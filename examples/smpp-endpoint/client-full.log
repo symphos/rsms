@@ -1,0 +1,62 @@
+warning: unused import: `Buf`
+ --> crates/rsms-core/src/pstring.rs:1:13
+  |
+1 | use bytes::{Buf, BufMut, BytesMut};
+  |             ^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `rsms-core` (lib) generated 1 warning (run `cargo fix --lib -p rsms-core` to apply 1 suggestion)
+warning: unused import: `BufMut`
+ --> crates/rsms-codec-cmpp/src/datatypes/terminate.rs:1:18
+  |
+1 | use bytes::{Buf, BufMut, BytesMut};
+  |                  ^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `header`
+  --> crates/rsms-codec-cmpp/src/datatypes/query.rs:66:15
+   |
+66 |     fn decode(header: PduHeader, buf: &mut Cursor<&[u8]>) -> Result<Self, CodecError> {
+   |               ^^^^^^ help: if this is intentional, prefix it with an underscore: `_header`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `header`
+   --> crates/rsms-codec-cmpp/src/datatypes/query.rs:140:15
+    |
+140 |     fn decode(header: PduHeader, buf: &mut Cursor<&[u8]>) -> Result<Self, CodecError> {
+    |               ^^^^^^ help: if this is intentional, prefix it with an underscore: `_header`
+
+warning: unused variable: `header`
+   --> crates/rsms-codec-cmpp/src/datatypes/query.rs:198:15
+    |
+198 |     fn decode(header: PduHeader, buf: &mut Cursor<&[u8]>) -> Result<Self, CodecError> {
+    |               ^^^^^^ help: if this is intentional, prefix it with an underscore: `_header`
+
+warning: unused variable: `header`
+   --> crates/rsms-codec-cmpp/src/datatypes/query.rs:233:15
+    |
+233 |     fn decode(header: PduHeader, buf: &mut Cursor<&[u8]>) -> Result<Self, CodecError> {
+    |               ^^^^^^ help: if this is intentional, prefix it with an underscore: `_header`
+
+warning: `rsms-codec-cmpp` (lib) generated 5 warnings (run `cargo fix --lib -p rsms-codec-cmpp` to apply 5 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.07s
+     Running `/mnt/g/RustProjects/rsms/target/debug/client`
+[Client] Connecting to 127.0.0.1:7893...
+[2m2026-04-05T03:50:34.787375Z[0m [32m INFO[0m [1mconnect[0m[1m{[0m[3mendpoint[0m[2m=[0msmpp-client[1m}[0m[2m:[0m [2mrsms_connector::client[0m[2m:[0m connecting to server [3maddr[0m[2m=[0m127.0.0.1:7893
+[2m2026-04-05T03:50:34.787655Z[0m [32m INFO[0m [1mconnect[0m[1m{[0m[3mendpoint[0m[2m=[0msmpp-client[1m}[0m[2m:[0m [2mrsms_connector::client[0m[2m:[0m connection established [3mconn_id[0m[2m=[0m1
+[Client] Connected! conn_id=1
+[Client] Sent BindTransmitter
+[Client] Sent SubmitSm
+[Client] Waiting for status report...
+[2m2026-04-05T03:50:34.788250Z[0m [32m INFO[0m [2mrsms_connector::client[0m[2m:[0m received frame [3mconn_id[0m[2m=[0m1 [3mlen[0m[2m=[0m33 [3mcmd_id[0m[2m=[0m2147483650
+[Client] BindTransmitterResp status=0
+[2m2026-04-05T03:50:34.788754Z[0m [32m INFO[0m [2mrsms_connector::client[0m[2m:[0m received frame [3mconn_id[0m[2m=[0m1 [3mlen[0m[2m=[0m25 [3mcmd_id[0m[2m=[0m2147483652
+[Client] SubmitSmResp status=0
+[Client] Still waiting... (1/5)
+[2m2026-04-05T03:50:35.790110Z[0m [32m INFO[0m [2mrsms_connector::client[0m[2m:[0m received frame [3mconn_id[0m[2m=[0m1 [3mlen[0m[2m=[0m195 [3mcmd_id[0m[2m=[0m5
+[Client] Received DeliverSm (status report)
+[Client] Status report received!
+[Client] Done

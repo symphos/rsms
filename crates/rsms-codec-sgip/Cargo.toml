@@ -1,0 +1,12 @@
+[package]
+name = "rsms-codec-sgip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SGIP 1.2 protocol codec"
+
+[dependencies]
+bytes.workspace = true
+num_enum.workspace = true
+rsms-core = { path = "../rsms-core" }
+thiserror.workspace = true

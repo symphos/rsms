@@ -1,0 +1,12 @@
+[package]
+name = "rsms-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Session state and placeholder session manager"
+
+[dependencies]
+rsms-core = { path = "../rsms-core" }
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

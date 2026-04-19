@@ -1,0 +1,12 @@
+[package]
+name = "rsms-longmsg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Long SMS splitting and merging"
+
+[dependencies]
+rsms-core = { path = "../rsms-core" }
+thiserror.workspace = true
+parking_lot.workspace = true
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }

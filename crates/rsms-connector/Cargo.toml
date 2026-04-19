@@ -1,0 +1,24 @@
+[package]
+name = "rsms-connector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TCP endpoint connector, connection pool, fetch"
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+rsms-business = { path = "../rsms-business" }
+rsms-codec-cmpp = { path = "../rsms-codec-cmpp" }
+rsms-codec-sgip = { path = "../rsms-codec-sgip" }
+rsms-codec-smgp = { path = "../rsms-codec-smgp" }
+rsms-codec-smpp = { path = "../rsms-codec-smpp" }
+rsms-core = { path = "../rsms-core" }
+rsms-pipeline = { path = "../rsms-pipeline" }
+rsms-ratelimit = { path = "../rsms-ratelimit" }
+rsms-session = { path = "../rsms-session" }
+rsms-window = { path = "../rsms-window" }
+dashmap.workspace = true
+tokio = { version = "1", features = ["net", "rt-multi-thread", "io-util", "macros", "sync", "time"] }
+tracing.workspace = true
+

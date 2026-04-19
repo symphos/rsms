@@ -1,0 +1,12 @@
+[package]
+name = "rsms-business"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Business handler trait and chain"
+
+[dependencies]
+async-trait.workspace = true
+rsms-codec-cmpp = { path = "../rsms-codec-cmpp" }
+rsms-core = { path = "../rsms-core" }
+tracing.workspace = true

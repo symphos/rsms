@@ -1,0 +1,13 @@
+[package]
+name = "rsms-pipeline"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bytes.workspace = true
+tokio = { version = "1", features = ["sync", "rt", "macros"] }
+thiserror.workspace = true
+async-trait.workspace = true
+
+[dependencies.rsms-core]
+path = "../rsms-core"

@@ -1,0 +1,10 @@
+[package]
+name = "rsms-ratelimit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Token bucket rate limiting and traffic shaping"
+
+[dependencies]
+tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
+tracing.workspace = true

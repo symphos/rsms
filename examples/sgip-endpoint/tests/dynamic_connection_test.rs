@@ -1,0 +1,293 @@
+use async_trait::async_trait;
+use rsms_connector::{
+    AuthCredentials, AuthHandler, AuthResult,
+    AccountConfig, AccountConfigProvider, SgipDecoder, connect,
+    AccountPool,
+};
+use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler, ClientConnection};
+use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Frame, Result};
+use rsms_codec_sgip::{
+    Bind, Submit, CommandId, Encodable,
+};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::time::{Duration, Instant};
+
+const TEST_ACCOUNT: &str = "900001";
+const TEST_PASSWORD: &str = "password123";
+const SGIP_NODE_ID: u32 = 1;
+const SGIP_TIMESTAMP: u32 = 0x04051200;
+
+struct PasswordAuthHandler {
+    accounts: std::collections::HashMap<String, String>,
+}
+
+impl PasswordAuthHandler {
+    fn new() -> Self {
+        Self { accounts: std::collections::HashMap::new() }
+    }
+    fn add_account(mut self, id: &str, pw: &str) -> Self {
+        self.accounts.insert(id.to_string(), pw.to_string());
+        self
+    }
+}
+
+#[async_trait]
+impl AuthHandler for PasswordAuthHandler {
+    fn name(&self) -> &'static str { "password-auth" }
+    async fn authenticate(&self, _client_id: &str, credentials: AuthCredentials, _conn_info: &ConnectionInfo) -> Result<AuthResult> {
+        match credentials {
+            AuthCredentials::Sgip { login_name, login_password } => {
+                if let Some(pw) = self.accounts.get(&login_name) {
+                    if login_password == *pw {
+                        return Ok(AuthResult::success(login_name));
+                    }
+                }
+                Ok(AuthResult::failure(1, "auth failed"))
+            }
+            _ => Ok(AuthResult::failure(1, "unsupported")),
+        }
+    }
+}
+
+struct DynamicConfigProvider {
+    config: tokio::sync::RwLock<AccountConfig>,
+}
+
+impl DynamicConfigProvider {
+    fn new(config: AccountConfig) -> Self {
+        Self { config: tokio::sync::RwLock::new(config) }
+    }
+}
+
+#[async_trait]
+impl AccountConfigProvider for DynamicConfigProvider {
+    async fn get_config(&self, _account: &str) -> Result<AccountConfig> {
+        Ok(self.config.read().await.clone())
+    }
+}
+
+struct TestClientHandler {
+    submit_resp_count: AtomicU64,
+}
+
+impl TestClientHandler {
+    fn new() -> Self {
+        Self { submit_resp_count: AtomicU64::new(0) }
+    }
+}
+
+#[async_trait]
+impl ClientHandler for TestClientHandler {
+    fn name(&self) -> &'static str { "test-client" }
+    async fn on_inbound(&self, _ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
+        if frame.command_id == CommandId::SubmitResp as u32 {
+            self.submit_resp_count.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+}
+
+static SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn next_seq() -> u32 {
+    SEQ.fetch_add(1, Ordering::Relaxed) as u32
+}
+
+fn build_bind_pdu() -> RawPdu {
+    let bind = Bind {
+        login_type: 1,
+        login_name: TEST_ACCOUNT.to_string(),
+        login_password: TEST_PASSWORD.to_string(),
+        reserve: [0u8; 8],
+    };
+    bind.to_pdu_bytes(SGIP_NODE_ID, SGIP_TIMESTAMP, next_seq()).into()
+}
+
+fn build_submit_pdu(sp_number: &str, dest_number: &str, content: &str, seq_num: u32) -> Vec<u8> {
+    let mut submit = Submit::new();
+    submit.sp_number = sp_number.to_string();
+    submit.charge_number = sp_number.to_string();
+    submit.user_count = 1;
+    submit.user_numbers = vec![dest_number.to_string()];
+    submit.corp_id = "".to_string();
+    submit.service_type = "SMS".to_string();
+    submit.fee_type = 2;
+    submit.fee_value = "000000".to_string();
+    submit.given_value = "000000".to_string();
+    submit.agent_flag = 0;
+    submit.morelate_to_mt_flag = 0;
+    submit.priority = 0;
+    submit.expire_time = "".to_string();
+    submit.schedule_time = "".to_string();
+    submit.report_flag = 1;
+    submit.tppid = 0;
+    submit.tpudhi = 0;
+    submit.msg_fmt = 15;
+    submit.message_type = 0;
+    submit.message_content = content.as_bytes().to_vec();
+    submit.reserve = [0u8; 8];
+
+    let body_bytes = {
+        let mut buf = bytes::BytesMut::new();
+        submit.encode(&mut buf).unwrap();
+        buf.to_vec()
+    };
+
+    let total_len = (20 + body_bytes.len()) as u32;
+    let mut pdu = Vec::new();
+    pdu.extend_from_slice(&total_len.to_be_bytes());
+    pdu.extend_from_slice(&(CommandId::Submit as u32).to_be_bytes());
+    pdu.extend_from_slice(&SGIP_NODE_ID.to_be_bytes());
+    pdu.extend_from_slice(&SGIP_TIMESTAMP.to_be_bytes());
+    pdu.extend_from_slice(&seq_num.to_be_bytes());
+    pdu.extend(body_bytes);
+    pdu
+}
+
+async fn start_server(
+    config_provider: Arc<DynamicConfigProvider>,
+) -> Result<(u16, Arc<AccountPool>, tokio::task::JoinHandle<()>)> {
+    let cfg = Arc::new(EndpointConfig::new(
+        "dynamic-conn-server",
+        "127.0.0.1",
+        0,
+        500,
+        60,
+    ).with_protocol("sgip"));
+    let auth = Arc::new(PasswordAuthHandler::new().add_account(TEST_ACCOUNT, TEST_PASSWORD));
+    let server = rsms_connector::serve(
+        cfg,
+        vec![],
+        Some(auth),
+        None,
+        Some(config_provider as Arc<dyn AccountConfigProvider>),
+        None,
+        None,
+    ).await?;
+    let port = server.local_addr.port();
+    let account_pool = server.account_pool();
+    let handle = tokio::spawn(async move { let _ = server.run().await; });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    Ok((port, account_pool, handle))
+}
+
+async fn create_connections(port: u16, count: usize) -> Vec<Arc<ClientConnection>> {
+    let mut connections = Vec::with_capacity(count);
+    for _ in 0..count {
+        let endpoint = Arc::new(EndpointConfig::new(
+            "sgip-client",
+            "127.0.0.1",
+            port,
+            500,
+            60,
+        ).with_protocol("sgip"));
+
+        let client_handler = Arc::new(TestClientHandler::new());
+        let conn = connect(
+            endpoint,
+            client_handler,
+            SgipDecoder,
+            Some(ClientConfig::default()),
+            None,
+            None,
+        ).await.expect("connect failed");
+
+        let bind_pdu = build_bind_pdu();
+        conn.write_frame(bind_pdu.as_bytes()).await.expect("send bind failed");
+        connections.push(conn);
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    connections
+}
+
+fn alive_connections(conns: &[Arc<ClientConnection>]) -> Vec<Arc<ClientConnection>> {
+    conns.iter().filter(|c| c.ready_for_fetch()).cloned().collect()
+}
+
+async fn send_submits_for_duration(
+    connections: &[Arc<ClientConnection>],
+    duration: Duration,
+    rate_per_sec: u64,
+) -> u64 {
+    let sent = Arc::new(AtomicU64::new(0));
+    let interval = Duration::from_secs_f64(1.0 / rate_per_sec as f64);
+    let start = Instant::now();
+    let mut seq: u32 = 1000;
+
+    loop {
+        if start.elapsed() >= duration { break; }
+        for conn in connections {
+            if !conn.ready_for_fetch() { continue; }
+            if start.elapsed() >= duration { break; }
+            seq = seq.wrapping_add(1);
+            let submit = build_submit_pdu("106900", "13800138000", &format!("msg-{}", seq), seq);
+            match conn.write_frame(&submit).await {
+                Ok(_) => { sent.fetch_add(1, Ordering::Relaxed); }
+                Err(_) => {}
+            }
+        }
+        tokio::time::sleep(interval).await;
+    }
+    sent.load(Ordering::Relaxed)
+}
+
+#[tokio::test]
+async fn test_sgip_dynamic_connection_adjust_5_to_3() {
+    let provider = Arc::new(DynamicConfigProvider::new(
+        AccountConfig::new().with_max_connections(5).with_max_qps(1000).with_window_size(2048)
+    ));
+    let (port, account_pool, server_handle) = start_server(provider).await.unwrap();
+
+    let connections = create_connections(port, 5).await;
+    assert_eq!(account_pool.connection_count(TEST_ACCOUNT).await, 5);
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    account_pool.update_config(TEST_ACCOUNT, AccountConfig::new()
+        .with_max_connections(3).with_max_qps(500).with_window_size(2048)
+    ).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    assert_eq!(account_pool.connection_count(TEST_ACCOUNT).await, 3);
+    let alive = alive_connections(&connections);
+    assert_eq!(alive.len(), 3);
+
+    let sent = send_submits_for_duration(&alive, Duration::from_secs(5), 200).await;
+    println!("SGIP 5→3 发送 Submit: {}", sent);
+    assert!(sent > 0);
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_sgip_dynamic_connection_multi_step() {
+    let provider = Arc::new(DynamicConfigProvider::new(
+        AccountConfig::new().with_max_connections(5).with_max_qps(1000).with_window_size(2048)
+    ));
+    let (port, account_pool, server_handle) = start_server(provider).await.unwrap();
+
+    let connections = create_connections(port, 5).await;
+    assert_eq!(account_pool.connection_count(TEST_ACCOUNT).await, 5);
+
+    // 5 → 3
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    account_pool.update_config(TEST_ACCOUNT, AccountConfig::new()
+        .with_max_connections(3).with_max_qps(500).with_window_size(2048)
+    ).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(account_pool.connection_count(TEST_ACCOUNT).await, 3);
+    assert_eq!(alive_connections(&connections).len(), 3);
+
+    // 3 → 1
+    account_pool.update_config(TEST_ACCOUNT, AccountConfig::new()
+        .with_max_connections(1).with_max_qps(200).with_window_size(2048)
+    ).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(account_pool.connection_count(TEST_ACCOUNT).await, 1);
+    let alive = alive_connections(&connections);
+    assert_eq!(alive.len(), 1);
+
+    let sent = send_submits_for_duration(&alive, Duration::from_secs(5), 100).await;
+    println!("SGIP 3→1 发送 Submit: {}", sent);
+    assert!(sent > 0);
+    server_handle.abort();
+}

@@ -1,0 +1,12 @@
+[package]
+name = "rsms-codec-smpp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SMPP v3.4 protocol codec with TLV support"
+
+[dependencies]
+bytes.workspace = true
+num_enum.workspace = true
+rsms-core = { path = "../rsms-core" }
+thiserror.workspace = true

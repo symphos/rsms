@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rsms-core",
+    "crates/rsms-codec-cmpp",
+    "crates/rsms-session",
+    "crates/rsms-business",
+    "crates/rsms-connector",
+    "crates/rsms-codec-sgip",
+    "crates/rsms-codec-smgp",
+    "crates/rsms-codec-smpp",
+    "crates/rsms-longmsg",
+    "crates/rsms-ratelimit",
+    "crates/rsms-pipeline",
+    "crates/rsms-window",
+    "examples/cmpp-endpoint",
+    "examples/sgip-endpoint",
+    "examples/smgp-endpoint",
+    "examples/smpp-endpoint",
+    "examples/cmpp_client",
+    "examples/cmpp_server",
+    "examples/smgp_client",
+    "examples/smgp_server",
+    "examples/sgip_client",
+    "examples/sgip_server",
+    "examples/smpp_client",
+    "examples/smpp_server",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+bytes = "1.11"
+thiserror = "2.0"
+tokio = "1"
+async-trait = "0.1"
+parking_lot = "0.12"
+encoding_rs = "0.8"
+md-5 = "0.11.0"
+num_enum = "0.7"
+dashmap = "6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
