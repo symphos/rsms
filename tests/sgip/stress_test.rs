@@ -1,0 +1,794 @@
+use async_trait::async_trait;
+use rsms_connector::{
+    serve, connect, SgipDecoder,
+    AuthCredentials, AuthHandler, AuthResult,
+    AccountConfigProvider,
+    protocol::MessageSource,
+};
+use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler};
+use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Frame, Result};
+use rsms_codec_sgip::{
+    decode_message, SgipMessage,
+    CommandId, Submit, SubmitResp, Deliver, DeliverResp, Report, ReportResp,
+    Bind, Encodable, SgipSequence,
+};
+use rsms_test_common::{
+    TestStats, StressMockMessageSource, MockAccountConfigProvider, rand_u32,
+    print_stress_results, StressTestResults,
+    drain_wait_submit_resp, drain_wait_queue_and_reports_single, drain_wait_final_single,
+    spawn_stats_monitor,
+};
+use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use tokio::time::{Duration, Instant};
+
+const STRESS_TEST_ACCOUNT: &str = "106900";
+const STRESS_TEST_PASSWORD: &str = "password123";
+const STRESS_TEST_DURATION_SECS: u64 = 30;
+const STRESS_TEST_RATE: f64 = 2500.0;
+const SGIP_NODE_ID: u32 = 1;
+const SGIP_TIMESTAMP: u32 = 0x04051200;
+
+#[derive(Clone)]
+struct ReportItem {
+    submit_seq_number: u32,
+    conn_id: u64,
+    dest_number: String,
+}
+
+impl ReportItem {
+    fn to_bytes(&self) -> Vec<u8> {
+        let dest_bytes = self.dest_number.as_bytes();
+        let mut buf = Vec::with_capacity(4 + 8 + 4 + dest_bytes.len());
+        buf.extend_from_slice(&self.submit_seq_number.to_be_bytes());
+        buf.extend_from_slice(&self.conn_id.to_be_bytes());
+        buf.extend_from_slice(&(dest_bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(dest_bytes);
+        buf
+    }
+
+    fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < 16 {
+            return None;
+        }
+        let submit_seq_number = u32::from_be_bytes(data[0..4].try_into().ok()?);
+        let conn_id = u64::from_be_bytes(data[4..12].try_into().ok()?);
+        let dest_len = u32::from_be_bytes(data[12..16].try_into().ok()?) as usize;
+        if data.len() < 16 + dest_len {
+            return None;
+        }
+        let dest_number = String::from_utf8(data[16..16 + dest_len].to_vec()).ok()?;
+        Some(Self { submit_seq_number, conn_id, dest_number })
+    }
+}
+
+struct SharedSeqState {
+    seq: AtomicU64,
+    pending_seq_numbers: RwLock<VecDeque<u32>>,
+    matched_seq_numbers: Mutex<HashSet<u32>>,
+}
+
+impl SharedSeqState {
+    fn new() -> Self {
+        Self {
+            seq: AtomicU64::new(1),
+            pending_seq_numbers: RwLock::new(VecDeque::new()),
+            matched_seq_numbers: Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn next_seq(&self) -> u32 {
+        self.seq.fetch_add(1, Ordering::Relaxed) as u32
+    }
+}
+
+#[allow(dead_code)]
+struct ClientState {
+    connected: AtomicBool,
+    login_status: Mutex<Option<u32>>,
+    shared: Arc<SharedSeqState>,
+    stats: Arc<TestStats>,
+}
+
+impl ClientState {
+    fn new(stats: Arc<TestStats>, shared: Arc<SharedSeqState>) -> Self {
+        Self {
+            connected: AtomicBool::new(false),
+            login_status: Mutex::new(None),
+            shared,
+            stats,
+        }
+    }
+
+    pub fn build_bind_pdu(&self, login_name: &str, login_password: &str) -> RawPdu {
+        let bind = Bind {
+            login_type: 1,
+            login_name: login_name.to_string(),
+            login_password: login_password.to_string(),
+            reserve: [0u8; 8],
+        };
+
+        let body_bytes = {
+            let mut buf = bytes::BytesMut::new();
+            bind.encode(&mut buf).unwrap();
+            buf.to_vec()
+        };
+
+        let total_len = (20 + body_bytes.len()) as u32;
+        let seq_num = self.shared.next_seq();
+
+        let mut pdu = Vec::new();
+        pdu.extend_from_slice(&total_len.to_be_bytes());
+        pdu.extend_from_slice(&(CommandId::Bind as u32).to_be_bytes());
+        pdu.extend_from_slice(&SGIP_NODE_ID.to_be_bytes());
+        pdu.extend_from_slice(&SGIP_TIMESTAMP.to_be_bytes());
+        pdu.extend_from_slice(&seq_num.to_be_bytes());
+        pdu.extend(body_bytes);
+
+        pdu.into()
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl ClientHandler for ClientState {
+    fn name(&self) -> &'static str {
+        "stress_client"
+    }
+
+    async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
+        let pdu = frame.data_as_slice();
+        if pdu.len() < 20 {
+            return Ok(());
+        }
+
+        let cmd_id = frame.command_id;
+
+        if cmd_id == CommandId::BindResp as u32 {
+            let result = pdu[20] as u32;
+            *self.login_status.lock().unwrap() = Some(result);
+            if result == 0 {
+                self.connected.store(true, Ordering::Relaxed);
+            }
+        } else if cmd_id == CommandId::SubmitResp as u32 {
+            let result = u32::from_be_bytes([pdu[20], pdu[21], pdu[22], pdu[23]]);
+            self.stats.submit_resp_received.fetch_add(1, Ordering::Relaxed);
+            if result != 0 {
+                self.stats.submit_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        } else if cmd_id == CommandId::Report as u32 {
+            self.stats.report_received.fetch_add(1, Ordering::Relaxed);
+
+            if let Ok(msg) = decode_message(pdu) {
+                if let SgipMessage::Report(r) = msg {
+                    let report_seq = r.submit_sequence.number;
+                    tracing::trace!("[Client] Report received for seq_number: {}", report_seq);
+
+                    let already_matched = self.shared.matched_seq_numbers.lock().unwrap().contains(&report_seq);
+                    if already_matched {
+                        return build_report_resp(ctx, frame).await;
+                    }
+
+                    let mut pending = self.shared.pending_seq_numbers.write().unwrap();
+                    if let Some(pos) = pending.iter().position(|&s| s == report_seq) {
+                        pending.remove(pos);
+                        self.shared.matched_seq_numbers.lock().unwrap().insert(report_seq);
+                        self.stats.report_matched.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+
+            return build_report_resp(ctx, frame).await;
+        } else if cmd_id == CommandId::Deliver as u32 {
+            self.stats.mo_received.fetch_add(1, Ordering::Relaxed);
+            tracing::trace!("[Client] Received Deliver/MO");
+            return build_deliver_resp(ctx, frame).await;
+        }
+
+        Ok(())
+    }
+}
+
+async fn build_report_resp(ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
+    let resp = ReportResp { result: 0 };
+    let body_bytes = {
+        let mut buf = bytes::BytesMut::new();
+        resp.encode(&mut buf).unwrap();
+        buf.to_vec()
+    };
+    let total_len = (20 + body_bytes.len()) as u32;
+    let pdu_bytes = frame.data_as_slice();
+    let mut resp_pdu = Vec::new();
+    resp_pdu.extend_from_slice(&total_len.to_be_bytes());
+    resp_pdu.extend_from_slice(&(CommandId::ReportResp as u32).to_be_bytes());
+    if pdu_bytes.len() >= 20 {
+        resp_pdu.extend_from_slice(&pdu_bytes[8..20]);
+    } else {
+        resp_pdu.extend_from_slice(&1u32.to_be_bytes());
+        resp_pdu.extend_from_slice(&SGIP_TIMESTAMP.to_be_bytes());
+        resp_pdu.extend_from_slice(&frame.sequence_id.to_be_bytes());
+    }
+    resp_pdu.extend(body_bytes);
+    ctx.conn.write_frame(resp_pdu.as_slice()).await
+}
+
+async fn build_deliver_resp(ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
+    let resp = DeliverResp { result: 0 };
+    let body_bytes = {
+        let mut buf = bytes::BytesMut::new();
+        resp.encode(&mut buf).unwrap();
+        buf.to_vec()
+    };
+    let total_len = (20 + body_bytes.len()) as u32;
+    let pdu_bytes = frame.data_as_slice();
+    let mut resp_pdu = Vec::new();
+    resp_pdu.extend_from_slice(&total_len.to_be_bytes());
+    resp_pdu.extend_from_slice(&(CommandId::DeliverResp as u32).to_be_bytes());
+    if pdu_bytes.len() >= 20 {
+        resp_pdu.extend_from_slice(&pdu_bytes[8..20]);
+    } else {
+        resp_pdu.extend_from_slice(&1u32.to_be_bytes());
+        resp_pdu.extend_from_slice(&SGIP_TIMESTAMP.to_be_bytes());
+        resp_pdu.extend_from_slice(&frame.sequence_id.to_be_bytes());
+    }
+    resp_pdu.extend(body_bytes);
+    ctx.conn.write_frame(resp_pdu.as_slice()).await
+}
+
+struct ServerHandler {
+    submit_count: AtomicU64,
+    msg_source: Arc<StressMockMessageSource>,
+}
+
+impl ServerHandler {
+    fn new(msg_source: Arc<StressMockMessageSource>) -> Self {
+        Self {
+            submit_count: AtomicU64::new(0),
+            msg_source,
+        }
+    }
+}
+
+#[async_trait]
+impl rsms_business::BusinessHandler for ServerHandler {
+    fn name(&self) -> &'static str {
+        "stress-server-handler"
+    }
+
+    async fn on_inbound(&self, ctx: &rsms_business::InboundContext, frame: &Frame) -> Result<()> {
+        if let Ok(msg) = decode_message(frame.data_as_slice()) {
+            match msg {
+                SgipMessage::Submit(s) => {
+                    let count = self.submit_count.fetch_add(1, Ordering::Relaxed);
+                    tracing::trace!("[Server] Received Submit #{}", count + 1);
+
+                    let resp = SubmitResp { result: 0 };
+                    let body_bytes = {
+                        let mut buf = bytes::BytesMut::new();
+                        resp.encode(&mut buf).unwrap();
+                        buf.to_vec()
+                    };
+                    let total_len = (20 + body_bytes.len()) as u32;
+                    let pdu_bytes = frame.data_as_slice();
+                    let mut resp_pdu = Vec::new();
+                    resp_pdu.extend_from_slice(&total_len.to_be_bytes());
+                    resp_pdu.extend_from_slice(&(CommandId::SubmitResp as u32).to_be_bytes());
+                    if pdu_bytes.len() >= 20 {
+                        resp_pdu.extend_from_slice(&pdu_bytes[8..20]);
+                    } else {
+                        resp_pdu.extend_from_slice(&1u32.to_be_bytes());
+                        resp_pdu.extend_from_slice(&SGIP_TIMESTAMP.to_be_bytes());
+                        resp_pdu.extend_from_slice(&frame.sequence_id.to_be_bytes());
+                    }
+                    resp_pdu.extend(body_bytes);
+                    ctx.conn.write_frame(resp_pdu.as_slice()).await?;
+
+                    let submit_seq_number = if pdu_bytes.len() >= 20 {
+                        seq_3_from_pdu(pdu_bytes)
+                    } else {
+                        0
+                    };
+
+                    let dest_number = s.user_numbers.first().cloned().unwrap_or_default();
+                    self.msg_source.push_item(STRESS_TEST_ACCOUNT, ReportItem {
+                        submit_seq_number,
+                        conn_id: ctx.conn.id(),
+                        dest_number,
+                    }.to_bytes()).await;
+                }
+                SgipMessage::ReportResp { .. } => {
+                    tracing::trace!("[Server] Received ReportResp");
+                }
+                SgipMessage::DeliverResp { .. } => {
+                    tracing::trace!("[Server] Received DeliverResp");
+                }
+                _ => {
+                    tracing::debug!("[Server] Received other message");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn seq_3_from_pdu(pdu: &[u8]) -> u32 {
+    if pdu.len() >= 20 {
+        u32::from_be_bytes([pdu[16], pdu[17], pdu[18], pdu[19]])
+    } else {
+        0
+    }
+}
+
+pub struct PasswordAuthHandler {
+    accounts: std::collections::HashMap<String, String>,
+}
+
+impl PasswordAuthHandler {
+    pub fn new() -> Self {
+        Self {
+            accounts: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn add_account(mut self, login_name: &str, password: &str) -> Self {
+        self.accounts.insert(login_name.to_string(), password.to_string());
+        self
+    }
+}
+
+#[async_trait]
+impl AuthHandler for PasswordAuthHandler {
+    fn name(&self) -> &'static str {
+        "sgip-password-auth"
+    }
+
+    async fn authenticate(&self, _client_id: &str, credentials: AuthCredentials, _conn_info: &ConnectionInfo) -> Result<AuthResult> {
+        if let AuthCredentials::Sgip { login_name, login_password } = credentials {
+            if let Some(expected_password) = self.accounts.get(&login_name) {
+                if *expected_password == login_password {
+                    return Ok(AuthResult::success(&login_name));
+                }
+            }
+            Ok(AuthResult::failure(1, "Invalid password"))
+        } else {
+            Ok(AuthResult::failure(1, "Invalid credentials"))
+        }
+    }
+}
+
+async fn start_test_server(
+    biz_handler: Arc<dyn rsms_business::BusinessHandler>,
+) -> Result<(u16, Arc<rsms_connector::AccountPool>, tokio::task::JoinHandle<()>)> {
+    let cfg = Arc::new(EndpointConfig::new(
+        "sgip-stress-server",
+        "127.0.0.1",
+        0,
+        500,
+        60,
+    ).with_protocol("sgip").with_log_level(tracing::Level::WARN));
+    let auth = Arc::new(PasswordAuthHandler::new().add_account(STRESS_TEST_ACCOUNT, STRESS_TEST_PASSWORD));
+    let server = serve(
+        cfg,
+        vec![biz_handler],
+        Some(auth),
+        None,
+        Some(Arc::new(MockAccountConfigProvider::with_limits(10000, 2048)) as Arc<dyn AccountConfigProvider>),
+        None,
+        None,
+    )
+    .await
+    .expect("bind");
+    let port = server.local_addr.port();
+    let account_pool = server.account_pool();
+    let handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    Ok((port, account_pool, handle))
+}
+
+fn build_sgip_submit_pdu(sp_number: &str, dest_number: &str, content: &str, seq_num: u32) -> Vec<u8> {
+    let mut submit = Submit::new();
+    submit.sp_number = sp_number.to_string();
+    submit.charge_number = sp_number.to_string();
+    submit.user_count = 1;
+    submit.user_numbers = vec![dest_number.to_string()];
+    submit.corp_id = "".to_string();
+    submit.service_type = "SMS".to_string();
+    submit.fee_type = 2;
+    submit.fee_value = "000000".to_string();
+    submit.given_value = "000000".to_string();
+    submit.agent_flag = 0;
+    submit.morelate_to_mt_flag = 0;
+    submit.priority = 0;
+    submit.expire_time = "".to_string();
+    submit.schedule_time = "".to_string();
+    submit.report_flag = 1;
+    submit.tppid = 0;
+    submit.tpudhi = 0;
+    submit.msg_fmt = 15;
+    submit.message_type = 0;
+    submit.message_content = content.as_bytes().to_vec();
+    submit.reserve = [0u8; 8];
+
+    let body_bytes = {
+        let mut buf = bytes::BytesMut::new();
+        submit.encode(&mut buf).unwrap();
+        buf.to_vec()
+    };
+
+    let total_len = (20 + body_bytes.len()) as u32;
+
+    let mut pdu = Vec::new();
+    pdu.extend_from_slice(&total_len.to_be_bytes());
+    pdu.extend_from_slice(&(CommandId::Submit as u32).to_be_bytes());
+    pdu.extend_from_slice(&SGIP_NODE_ID.to_be_bytes());
+    pdu.extend_from_slice(&SGIP_TIMESTAMP.to_be_bytes());
+    pdu.extend_from_slice(&seq_num.to_be_bytes());
+    pdu.extend(body_bytes);
+
+    pdu
+}
+
+async fn mt_producer_task(
+    msg_source: Arc<StressMockMessageSource>,
+    stats: Arc<TestStats>,
+    shared: Arc<SharedSeqState>,
+    target_rate: f64,
+) {
+    let inter_msg_interval = Duration::from_secs_f64(1.0 / target_rate);
+    let mut interval = tokio::time::interval(inter_msg_interval);
+
+    let src_numbers = ["13800138000", "13800138001", "13800138002", "13800138003", "13800138004"];
+    let mut msg_count: u64 = 0;
+
+    loop {
+        interval.tick().await;
+
+        let src = src_numbers[msg_count as usize % src_numbers.len()];
+        let content = format!("MT Test #{}", msg_count);
+        let seq_num = shared.next_seq();
+        let pdu_bytes = build_sgip_submit_pdu(src, STRESS_TEST_ACCOUNT, &content, seq_num);
+
+        if msg_source.push("sgip-stress-client", pdu_bytes).await.is_ok() {
+            stats.submit_sent.fetch_add(1, Ordering::Relaxed);
+            shared.pending_seq_numbers.write().unwrap().push_back(seq_num);
+        }
+
+        msg_count += 1;
+    }
+}
+
+async fn report_generator_task(
+    msg_source: Arc<StressMockMessageSource>,
+    account_pool: Arc<rsms_connector::AccountPool>,
+    report_sent: Arc<AtomicU64>,
+    target_rate: f64,
+) {
+    let inter_msg_interval = Duration::from_secs_f64(1.0 / target_rate);
+    let mut interval = tokio::time::interval(inter_msg_interval);
+
+    loop {
+        interval.tick().await;
+
+        let raw_items = msg_source.fetch_bytes(STRESS_TEST_ACCOUNT, 100).await;
+        let items: Vec<ReportItem> = raw_items.into_iter()
+            .filter_map(|b| ReportItem::from_bytes(&b))
+            .collect();
+
+        for item in items {
+            if let Some(acc) = account_pool.get(STRESS_TEST_ACCOUNT).await {
+                if let Some(conn) = acc.first_connection().await {
+                    let report = Report {
+                        submit_sequence: SgipSequence::new(SGIP_NODE_ID, SGIP_TIMESTAMP, item.submit_seq_number),
+                        report_type: 0,
+                        user_number: item.dest_number,
+                        state: 0,
+                        error_code: 0,
+                        reserve: [0u8; 8],
+                    };
+
+                    let body_bytes = {
+                        let mut buf = bytes::BytesMut::new();
+                        report.encode(&mut buf).unwrap();
+                        buf.to_vec()
+                    };
+
+                    let total_len = (20 + body_bytes.len()) as u32;
+                    let seq = rand_u32();
+                    let mut pdu = Vec::new();
+                    pdu.extend_from_slice(&total_len.to_be_bytes());
+                    pdu.extend_from_slice(&(CommandId::Report as u32).to_be_bytes());
+                    pdu.extend_from_slice(&SGIP_NODE_ID.to_be_bytes());
+                    pdu.extend_from_slice(&SGIP_TIMESTAMP.to_be_bytes());
+                    pdu.extend_from_slice(&seq.to_be_bytes());
+                    pdu.extend(body_bytes);
+
+                    match conn.write_frame(pdu.as_slice()).await {
+                        Ok(()) => {
+                            report_sent.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            tracing::debug!("Failed to send Report: {:?}", e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn mo_generator_task(
+    account_pool: Arc<rsms_connector::AccountPool>,
+    mo_sent: Arc<AtomicU64>,
+    target_rate: f64,
+) {
+    let inter_msg_interval = Duration::from_secs_f64(1.0 / target_rate);
+    let mut interval = tokio::time::interval(inter_msg_interval);
+
+    let src_numbers = ["13800138000", "13800138001", "13800138002", "13800138003", "13800138004"];
+
+    loop {
+        interval.tick().await;
+
+        if let Some(acc) = account_pool.get(STRESS_TEST_ACCOUNT).await {
+            if let Some(conn) = acc.first_connection().await {
+                let src = src_numbers[rand_u32() as usize % src_numbers.len()];
+                let content = format!("MO Test #{}", mo_sent.load(Ordering::Relaxed) + 1);
+
+                let mut deliver = Deliver::new();
+                deliver.user_number = src.to_string();
+                deliver.sp_number = STRESS_TEST_ACCOUNT.to_string();
+                deliver.tppid = 0;
+                deliver.tpudhi = 0;
+                deliver.msg_fmt = 15;
+                deliver.message_content = content.as_bytes().to_vec();
+                deliver.reserve = [0u8; 8];
+
+                let body_bytes = {
+                    let mut buf = bytes::BytesMut::new();
+                    deliver.encode(&mut buf).unwrap();
+                    buf.to_vec()
+                };
+
+                let total_len = (20 + body_bytes.len()) as u32;
+                let seq = rand_u32();
+                let mut pdu = Vec::new();
+                pdu.extend_from_slice(&total_len.to_be_bytes());
+                pdu.extend_from_slice(&(CommandId::Deliver as u32).to_be_bytes());
+                pdu.extend_from_slice(&SGIP_NODE_ID.to_be_bytes());
+                pdu.extend_from_slice(&SGIP_TIMESTAMP.to_be_bytes());
+                pdu.extend_from_slice(&seq.to_be_bytes());
+                pdu.extend(body_bytes);
+
+                match conn.write_frame(pdu.as_slice()).await {
+                    Ok(()) => {
+                        mo_sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        tracing::debug!("Failed to send MO: {:?}", e);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn stress_test_sgip_1connection() {
+    run_stress_test(1).await;
+}
+
+#[tokio::test]
+async fn stress_test_sgip_5connections() {
+    run_stress_test(5).await;
+}
+
+async fn run_stress_test(num_connections: usize) {
+    let total_start = Instant::now();
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .try_init();
+
+    println!("\n");
+    println!("==========================================");
+    println!("SGIP Stress Test - {} Connection(s)", num_connections);
+    println!("==========================================");
+    println!("Account: {}", STRESS_TEST_ACCOUNT);
+    println!("Connections: {}", num_connections);
+    println!("Target Rate: {} msg/s", STRESS_TEST_RATE);
+    println!("Duration: {} seconds", STRESS_TEST_DURATION_SECS);
+    println!("==========================================\n");
+
+    let stats = Arc::new(TestStats::new());
+    let msg_source = Arc::new(StressMockMessageSource::new());
+    let shared_seq = Arc::new(SharedSeqState::new());
+    let server_handler = Arc::new(ServerHandler::new(msg_source.clone()));
+    let (port, account_pool, server_handle) = start_test_server(server_handler.clone()).await.unwrap();
+
+    tracing::warn!("Server started on port {}", port);
+
+    let mt_rate = 2500.0;
+    let report_rate = 2500.0;
+    let mo_rate = 1250.0;
+
+    let report_sent = Arc::new(AtomicU64::new(0));
+    let mo_sent = Arc::new(AtomicU64::new(0));
+
+    let report_gen_handle = tokio::spawn(report_generator_task(
+        msg_source.clone(),
+        account_pool.clone(),
+        report_sent.clone(),
+        report_rate,
+    ));
+
+    let mo_gen_handle = tokio::spawn(mo_generator_task(
+        account_pool.clone(),
+        mo_sent.clone(),
+        mo_rate,
+    ));
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let mut client_conns = Vec::new();
+    let mut client_states = Vec::new();
+
+    for i in 0..num_connections {
+        let client_state = Arc::new(ClientState::new(stats.clone(), shared_seq.clone()));
+        let endpoint = Arc::new(EndpointConfig::new(
+            "sgip-stress-client",
+            "127.0.0.1",
+            port,
+            if num_connections == 1 { 1024 } else { 2048 },
+            30,
+        ).with_window_size(2048).with_protocol("sgip").with_log_level(tracing::Level::WARN));
+
+        let mut conn = None;
+        for retry in 0..50 {
+            match connect(
+                endpoint.clone(),
+                client_state.clone(),
+                SgipDecoder,
+                Some(ClientConfig::new()),
+                Some(msg_source.clone() as Arc<dyn MessageSource>),
+                None,
+            )
+            .await
+            {
+                Ok(c) => {
+                    conn = Some(c);
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!("Connection {} attempt {} failed: {:?}", i, retry, e);
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+
+        let conn = conn.expect("Failed to establish connection after retries");
+
+        let bind_pdu = client_state.build_bind_pdu(STRESS_TEST_ACCOUNT, STRESS_TEST_PASSWORD);
+        conn.write_frame(bind_pdu.as_bytes()).await.expect("send bind");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut retries = 0;
+        while !client_state.is_connected() && retries < 30 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            retries += 1;
+        }
+
+        assert!(client_state.is_connected(), "Connection {} failed after {} retries", i, retries);
+        tracing::warn!("Client {} connected", i);
+
+        client_conns.push(conn.clone());
+        client_states.push(client_state.clone());
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    let producer_handle = tokio::spawn(mt_producer_task(
+        msg_source.clone(),
+        stats.clone(),
+        shared_seq.clone(),
+        mt_rate,
+    ));
+
+    let warmup_secs = total_start.elapsed().as_secs_f64();
+    stats.start();
+
+    let monitor_handle = spawn_stats_monitor(
+        stats.clone(),
+        msg_source.clone(),
+        "SGIP",
+        STRESS_TEST_DURATION_SECS,
+        1,
+        Some(STRESS_TEST_ACCOUNT.to_string()),
+    );
+
+    tokio::time::sleep(Duration::from_secs(STRESS_TEST_DURATION_SECS)).await;
+
+    stats.end();
+
+    producer_handle.abort();
+
+    drain_wait_submit_resp(&stats, Duration::from_secs(10)).await;
+
+    drain_wait_queue_and_reports_single(
+        &stats, &msg_source, STRESS_TEST_ACCOUNT,
+        report_sent.load(Ordering::Relaxed),
+        Duration::from_secs(15),
+    ).await;
+
+    report_gen_handle.abort();
+    mo_gen_handle.abort();
+
+    drain_wait_final_single(
+        &stats,
+        report_sent.load(Ordering::Relaxed),
+        mo_sent.load(Ordering::Relaxed),
+        Duration::from_secs(5),
+    ).await;
+
+    monitor_handle.abort();
+
+    let total_secs = total_start.elapsed().as_secs_f64();
+
+    let results = StressTestResults::from_stats(
+        &stats,
+        report_sent.load(Ordering::Relaxed),
+        mo_sent.load(Ordering::Relaxed),
+        warmup_secs,
+        total_secs,
+    );
+    print_stress_results(&results, "SGIP", &format!("Stress Test ({} connections)", num_connections));
+
+    server_handle.abort();
+
+    let stress_secs = results.stress_secs;
+    let submit_sent = results.submit_sent;
+    let submit_resp = results.submit_resp;
+    let report_matched = results.report_matched;
+    let mo_recv = results.mo_received;
+
+    let actual_mt_qps = submit_sent as f64 / stress_secs;
+    let actual_mo_qps = mo_recv as f64 / stress_secs;
+
+    let expected_min_mt = (mt_rate * (STRESS_TEST_DURATION_SECS as f64) * 0.4) as u64;
+    let expected_min_mo = (mo_rate * (STRESS_TEST_DURATION_SECS as f64) * 0.3) as u64;
+
+    assert!(
+        submit_sent >= expected_min_mt,
+        "Expected at least {} MT messages, got {} ({:.1} QPS)",
+        expected_min_mt,
+        submit_sent,
+        actual_mt_qps
+    );
+
+    let match_ratio = if submit_resp > 0 {
+        report_matched as f64 / submit_resp as f64
+    } else {
+        0.0
+    };
+
+    assert!(
+        report_matched >= submit_resp.saturating_sub(100),
+        "Report SeqNumber should match SubmitResp (1:1), got {}/{} ({:.1}% match)",
+        report_matched,
+        submit_resp,
+        match_ratio * 100.0
+    );
+
+    assert!(
+        mo_recv >= expected_min_mo,
+        "Expected at least {} MO messages, got {} ({:.1} QPS)",
+        expected_min_mo,
+        mo_recv,
+        actual_mo_qps
+    );
+}

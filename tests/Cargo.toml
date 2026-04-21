@@ -1,0 +1,119 @@
+[package]
+name = "rsms-tests"
+version.workspace = true
+edition.workspace = true
+
+# CMPP
+[[test]]
+name = "cmpp-integration"
+path = "cmpp/cmpp_test.rs"
+
+[[test]]
+name = "cmpp20-test"
+path = "cmpp/cmpp20_test.rs"
+
+[[test]]
+name = "cmpp-stress-test"
+path = "cmpp/stress_test.rs"
+
+[[test]]
+name = "cmpp-multi-account-stress-test"
+path = "cmpp/multi_account_stress_test.rs"
+
+[[test]]
+name = "cmpp-longmsg-test"
+path = "cmpp/cmpp_longmsg_test.rs"
+
+[[test]]
+name = "cmpp-dynamic-connection-test"
+path = "cmpp/dynamic_connection_test.rs"
+
+[[test]]
+name = "cmpp-transaction-test"
+path = "cmpp/transaction_integration_test.rs"
+
+[[test]]
+name = "cmpp-transaction-manager-test"
+path = "cmpp/transaction_manager_test.rs"
+
+# SMGP
+[[test]]
+name = "smgp-integration"
+path = "smgp/integration.rs"
+
+[[test]]
+name = "smgp-stress-test"
+path = "smgp/stress_test.rs"
+
+[[test]]
+name = "smgp-multi-account-stress-test"
+path = "smgp/multi_account_stress_test.rs"
+
+[[test]]
+name = "smgp-longmsg-test"
+path = "smgp/smgp_longmsg_test.rs"
+
+[[test]]
+name = "smgp-dynamic-connection-test"
+path = "smgp/dynamic_connection_test.rs"
+
+# SMPP
+[[test]]
+name = "smpp-integration"
+path = "smpp/integration.rs"
+
+[[test]]
+name = "smpp-stress-test"
+path = "smpp/stress_test.rs"
+
+[[test]]
+name = "smpp-multi-account-stress-test"
+path = "smpp/multi_account_stress_test.rs"
+
+[[test]]
+name = "smpp-longmsg-test"
+path = "smpp/smpp_longmsg_test.rs"
+
+[[test]]
+name = "smpp-dynamic-connection-test"
+path = "smpp/dynamic_connection_test.rs"
+
+# SGIP
+[[test]]
+name = "sgip-integration"
+path = "sgip/integration.rs"
+
+[[test]]
+name = "sgip-stress-test"
+path = "sgip/stress_test.rs"
+
+[[test]]
+name = "sgip-multi-account-stress-test"
+path = "sgip/multi_account_stress_test.rs"
+
+[[test]]
+name = "sgip-longmsg-test"
+path = "sgip/sgip_longmsg_test.rs"
+
+[[test]]
+name = "sgip-dynamic-connection-test"
+path = "sgip/dynamic_connection_test.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+dashmap.workspace = true
+
+rsms-core = { path = "../crates/rsms-core" }
+rsms-connector = { path = "../crates/rsms-connector" }
+rsms-business = { path = "../crates/rsms-business" }
+rsms-session = { path = "../crates/rsms-session" }
+rsms-codec-cmpp = { path = "../crates/rsms-codec-cmpp" }
+rsms-codec-smgp = { path = "../crates/rsms-codec-smgp" }
+rsms-codec-smpp = { path = "../crates/rsms-codec-smpp" }
+rsms-codec-sgip = { path = "../crates/rsms-codec-sgip" }
+rsms-longmsg = { path = "../crates/rsms-longmsg" }
+rsms-test-common = { path = "common" }

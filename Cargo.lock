@@ -65,24 +65,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cmpp-endpoint-example"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "bytes",
- "dashmap",
- "rsms-business",
- "rsms-codec-cmpp",
- "rsms-connector",
- "rsms-core",
- "rsms-longmsg",
- "rsms-session",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "cmpp-server-example"
 version = "0.0.1"
 dependencies = [
@@ -506,6 +488,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsms-test-common"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "dashmap",
+ "rsms-business",
+ "rsms-connector",
+ "rsms-core",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "rsms-tests"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "dashmap",
+ "rsms-business",
+ "rsms-codec-cmpp",
+ "rsms-codec-sgip",
+ "rsms-codec-smgp",
+ "rsms-codec-smpp",
+ "rsms-connector",
+ "rsms-core",
+ "rsms-longmsg",
+ "rsms-session",
+ "rsms-test-common",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "rsms-window"
 version = "0.0.1"
 dependencies = [
@@ -557,24 +576,6 @@ dependencies = [
  "rsms-connector",
  "rsms-core",
  "rsms-longmsg",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "sgip-endpoint-example"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "bytes",
- "dashmap",
- "rsms-business",
- "rsms-codec-sgip",
- "rsms-connector",
- "rsms-core",
- "rsms-longmsg",
- "rsms-session",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -637,24 +638,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "smgp-endpoint-example"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "bytes",
- "dashmap",
- "rsms-business",
- "rsms-codec-smgp",
- "rsms-connector",
- "rsms-core",
- "rsms-longmsg",
- "rsms-session",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "smgp-server-example"
 version = "0.0.1"
 dependencies = [
@@ -680,24 +663,6 @@ dependencies = [
  "rsms-connector",
  "rsms-core",
  "rsms-longmsg",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "smpp-endpoint-example"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "bytes",
- "dashmap",
- "rsms-business",
- "rsms-codec-smpp",
- "rsms-connector",
- "rsms-core",
- "rsms-longmsg",
- "rsms-session",
  "tokio",
  "tracing",
  "tracing-subscriber",

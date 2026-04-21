@@ -1,0 +1,16 @@
+[package]
+name = "rsms-test-common"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+dashmap.workspace = true
+
+rsms-core = { path = "../../crates/rsms-core" }
+rsms-connector = { path = "../../crates/rsms-connector" }
+rsms-business = { path = "../../crates/rsms-business" }

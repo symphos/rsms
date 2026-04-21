@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use bytes::BytesMut;
-use rsms_codec_smpp::{SmppMessage, decode_message_with_version, CommandId, CommandStatus, Encodable, BindTransmitterResp, BindReceiverResp, BindTransceiverResp, SubmitSmResp, EnquireLinkResp, UnbindResp, SmppVersion};
+use rsms_codec_smpp::{SmppMessage, decode_message_with_version, CommandId, CommandStatus, Encodable, BindTransmitterResp, SubmitSmResp, EnquireLinkResp, UnbindResp, SmppVersion};
 use rsms_core::{Frame, Result};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -81,6 +81,41 @@ fn encode_smpp_error_resp(command_id: CommandId, sequence_number: u32, status: C
     encode_smpp_pdu_header(command_id, sequence_number, status as u32, 0)
 }
 
+struct BindInfo {
+    system_id: String,
+    password: String,
+    interface_version: u8,
+    resp_command_id: CommandId,
+    bind_type_name: &'static str,
+}
+
+fn extract_bind_info(msg: &SmppMessage) -> Option<BindInfo> {
+    match msg {
+        SmppMessage::BindTransmitter(b) => Some(BindInfo {
+            system_id: b.system_id.clone(),
+            password: b.password.clone(),
+            interface_version: b.interface_version,
+            resp_command_id: CommandId::BIND_TRANSMITTER_RESP,
+            bind_type_name: "发送端",
+        }),
+        SmppMessage::BindReceiver(b) => Some(BindInfo {
+            system_id: b.system_id.clone(),
+            password: b.password.clone(),
+            interface_version: b.interface_version,
+            resp_command_id: CommandId::BIND_RECEIVER_RESP,
+            bind_type_name: "接收端",
+        }),
+        SmppMessage::BindTransceiver(b) => Some(BindInfo {
+            system_id: b.system_id.clone(),
+            password: b.password.clone(),
+            interface_version: b.interface_version,
+            resp_command_id: CommandId::BIND_TRANSCEIVER_RESP,
+            bind_type_name: "收发一体",
+        }),
+        _ => None,
+    }
+}
+
 #[async_trait]
 impl crate::protocol::ProtocolHandler for SmppHandler {
     fn name(&self) -> &'static str {
@@ -99,212 +134,67 @@ impl crate::protocol::ProtocolHandler for SmppHandler {
             Err(e) => {
                 tracing::error!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "SMPP 消息解码失败: {e}");
                 tracing::debug!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "原始数据 (hex): {:02x?}", frame_bytes);
-                
                 return Ok(HandleResult::Stop);
             }
         };
 
+        if let Some(info) = extract_bind_info(&msg) {
+            tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "收到SMPP绑定({}): system_id={}", info.bind_type_name, info.system_id);
+            
+            let credentials = AuthCredentials::Smpp {
+                system_id: info.system_id.clone(),
+                password: info.password.clone(),
+                interface_version: info.interface_version,
+            };
+            
+            let auth_result = if let Some(ref handler) = self.auth_handler {
+                let conn_info = conn.connection_info().await;
+                handler.authenticate(&info.system_id, credentials, &conn_info).await
+            } else {
+                Ok(AuthResult::success(info.system_id.clone()))
+            };
+            
+            let (status, should_continue) = match &auth_result {
+                Ok(result) if result.status == 0 => {
+                    conn.set_authenticated_account(result.account.clone()).await;
+                    conn.set_protocol_version(info.interface_version).await;
+                    tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "SMPP认证成功: account={}, version={:02x}", result.account, info.interface_version);
+                    (0, true)
+                }
+                Ok(result) => {
+                    tracing::warn!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "SMPP认证失败: status={}", result.status);
+                    (result.status, false)
+                }
+                Err(e) => {
+                    tracing::error!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "SMPP认证错误: {}", e);
+                    (1, false)
+                }
+            };
+
+            let resp = BindTransmitterResp {
+                system_id: "SERVER".to_string(),
+                sc_interface_version: info.interface_version,
+            };
+            let mut body = BytesMut::new();
+            resp.encode(&mut body).unwrap();
+            
+            let mut pdu = encode_smpp_pdu_header(info.resp_command_id, sequence_number, status, body.len());
+            pdu.extend_from_slice(&body);
+            conn.write_frame(&pdu).await?;
+            
+            if should_continue {
+                tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "发送SMPP绑定响应: status=0");
+            }
+            
+            return Ok(if should_continue { HandleResult::Continue } else { HandleResult::Stop });
+        }
+
         match msg {
-            SmppMessage::BindTransmitter(b) => {
-                tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "收到SMPP绑定(发送端): system_id={}", b.system_id);
-                
-                let credentials = AuthCredentials::Smpp {
-                    system_id: b.system_id.clone(),
-                    password: b.password.clone(),
-                    interface_version: b.interface_version,
-                };
-                
-                let auth_result = if let Some(ref handler) = self.auth_handler {
-                    let conn_info = conn.connection_info().await;
-                    handler.authenticate(&b.system_id, credentials, &conn_info).await
-                } else {
-                    Ok(AuthResult::success(b.system_id.clone()))
-                };
-                
-                match auth_result {
-                    Ok(result) if result.status == 0 => {
-                        conn.set_authenticated_account(result.account.clone()).await;
-                        conn.set_protocol_version(b.interface_version).await;
-                        tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "SMPP认证成功: account={}, version={:02x}", result.account, b.interface_version);
-                        
-                        let resp = BindTransmitterResp {
-                            system_id: "SERVER".to_string(),
-                            sc_interface_version: b.interface_version,
-                        };
-                        let mut body = BytesMut::new();
-                        resp.encode(&mut body).unwrap();
-                        
-                        let mut pdu = encode_smpp_pdu_header(CommandId::BIND_TRANSMITTER_RESP, sequence_number, 0, body.len());
-                        pdu.extend_from_slice(&body);
-                        conn.write_frame(&pdu).await?;
-                        tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "发送SMPP绑定响应: status=0");
-                        return Ok(HandleResult::Continue);
-                    }
-                    Ok(result) => {
-                        tracing::warn!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "SMPP认证失败: status={}", result.status);
-                        let resp = BindTransmitterResp {
-                            system_id: "SERVER".to_string(),
-                            sc_interface_version: b.interface_version,
-                        };
-                        let mut body = BytesMut::new();
-                        resp.encode(&mut body).unwrap();
-                        
-                        let mut pdu = encode_smpp_pdu_header(CommandId::BIND_TRANSMITTER_RESP, sequence_number, result.status, body.len());
-                        pdu.extend_from_slice(&body);
-                        conn.write_frame(&pdu).await?;
-                        return Ok(HandleResult::Stop);
-                    }
-                    Err(e) => {
-                        tracing::error!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "SMPP认证错误: {}", e);
-                        let resp = BindTransmitterResp {
-                            system_id: "SERVER".to_string(),
-                            sc_interface_version: b.interface_version,
-                        };
-                        let mut body = BytesMut::new();
-                        resp.encode(&mut body).unwrap();
-                        
-                        let mut pdu = encode_smpp_pdu_header(CommandId::BIND_TRANSMITTER_RESP, sequence_number, 1, body.len());
-                        pdu.extend_from_slice(&body);
-                        conn.write_frame(&pdu).await?;
-                        return Ok(HandleResult::Stop);
-                    }
-                }
-            }
-            SmppMessage::BindReceiver(b) => {
-                tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "收到SMPP绑定(接收端): system_id={}", b.system_id);
-                
-                let credentials = AuthCredentials::Smpp {
-                    system_id: b.system_id.clone(),
-                    password: b.password.clone(),
-                    interface_version: b.interface_version,
-                };
-                
-                let auth_result = if let Some(ref handler) = self.auth_handler {
-                    let conn_info = conn.connection_info().await;
-                    handler.authenticate(&b.system_id, credentials, &conn_info).await
-                } else {
-                    Ok(AuthResult::success(b.system_id.clone()))
-                };
-                
-                match auth_result {
-                    Ok(result) if result.status == 0 => {
-                        conn.set_authenticated_account(result.account.clone()).await;
-                        conn.set_protocol_version(b.interface_version).await;
-                        tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "SMPP认证成功: account={}, version={:02x}", result.account, b.interface_version);
-                        
-                        let resp = BindReceiverResp {
-                            system_id: "SERVER".to_string(),
-                            sc_interface_version: b.interface_version,
-                        };
-                        let mut body = BytesMut::new();
-                        resp.encode(&mut body).unwrap();
-                        
-                        let mut pdu = encode_smpp_pdu_header(CommandId::BIND_RECEIVER_RESP, sequence_number, 0, body.len());
-                        pdu.extend_from_slice(&body);
-                        conn.write_frame(&pdu).await?;
-                        tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "发送SMPP绑定响应: status=0");
-                        return Ok(HandleResult::Continue);
-                    }
-                    Ok(result) => {
-                        tracing::warn!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "SMPP认证失败: status={}", result.status);
-                        let resp = BindReceiverResp {
-                            system_id: "SERVER".to_string(),
-                            sc_interface_version: b.interface_version,
-                        };
-                        let mut body = BytesMut::new();
-                        resp.encode(&mut body).unwrap();
-                        
-                        let mut pdu = encode_smpp_pdu_header(CommandId::BIND_RECEIVER_RESP, sequence_number, result.status, body.len());
-                        pdu.extend_from_slice(&body);
-                        conn.write_frame(&pdu).await?;
-                        return Ok(HandleResult::Stop);
-                    }
-                    Err(e) => {
-                        tracing::error!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "SMPP认证错误: {}", e);
-                        let resp = BindReceiverResp {
-                            system_id: "SERVER".to_string(),
-                            sc_interface_version: b.interface_version,
-                        };
-                        let mut body = BytesMut::new();
-                        resp.encode(&mut body).unwrap();
-                        
-                        let mut pdu = encode_smpp_pdu_header(CommandId::BIND_RECEIVER_RESP, sequence_number, 1, body.len());
-                        pdu.extend_from_slice(&body);
-                        conn.write_frame(&pdu).await?;
-                        return Ok(HandleResult::Stop);
-                    }
-                }
-            }
-            SmppMessage::BindTransceiver(b) => {
-                tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "收到SMPP绑定(收发一体): system_id={}", b.system_id);
-                
-                let credentials = AuthCredentials::Smpp {
-                    system_id: b.system_id.clone(),
-                    password: b.password.clone(),
-                    interface_version: b.interface_version,
-                };
-                
-                let auth_result = if let Some(ref handler) = self.auth_handler {
-                    let conn_info = conn.connection_info().await;
-                    handler.authenticate(&b.system_id, credentials, &conn_info).await
-                } else {
-                    Ok(AuthResult::success(b.system_id.clone()))
-                };
-                
-                match auth_result {
-                    Ok(result) if result.status == 0 => {
-                        conn.set_authenticated_account(result.account.clone()).await;
-                        conn.set_protocol_version(b.interface_version).await;
-                        tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "SMPP认证成功: account={}, version={:02x}", result.account, b.interface_version);
-                        
-                        let resp = BindTransceiverResp {
-                            system_id: "SERVER".to_string(),
-                            sc_interface_version: b.interface_version,
-                        };
-                        let mut body = BytesMut::new();
-                        resp.encode(&mut body).unwrap();
-                        
-                        let mut pdu = encode_smpp_pdu_header(CommandId::BIND_TRANSCEIVER_RESP, sequence_number, 0, body.len());
-                        pdu.extend_from_slice(&body);
-                        conn.write_frame(&pdu).await?;
-                        tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "发送SMPP绑定响应: status=0");
-                        return Ok(HandleResult::Continue);
-                    }
-                    Ok(result) => {
-                        tracing::warn!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "SMPP认证失败: status={}", result.status);
-                        let resp = BindTransceiverResp {
-                            system_id: "SERVER".to_string(),
-                            sc_interface_version: b.interface_version,
-                        };
-                        let mut body = BytesMut::new();
-                        resp.encode(&mut body).unwrap();
-                        
-                        let mut pdu = encode_smpp_pdu_header(CommandId::BIND_TRANSCEIVER_RESP, sequence_number, result.status, body.len());
-                        pdu.extend_from_slice(&body);
-                        conn.write_frame(&pdu).await?;
-                        return Ok(HandleResult::Stop);
-                    }
-                    Err(e) => {
-                        tracing::error!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "SMPP认证错误: {}", e);
-                        let resp = BindTransceiverResp {
-                            system_id: "SERVER".to_string(),
-                            sc_interface_version: b.interface_version,
-                        };
-                        let mut body = BytesMut::new();
-                        resp.encode(&mut body).unwrap();
-                        
-                        let mut pdu = encode_smpp_pdu_header(CommandId::BIND_TRANSCEIVER_RESP, sequence_number, 1, body.len());
-                        pdu.extend_from_slice(&body);
-                        conn.write_frame(&pdu).await?;
-                        return Ok(HandleResult::Stop);
-                    }
-                }
-            }
-            SmppMessage::SubmitSm(ref _s) => {
+            SmppMessage::SubmitSm(_) => {
                 if conn.should_log(tracing::Level::DEBUG) {
                     tracing::debug!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "收到SMPP短信提交");
                 }
-                return Ok(HandleResult::Continue);
+                Ok(HandleResult::Continue)
             }
             SmppMessage::EnquireLink { .. } => {
                 tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "收到SMPP链路检测");
@@ -317,13 +207,13 @@ impl crate::protocol::ProtocolHandler for SmppHandler {
                 pdu.extend_from_slice(&body);
                 conn.write_frame(&pdu).await?;
                 tracing::debug!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "发送SMPP链路检测响应");
-                return Ok(HandleResult::Continue);
+                Ok(HandleResult::Continue)
             }
             SmppMessage::DeliverSm(d) => {
                 if conn.should_log(tracing::Level::DEBUG) {
                     tracing::debug!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "收到SMPP Deliver: from={}, to={}", d.source_addr, d.destination_addr);
                 }
-                return Ok(HandleResult::Continue);
+                Ok(HandleResult::Continue)
             }
             SmppMessage::Unbind(_) => {
                 tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "收到SMPP解绑请求");
@@ -336,9 +226,9 @@ impl crate::protocol::ProtocolHandler for SmppHandler {
                 pdu.extend_from_slice(&body);
                 conn.write_frame(&pdu).await?;
                 tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "发送SMPP解绑响应");
-                return Ok(HandleResult::Stop);
+                Ok(HandleResult::Stop)
             }
-            _ => return Ok(HandleResult::Stop),
+            _ => Ok(HandleResult::Stop),
         }
     }
 }
