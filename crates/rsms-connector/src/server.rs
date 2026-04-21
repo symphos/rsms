@@ -66,14 +66,11 @@ impl BoundServer {
         
         if let Some(source) = &self.message_source {
             let source_clone = Arc::clone(source);
-            let pool_clone = Arc::clone(&self.pool);
             let account_pool2 = Arc::clone(&self.account_pool);
             let account_config = account_config_provider.clone();
-            let handlers_clone = self.handlers.clone();
-            let eh = self.event_handler.clone();
             
             tokio::spawn(async move {
-                inbound_fetcher_task(source_clone, pool_clone, account_pool2, account_config, handlers_clone, eh).await;
+                inbound_fetcher_task(source_clone, account_pool2, account_config).await;
             });
         }
         
@@ -154,11 +151,8 @@ impl BoundServer {
 
 async fn inbound_fetcher_task(
     source: Arc<dyn MessageSource>,
-    _pool: Arc<ConnectionPool>,
     account_pool: Arc<AccountPool>,
     account_config_provider: Option<Arc<dyn AccountConfigProvider>>,
-    _handlers: Vec<Arc<dyn BusinessHandler>>,
-    _event_handler: Option<Arc<dyn ServerEventHandler>>,
 ) {
     let mut account_thread_counts: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
     
