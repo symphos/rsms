@@ -10,6 +10,7 @@ pub mod client;
 pub mod client_pool;
 pub mod connection;
 pub mod handlers;
+pub mod id_generator;
 pub mod pool;
 pub mod protocol;
 pub mod server;
@@ -27,6 +28,8 @@ pub use handlers::sgip::SgipHandler;
 pub use handlers::smgp::SmgpHandler;
 pub use handlers::smpp::SmppHandler;
 pub use pool::{ConnectionPool, AccountPool, AccountConnections};
+pub use id_generator::SimpleIdGenerator;
+pub use rsms_core::IdGenerator;
 pub use protocol::{
     ProtocolHandler, ProtocolConnection, AuthHandler, AuthCredentials, AuthResult,
     AccountConfig, AccountPoolConfig, AccountConfigProvider,

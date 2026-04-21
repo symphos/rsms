@@ -1,65 +1,15 @@
 use async_trait::async_trait;
 use bytes::BytesMut;
 use rsms_codec_smgp::{
-    SmgpMessage, SmgpMsgId, decode_message, CommandId, Encodable, LoginResp, 
-    SubmitResp as SmgpSubmitResp, ActiveTestResp, DeliverResp,
+    SmgpMessage, decode_message, CommandId, Encodable, LoginResp, 
+    ActiveTestResp, DeliverResp,
 };
 use rsms_core::{Frame, Result};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::protocol::{
     ProtocolConnection, AuthCredentials, AuthHandler, AuthResult, HandleResult,
-    Protocol,
 };
-
-static SMGP_NEXT_MSG_ID: AtomicU64 = AtomicU64::new(1);
-
-pub struct SmgpProtocol;
-
-impl SmgpProtocol {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for SmgpProtocol {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Protocol for SmgpProtocol {
-    type Submit = SmgpMessage;
-    type SubmitResp = SmgpSubmitResp;
-    type MsgId = SmgpMsgId;
-    type Deliver = SmgpMessage;
-
-    fn name(&self) -> &'static str {
-        "smgp"
-    }
-
-    fn next_msg_id(&self) -> u64 {
-        SMGP_NEXT_MSG_ID.fetch_add(1, Ordering::Relaxed)
-    }
-
-    fn encode_submit_resp(
-        &self,
-        sequence_id: u32,
-        msg_id: &Self::MsgId,
-        result: u32,
-    ) -> Vec<u8> {
-        let resp = SmgpSubmitResp {
-            msg_id: *msg_id,
-            status: result,
-        };
-        let mut body = BytesMut::new();
-        resp.encode(&mut body).unwrap();
-        let mut pdu = encode_pdu_header(CommandId::SubmitResp, sequence_id, body.len());
-        pdu.extend_from_slice(&body);
-        pdu
-    }
-}
 
 pub struct SmgpHandler {
     auth_handler: Option<Arc<dyn AuthHandler>>,

@@ -1,60 +1,12 @@
 use async_trait::async_trait;
 use bytes::BytesMut;
-use rsms_codec_smpp::{SmppMessage, decode_message_with_version, CommandId, CommandStatus, Encodable, BindTransmitterResp, SubmitSmResp, EnquireLinkResp, UnbindResp, SmppVersion};
+use rsms_codec_smpp::{SmppMessage, decode_message_with_version, CommandId, CommandStatus, Encodable, BindTransmitterResp, EnquireLinkResp, UnbindResp, SmppVersion};
 use rsms_core::{Frame, Result};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::protocol::{
-    AuthCredentials, AuthHandler, AuthResult, HandleResult, Protocol, ProtocolConnection,
+    AuthCredentials, AuthHandler, AuthResult, HandleResult, ProtocolConnection,
 };
-
-static NEXT_MSG_ID: AtomicU64 = AtomicU64::new(1);
-
-pub struct SmppProtocol;
-
-impl SmppProtocol {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for SmppProtocol {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Protocol for SmppProtocol {
-    type Submit = SmppMessage;
-    type SubmitResp = SubmitSmResp;
-    type MsgId = String;
-    type Deliver = SmppMessage;
-
-    fn name(&self) -> &'static str {
-        "smpp"
-    }
-
-    fn next_msg_id(&self) -> u64 {
-        NEXT_MSG_ID.fetch_add(1, Ordering::Relaxed)
-    }
-
-    fn encode_submit_resp(
-        &self,
-        sequence_id: u32,
-        msg_id: &Self::MsgId,
-        result: u32,
-    ) -> Vec<u8> {
-        let resp = SubmitSmResp {
-            message_id: msg_id.clone(),
-        };
-        let mut body = BytesMut::new();
-        resp.encode(&mut body).unwrap();
-        let mut pdu = encode_smpp_pdu_header(CommandId::SUBMIT_SM_RESP, sequence_id, result, body.len());
-        pdu.extend_from_slice(&body);
-        pdu
-    }
-}
 
 pub struct SmppHandler {
     auth_handler: Option<Arc<dyn AuthHandler>>,

@@ -1,11 +1,12 @@
 //! 业务处理器扩展（对齐 `BusinessHandlerInterface`）。
 use async_trait::async_trait;
-use rsms_core::{EndpointConfig, Frame, Result};
+use rsms_core::{EndpointConfig, Frame, IdGenerator, Result};
 use std::sync::Arc;
 
 pub struct InboundContext {
     pub endpoint: Arc<EndpointConfig>,
     pub conn: Arc<dyn ProtocolConnection>,
+    pub id_generator: Option<Arc<dyn IdGenerator>>,
 }
 
 #[async_trait]
@@ -47,8 +48,9 @@ pub async fn run_chain(
     conn: Arc<dyn ProtocolConnection>,
     handlers: &[Arc<dyn BusinessHandler>],
     frame: &Frame,
+    id_generator: Option<Arc<dyn IdGenerator>>,
 ) -> Result<()> {
-    let ctx = InboundContext { endpoint, conn };
+    let ctx = InboundContext { endpoint, conn, id_generator };
     if handlers.is_empty() {
         return NoopBusiness.on_inbound(&ctx, frame).await;
     }

@@ -21,10 +21,12 @@ use rsms_codec_cmpp::{
     CmppMessage, Deliver, Pdu, SubmitResp,
 };
 use rsms_connector::{
-    serve, AccountConfig, AccountConfigProvider, AccountPoolConfig, AuthCredentials,
-    AuthHandler, AuthResult, MessageItem, MessageSource, ProtocolConnection, ServerEventHandler,
+    serve, BoundServer, AccountConfig, AccountConfigProvider, AccountPoolConfig,
+    AuthCredentials, AuthHandler, AuthResult, MessageSource, MessageItem,
+    ServerEventHandler, ProtocolConnection,
+    SimpleIdGenerator,
 };
-use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Frame, RawPdu, Result};
+use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Frame, IdGenerator, RawPdu, Result};
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
 use std::collections::{HashMap, VecDeque};
@@ -159,17 +161,19 @@ impl AuthHandler for CmppAuthHandler {
 
 struct FileMessageSource {
     queues: Mutex<HashMap<String, VecDeque<MessageItem>>>,
+    id_generator: Arc<dyn IdGenerator>,
 }
 
 impl FileMessageSource {
-    fn new() -> Self {
+    fn new(id_generator: Arc<dyn IdGenerator>) -> Self {
         Self {
             queues: Mutex::new(HashMap::new()),
+            id_generator,
         }
     }
 
-    fn load_from_file(path: &str) -> Self {
-        let source = Self::new();
+    fn load_from_file(path: &str, id_generator: Arc<dyn IdGenerator>) -> Self {
+        let source = Self::new(id_generator);
         let messages = load_mo_messages(path);
         let mut splitter = LongMessageSplitter::new();
         for mo in messages {
@@ -184,12 +188,14 @@ impl FileMessageSource {
                 let frames = splitter.split(content_bytes, alphabet);
                 let mut items = Vec::new();
                 for frame in frames {
-                    let pdu = build_deliver_mo_with_udh(&mo.account, &mo.phone, &frame.content, frame.has_udhi);
+                    let msg_id = source.id_generator.next_msg_id().to_be_bytes();
+                    let pdu = build_deliver_mo_with_udh(&mo.account, &mo.phone, &frame.content, frame.has_udhi, &msg_id);
                     items.push(Arc::new(pdu) as Arc<dyn EncodedPdu>);
                 }
                 source.push_group_sync(&mo.account, MessageItem::Group { items });
             } else {
-                let pdu = build_deliver_mo(&mo.account, &mo.phone, &mo.content);
+                let msg_id = source.id_generator.next_msg_id().to_be_bytes();
+                let pdu = build_deliver_mo(&mo.account, &mo.phone, &mo.content, &msg_id);
                 source.push_sync(&mo.account, pdu);
             }
         }
@@ -398,9 +404,9 @@ fn build_deliver_report(account: &str, msg_id: &[u8; 8], phone: &str) -> RawPdu 
     pdu.to_pdu_bytes(0)
 }
 
-fn build_deliver_mo(account: &str, phone: &str, content: &str) -> RawPdu {
+fn build_deliver_mo(account: &str, phone: &str, content: &str, msg_id: &[u8; 8]) -> RawPdu {
     let deliver = Deliver {
-        msg_id: 0u64.to_be_bytes(),
+        msg_id: *msg_id,
         dest_id: account.to_string(),
         service_id: "SMS".to_string(),
         tppid: 0,
@@ -417,9 +423,9 @@ fn build_deliver_mo(account: &str, phone: &str, content: &str) -> RawPdu {
     pdu.to_pdu_bytes(0)
 }
 
-fn build_deliver_mo_with_udh(account: &str, phone: &str, content: &[u8], has_udhi: bool) -> RawPdu {
+fn build_deliver_mo_with_udh(account: &str, phone: &str, content: &[u8], has_udhi: bool, msg_id: &[u8; 8]) -> RawPdu {
     let deliver = Deliver {
-        msg_id: 0u64.to_be_bytes(),
+        msg_id: *msg_id,
         dest_id: account.to_string(),
         service_id: "SMS".to_string(),
         tppid: 0,
@@ -500,7 +506,10 @@ async fn main() -> Result<()> {
     let messages_path = Path::new(manifest_dir).join("messages.conf");
 
     let accounts = load_accounts(&accounts_path.to_string_lossy());
-    let msg_source = Arc::new(FileMessageSource::load_from_file(&messages_path.to_string_lossy()));
+    let msg_source = Arc::new(FileMessageSource::load_from_file(
+        &messages_path.to_string_lossy(),
+        Arc::new(SimpleIdGenerator::new()),
+    ));
 
     let config = Arc::new(
         EndpointConfig::new("cmpp-gateway", "0.0.0.0", 7890, 500, 60)

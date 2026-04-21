@@ -267,7 +267,6 @@ impl MessageSource for FileMessageSource {
 struct SgipBusinessHandler {
     msg_source: Arc<FileMessageSource>,
     merger: Arc<std::sync::Mutex<LongMessageMerger>>,
-    report_seq: std::sync::atomic::AtomicU32,
 }
 
 #[async_trait]
@@ -405,7 +404,11 @@ impl SgipBusinessHandler {
 
         if submit.report_flag == 1 {
             if let Some(account) = ctx.conn.authenticated_account().await {
-                let report = build_report(&account, &seq, phone, &self.report_seq);
+                let report_number = ctx.id_generator
+                    .as_ref()
+                    .map(|g| g.next_sequence_id())
+                    .unwrap_or(1);
+                let report = build_report(&account, &seq, phone, report_number);
                 self.msg_source.push(&account, report).await;
             }
         }
@@ -422,7 +425,7 @@ fn build_report(
     _account: &str,
     submit_seq: &SgipSequence,
     phone: &str,
-    report_seq_counter: &std::sync::atomic::AtomicU32,
+    report_number: u32,
 ) -> RawPdu {
     let report = Report {
         submit_sequence: *submit_seq,
@@ -433,10 +436,9 @@ fn build_report(
         reserve: [0u8; 8],
     };
 
-    let number = report_seq_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let now_ts = sgip_timestamp();
     report
-        .to_pdu_bytes(submit_seq.node_id, now_ts, number)
+        .to_pdu_bytes(submit_seq.node_id, now_ts, report_number)
         .to_vec()
         .into()
 }
@@ -554,7 +556,6 @@ async fn main() -> Result<()> {
         vec![Arc::new(SgipBusinessHandler {
             msg_source: msg_source.clone(),
             merger: Arc::new(std::sync::Mutex::new(LongMessageMerger::new())),
-            report_seq: std::sync::atomic::AtomicU32::new(1),
         })],
         Some(Arc::new(SgipAuthHandler { accounts })),
         Some(msg_source as Arc<dyn MessageSource>),

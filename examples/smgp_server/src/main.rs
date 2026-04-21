@@ -257,10 +257,15 @@ impl SmgpBusinessHandler {
             .unwrap_or("unknown");
 
         let msg_id = SmgpMsgId::from_u64(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64,
+            ctx.id_generator
+                .as_ref()
+                .map(|g| g.next_msg_id())
+                .unwrap_or_else(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as u64
+                }),
         );
 
         let resp = SubmitResp {

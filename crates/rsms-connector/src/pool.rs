@@ -1,7 +1,8 @@
 use crate::connection::Connection;
+use crate::id_generator::SimpleIdGenerator;
 use crate::protocol::{AccountConfig, AccountPoolConfig, SubmitLimiter};
 use crate::transaction::TransactionManager;
-use rsms_core::{Result, RsmsError, SessionState, ShutdownHandle, SimpleShutdownHandle};
+use rsms_core::{IdGenerator, Result, RsmsError, SessionState, ShutdownHandle, SimpleShutdownHandle};
 use rsms_ratelimit::SmoothRateLimiter;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, AtomicU16, Ordering};
@@ -87,6 +88,7 @@ pub struct AccountConnections {
     inflight: AtomicU16,
     rate_limiter: SmoothRateLimiter,
     pub transaction_manager: Arc<TransactionManager>,
+    id_generator: Arc<dyn IdGenerator>,
 }
 
 impl AccountConnections {
@@ -102,7 +104,12 @@ impl AccountConnections {
             inflight: AtomicU16::new(0),
             rate_limiter,
             transaction_manager,
+            id_generator: Arc::new(SimpleIdGenerator::new()),
         })
+    }
+
+    pub fn id_generator(&self) -> &Arc<dyn IdGenerator> {
+        &self.id_generator
     }
 
     pub async fn add_connection(&self, conn: Arc<Connection>) {

@@ -206,21 +206,3 @@ pub trait ClientEventHandler: Send + Sync {
     async fn on_connected(&self, conn: &Arc<dyn ProtocolConnection>);
     async fn on_disconnected(&self, conn_id: u64);
 }
-
-pub trait Protocol: Send + Sync + 'static {
-    type Submit: Send + Sync + Clone + 'static;
-    type SubmitResp: Send + Sync + Clone + 'static;
-    type MsgId: Send + Sync + 'static;
-    type Deliver: Send + Sync + Clone + 'static;
-
-    fn name(&self) -> &'static str;
-
-    fn next_msg_id(&self) -> u64;
-
-    fn encode_submit_resp(
-        &self,
-        sequence_id: u32,
-        msg_id: &Self::MsgId,
-        result: u32,
-    ) -> Vec<u8>;
-}

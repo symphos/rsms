@@ -323,7 +323,10 @@ impl SmppBusinessHandler {
         let phone = &submit.destination_addr;
         let source = &submit.source_addr;
 
-        let msg_id = format!("{:010}", sequence_id);
+        let msg_id = ctx.id_generator
+            .as_ref()
+            .map(|g| g.next_msg_id().to_string())
+            .unwrap_or_else(|| format!("{:010}", sequence_id));
         let resp = SubmitSmResp {
             message_id: msg_id.clone(),
         };

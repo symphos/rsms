@@ -2,68 +2,18 @@ use async_trait::async_trait;
 use bytes::BytesMut;
 use rsms_codec_cmpp::{
     CmppMessage, CommandId, CommandStatus, ConnectResp, Encodable,
-    SubmitResp as CmppSubmitResp,
     decode_message_with_version, encode_message,
 };
 use rsms_core::{Frame, Result};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::protocol::{
-    AuthCredentials, AuthHandler, AuthResult, HandleResult, Protocol, ProtocolConnection,
+    AuthCredentials, AuthHandler, AuthResult, HandleResult, ProtocolConnection,
     RESPONSE_COMMAND_MASK,
 };
 
-static CMPP_NEXT_MSG_ID: AtomicU64 = AtomicU64::new(1);
-
 const CMPP_VERSION_2_0: u8 = 0x20;
 const CMPP_VERSION_3_0: u8 = 0x30;
-
-pub struct CmppProtocol;
-
-impl CmppProtocol {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for CmppProtocol {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Protocol for CmppProtocol {
-    type Submit = CmppMessage;
-    type SubmitResp = CmppSubmitResp;
-    type MsgId = [u8; 8];
-    type Deliver = CmppMessage;
-
-    fn name(&self) -> &'static str {
-        "cmpp"
-    }
-
-    fn next_msg_id(&self) -> u64 {
-        CMPP_NEXT_MSG_ID.fetch_add(1, Ordering::Relaxed)
-    }
-
-    fn encode_submit_resp(
-        &self,
-        sequence_id: u32,
-        msg_id: &Self::MsgId,
-        result: u32,
-    ) -> Vec<u8> {
-        let resp = CmppSubmitResp {
-            msg_id: *msg_id,
-            result,
-        };
-        let mut body = BytesMut::new();
-        resp.encode(&mut body).unwrap();
-        let mut pdu = encode_pdu_header(CommandId::SubmitResp, sequence_id, body.len());
-        pdu.extend_from_slice(&body);
-        pdu
-    }
-}
 
 fn encode_pdu_header(command_id: CommandId, sequence_id: u32, body_len: usize) -> Vec<u8> {
     let total_len = 12 + body_len;

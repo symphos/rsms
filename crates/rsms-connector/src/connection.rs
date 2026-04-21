@@ -344,7 +344,7 @@ pub async fn run_connection(
         read_buf.extend_from_slice(&tmp_buf[..n]);
         conn.touch().await;
 
-        let frames = match decode_frames_drain(&mut read_buf) {
+        let frames = match decode_frames_drain(&mut read_buf, protocol) {
             Ok(f) => f,
             Err(e) => {
                 error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "frame decode: {e}");
@@ -372,7 +372,8 @@ pub async fn run_connection(
             }
             
             if handle_result.unwrap() == HandleResult::Continue {
-                if let Err(e) = run_chain(conn.config.clone(), conn_arc.clone() as Arc<dyn rsms_business::ProtocolConnection>, &handlers, &frame).await {
+                let id_gen = conn_arc.account_connections().await.map(|ac| ac.id_generator().clone());
+                if let Err(e) = run_chain(conn.config.clone(), conn_arc.clone() as Arc<dyn rsms_business::ProtocolConnection>, &handlers, &frame, id_gen).await {
                     error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "business: {}", e);
                 }
             }
@@ -418,8 +419,13 @@ pub async fn run_connection(
     }
 }
 
-fn decode_frames_drain(buf: &mut Vec<u8>) -> Result<Vec<Frame>> {
+fn decode_frames_drain(buf: &mut Vec<u8>, protocol: &str) -> Result<Vec<Frame>> {
     let mut frames = Vec::new();
+    
+    let seq_offset = match protocol {
+        "smpp" | "sgip" => 12,
+        _ => 8,
+    };
     
     while buf.len() >= 4 {
         let total = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
@@ -433,12 +439,15 @@ fn decode_frames_drain(buf: &mut Vec<u8>) -> Result<Vec<Frame>> {
         }
         
         let data: Vec<u8> = buf.drain(..total).collect();
-        let (command_id, sequence_id) = if data.len() >= 12 {
-            let command_id = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-            let sequence_id = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
-            (command_id, sequence_id)
+        let command_id = if data.len() >= 8 {
+            u32::from_be_bytes([data[4], data[5], data[6], data[7]])
         } else {
-            (0, 0)
+            0
+        };
+        let sequence_id = if data.len() >= seq_offset + 4 {
+            u32::from_be_bytes([data[seq_offset], data[seq_offset + 1], data[seq_offset + 2], data[seq_offset + 3]])
+        } else {
+            0
         };
         
         frames.push(Frame::new(command_id, sequence_id, RawPdu::from_vec(data)));

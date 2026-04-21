@@ -1,59 +1,13 @@
 use async_trait::async_trait;
 use bytes::BytesMut;
-use rsms_codec_sgip::{SgipMessage, CommandId, CommandStatus, Encodable, BindResp, SubmitResp as SgipSubmitResp, ReportResp, DeliverResp, UnbindResp, decode_message};
+use rsms_codec_sgip::{SgipMessage, CommandId, CommandStatus, Encodable, BindResp, ReportResp, DeliverResp, UnbindResp, decode_message};
 use rsms_core::{Frame, Result};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::protocol::{
-    AuthCredentials, AuthHandler, AuthResult, HandleResult, Protocol, ProtocolConnection,
+    AuthCredentials, AuthHandler, AuthResult, HandleResult, ProtocolConnection,
     RESPONSE_COMMAND_MASK,
 };
-
-static NEXT_MSG_ID: AtomicU64 = AtomicU64::new(1);
-
-pub struct SgipProtocol;
-
-impl SgipProtocol {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for SgipProtocol {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Protocol for SgipProtocol {
-    type Submit = SgipMessage;
-    type SubmitResp = SgipSubmitResp;
-    type MsgId = ();
-    type Deliver = SgipMessage;
-
-    fn name(&self) -> &'static str {
-        "sgip"
-    }
-
-    fn next_msg_id(&self) -> u64 {
-        NEXT_MSG_ID.fetch_add(1, Ordering::Relaxed)
-    }
-
-    fn encode_submit_resp(
-        &self,
-        _sequence_id: u32,
-        _msg_id: &Self::MsgId,
-        result: u32,
-    ) -> Vec<u8> {
-        let resp = SgipSubmitResp { result };
-        let mut body = BytesMut::new();
-        resp.encode(&mut body).unwrap();
-        let mut pdu = encode_sgip_pdu_header(CommandId::SubmitResp, body.len());
-        pdu.extend_from_slice(&body);
-        pdu
-    }
-}
 
 pub struct SgipHandler {
     auth_handler: Option<Arc<dyn AuthHandler>>,
