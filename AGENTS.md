@@ -11,15 +11,19 @@
 核心目标：
 1. **框架重构**：移除框架对 SubmitResp/SubmitSmResp 的自动发送，业务方在 `BusinessHandler::on_inbound` 中自己处理
 2. **消息队列**：使用方自己建内存消息队列，通过 `MessageSource.fetch()` 拉取，按账号隔离
-3. **客户端**：业务方自己维护 msgId → 业务信息映射，用于匹配 Report
-4. **优化**：使用 DashMap 替代 RwLock+HashMap 减少锁竞争
-5. **压测**：完成 CMPP/SMGP/SMPP/SGIP 四协议的单账号和多账号压测，保证消息零丢失
+3. **ID 生成器**：按账号维度的 MsgId/SequenceId 生成器，`AccountConnections` 持有 `IdGenerator` 实例
+4. **客户端**：业务方自己维护 msgId → 业务信息映射，用于匹配 Report
+5. **优化**：使用 DashMap 替代 RwLock+HashMap 减少锁竞争
+6. **压测**：完成 CMPP/SMGP/SMPP/SGIP 四协议的单账号和多账号压测，保证消息零丢失
 
 ## Instructions
 
 - 框架不缓存 MsgId，避免 OOM 风险
 - 服务端收到 Submit → 立即返回 Resp → 异步写队列
 - `MessageSource` trait：`fetch(account, batch_size) -> Vec<Vec<u8>>`，使用方自己序列化/反序列化
+- **`IdGenerator` trait（rsms-core）**：`next_msg_id() -> u64` + `next_sequence_id() -> u32`，按账号隔离
+- **`AccountConnections` 持有 `Arc<dyn IdGenerator>`**：`SimpleIdGenerator`（rsms-connector）为默认实现
+- **`InboundContext.id_generator`**：`Option<Arc<dyn IdGenerator>>`，业务 Handler 通过 `ctx.id_generator` 获取
 - 客户端匹配完 msgId 后立即移除
 - `send_request` 改用 `window.offer()` 等待而非 `try_offer()` 立即报错
 - 压测要有两个时间维度：压测时间 + 程序总时间
@@ -95,6 +99,17 @@
 - MockAccountConfigProvider 已设为 10000，但 pool 创建时初始值是 100
 - update_config 在连接注册到 pool 后才调用
 
+### 12. `Protocol` trait 死代码清理
+- `Protocol` trait 的 `next_msg_id()`、`encode_submit_resp()` 及关联类型（MsgId/Submit/SubmitResp/Deliver）从未被调用
+- `CmppProtocol`/`SmgpProtocol`/`SmppProtocol`/`SgipProtocol` 从未被实例化
+- 各 handler 的全局静态计数器（`static NEXT_MSG_ID: AtomicU64`）也是死代码
+- **已全部移除**，ID 生成职责迁移到 `IdGenerator` trait
+
+### 13. 服务端 `decode_frames_drain` sequence_id 偏移量 bug
+- 原来 `decode_frames_drain` 固定用 bytes 8-11 提取 sequence_id（只对 CMPP/SMGP 正确）
+- SMPP（16字节头）和 SGIP（20字节头）的 sequence_id 在 bytes 12-15
+- **已修复**：`decode_frames_drain` 新增 `protocol` 参数，SMPP/SGIP 用 offset 12
+
 ## Accomplished
 
 ### CMPP（✅ 全部完成）
@@ -120,19 +135,31 @@
 - ✅ stress_test.rs（1连接 + 5连接）全部通过，零丢失
 - ✅ **multi_account_stress_test.rs（5×5，300s）已通过，零丢失，MT TPS 12,563**
 
+### IdGenerator 重构（✅ 已完成）
+- ✅ `IdGenerator` trait 定义在 `rsms-core`，`SimpleIdGenerator` 实现在 `rsms-connector`
+- ✅ `AccountConnections` 按账号持有独立 `IdGenerator` 实例
+- ✅ `InboundContext.id_generator` 传递给业务 Handler
+- ✅ 移除 `Protocol` trait 死代码（`next_msg_id`、`encode_submit_resp`、4个 Protocol struct）
+- ✅ 修复 `decode_frames_drain` sequence_id 偏移量（SMPP/SGIP 用 offset 12）
+- ✅ 四协议示例 server 接入 `id_generator`
+- ✅ 全量测试通过（41 集成 + 11 压测）
+
 ## Relevant files / directories
 
-### 框架核心（已修改）
+### 框架核心
 ```
-crates/rsms-connector/src/protocol.rs              # MessageSource trait, AccountConfig
-crates/rsms-connector/src/client.rs                # send_request, SmppDecoder, window.offer, sequence_id 偏移量修复
+crates/rsms-core/src/id_generator.rs              # IdGenerator trait 定义
+crates/rsms-connector/src/id_generator.rs          # SimpleIdGenerator 实现
+crates/rsms-connector/src/protocol.rs              # MessageSource, AccountConfig, ProtocolHandler
+crates/rsms-connector/src/client.rs                # send_request, window.offer, sequence_id 偏移量
 crates/rsms-connector/src/server.rs                # inbound_fetcher_task, serve()
 crates/rsms-connector/src/connection.rs            # decode_frames_drain, run_connection, write_frame
 crates/rsms-connector/src/handlers/cmpp.rs         # CMPP handler
 crates/rsms-connector/src/handlers/smgp.rs         # SMGP handler
 crates/rsms-connector/src/handlers/smpp.rs         # SMPP handler
-crates/rsms-connector/src/pool.rs                  # AccountConnections, rate_limiter, window
-crates/rsms-connector/Cargo.toml                   # dashmap 依赖
+crates/rsms-connector/src/handlers/sgip.rs         # SGIP handler
+crates/rsms-connector/src/pool.rs                  # AccountConnections + id_generator
+crates/rsms-business/src/lib.rs                    # InboundContext + id_generator, run_chain
 crates/rsms-core/src/endpoint.rs                   # EndpointConfig + window_size + protocol
 crates/rsms-window/src/window.rs                   # offer vs try_offer
 ```
@@ -148,37 +175,19 @@ crates/rsms-codec-smpp/src/datatypes/command_id.rs # CommandId enum
 crates/rsms-codec-smpp/src/version.rs              # SmppVersion (V34/V50)
 ```
 
-### SMPP 压测文件
+### 测试文件
 ```
-examples/smpp-endpoint/tests/stress_test.rs                    # 4个单账号压测（V3.4/V5.0 × 1/5连接）用 write_frame
-examples/smpp-endpoint/tests/multi_account_stress_test.rs      # 1个多账号压测（5×5，300s）用 write_frame
-examples/smpp-endpoint/tests/mod.rs                            # 原有 9 个集成测试
-```
-
-### CMPP 压测文件（已完成）
-```
-examples/cmpp-endpoint/tests/stress_test.rs                    # 单账号压测
-examples/cmpp-endpoint/tests/multi_account_stress_test.rs      # 多账号压测（300s，已通过）
+tests/cmpp/                                        # CMPP 集成+压测测试
+tests/smgp/                                        # SMGP 集成+压测测试
+tests/smpp/                                        # SMPP 集成+压测测试
+tests/sgip/                                        # SGIP 集成+压测测试
+tests/common/                                      # 测试公共库
 ```
 
-### SMGP 压测文件（已完成）
+### 示例服务端/客户端
 ```
-examples/smgp-endpoint/tests/stress_test.rs                    # 单账号压测
-examples/smgp-endpoint/tests/multi_account_stress_test.rs      # 多账号压测（300s，已通过）
-```
-
-### SGIP 压测文件（已完成）
-```
-examples/sgip-endpoint/tests/stress_test.rs                    # 单账号压测（1连接 + 5连接）
-examples/sgip-endpoint/tests/multi_account_stress_test.rs      # 多账号压测（5×5，300s，已通过）
-```
-
-### 其他已更新的文件
-```
-examples/cmpp-endpoint/tests/cmpp_test.rs
-examples/cmpp-endpoint/tests/cmpp20_test.rs
-examples/cmpp-endpoint/src/server.rs / client.rs
-examples/smgp-endpoint/src/server.rs / client.rs
-examples/smpp-endpoint/src/server.rs / client.rs
-examples/sgip-endpoint/ (all handler/server/client files updated for MessageSource trait)
+examples/cmpp_server/    examples/cmpp_client/
+examples/smgp_server/    examples/smgp_client/
+examples/smpp_server/    examples/smpp_client/
+examples/sgip_server/    examples/sgip_client/
 ```
