@@ -3,8 +3,7 @@ pub mod datatypes;
 pub mod frame;
 pub mod message;
 pub mod registry;
-pub mod submit_v34;
-pub mod submit_v50;
+pub mod submit_decode;
 pub mod version;
 
 pub use codec::{

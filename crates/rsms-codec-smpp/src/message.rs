@@ -8,8 +8,7 @@ use crate::datatypes::{
     BindTransmitterResp, CancelSm, CancelSmResp, CommandId, DeliverSm, DeliverSmResp, EnquireLink,
     EnquireLinkResp, GenericNack, QuerySm, QuerySmResp, SubmitSm, SubmitSmResp, Unbind, UnbindResp,
 };
-use crate::submit_v34::{decode_deliver_sm_v34, decode_submit_sm_v34};
-use crate::submit_v50::{decode_deliver_sm_v50, decode_submit_sm_v50};
+use crate::submit_decode::{decode_deliver_sm, decode_submit_sm};
 use crate::version::SmppVersion;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -177,10 +176,7 @@ pub fn decode_message_with_version(
             })
         }
         CommandId::SUBMIT_SM => {
-            let submit = match version {
-                Some(SmppVersion::V50) => decode_submit_sm_v50(command_length, &body)?,
-                _ => decode_submit_sm_v34(command_length, &body)?,
-            };
+            let submit = decode_submit_sm(version, command_length, &body)?;
             SmppMessage::SubmitSm(submit)
         }
         CommandId::SUBMIT_SM_RESP => {
@@ -189,10 +185,7 @@ pub fn decode_message_with_version(
             SmppMessage::SubmitSmResp(SubmitSmResp { message_id })
         }
         CommandId::DELIVER_SM => {
-            let deliver = match version {
-                Some(SmppVersion::V50) => decode_deliver_sm_v50(command_length, &body)?,
-                _ => decode_deliver_sm_v34(command_length, &body)?,
-            };
+            let deliver = decode_deliver_sm(version, command_length, &body)?;
             SmppMessage::DeliverSm(deliver)
         }
         CommandId::DELIVER_SM_RESP => {

@@ -203,21 +203,21 @@ impl TransactionManager {
     pub async fn on_report(&self, report: ReportInfo) {
         let entry = {
             let transactions = self.inner.transactions.read().await;
-            
-            // 首先尝试用 msg_id 查找
+
             if let Some(tx) = transactions.get(&report.msg_id) {
                 Some(tx.clone())
             } else {
-                // 如果没找到，尝试在 seq_to_msg_id 映射中查找
                 let seq_to_msg = self.inner.seq_to_msg_id.read().await;
+                let mut found = None;
                 for (_, msg_id) in seq_to_msg.iter() {
                     if let Some(tx) = transactions.get(msg_id) {
                         if tx.info.msg_id.as_deref() == Some(&report.msg_id) {
-                            return;
+                            found = Some(tx.clone());
+                            break;
                         }
                     }
                 }
-                None
+                found
             }
         };
 

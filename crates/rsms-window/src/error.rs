@@ -29,7 +29,4 @@ pub enum WindowError {
     Internal(String),
 }
 
-unsafe impl Send for WindowError {}
-unsafe impl Sync for WindowError {}
-
 pub type WindowResult<T> = Result<T, WindowError>;

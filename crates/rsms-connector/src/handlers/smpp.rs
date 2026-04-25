@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use bytes::BytesMut;
-use rsms_codec_smpp::{SmppMessage, decode_message_with_version, CommandId, CommandStatus, Encodable, BindTransmitterResp, EnquireLinkResp, UnbindResp, SmppVersion};
+use rsms_codec_smpp::{SmppMessage, decode_message_with_version, CommandId, Encodable, BindTransmitterResp, EnquireLinkResp, UnbindResp, SmppVersion};
 use rsms_core::{Frame, Result};
 use std::sync::Arc;
 
@@ -26,11 +26,6 @@ fn encode_smpp_pdu_header(command_id: CommandId, sequence_number: u32, status: u
     pdu.extend_from_slice(&status.to_be_bytes());
     pdu.extend_from_slice(&sequence_number.to_be_bytes());
     pdu
-}
-
-#[allow(dead_code)]
-fn encode_smpp_error_resp(command_id: CommandId, sequence_number: u32, status: CommandStatus) -> Vec<u8> {
-    encode_smpp_pdu_header(command_id, sequence_number, status as u32, 0)
 }
 
 struct BindInfo {

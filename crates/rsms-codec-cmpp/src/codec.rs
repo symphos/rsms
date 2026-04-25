@@ -1,5 +1,5 @@
 use bytes::{Buf, BufMut, BytesMut};
-use rsms_core::{RawPdu, RsmsError};
+use rsms_core::{CstringError, RawPdu, RsmsError};
 use std::io::Cursor;
 use thiserror::Error;
 
@@ -95,6 +95,18 @@ impl From<CodecError> for RsmsError {
     }
 }
 
+impl From<CstringError> for CodecError {
+    fn from(e: CstringError) -> Self {
+        match e {
+            CstringError::Incomplete => CodecError::Incomplete,
+            CstringError::FieldTooLong { field, max_len } => CodecError::FieldValidation {
+                field,
+                reason: format!("exceeds maximum length of {} bytes", max_len - 1),
+            },
+        }
+    }
+}
+
 impl CodecError {
     pub fn to_command_status(&self) -> CommandStatus {
         match self {
@@ -112,38 +124,11 @@ pub fn decode_cstring(
     max_len: usize,
     field_name: &'static str,
 ) -> Result<String, CodecError> {
-    let mut string_bytes = Vec::new();
-    let mut bytes_read = 0;
-
-    while bytes_read < max_len {
-        if !buf.has_remaining() {
-            return Err(CodecError::Incomplete);
-        }
-        let byte = buf.get_u8();
-        bytes_read += 1;
-        if byte == 0 {
-            return Ok(String::from_utf8_lossy(&string_bytes).into_owned());
-        }
-        string_bytes.push(byte);
-    }
-
-    Err(CodecError::FieldValidation {
-        field: field_name,
-        reason: format!("exceeds maximum length of {} bytes", max_len - 1),
-    })
+    rsms_core::decode_cstring(buf, max_len, field_name).map_err(Into::into)
 }
 
 pub fn encode_cstring(buf: &mut BytesMut, value: &str, max_len: usize) -> Result<(), CodecError> {
-    let bytes = value.as_bytes();
-    if bytes.len() >= max_len {
-        return Err(CodecError::FieldValidation {
-            field: "cstring",
-            reason: format!("string length {} exceeds max {}", bytes.len(), max_len - 1),
-        });
-    }
-    buf.put(bytes);
-    buf.put_u8(0);
-    Ok(())
+    rsms_core::encode_cstring(buf, value, max_len).map_err(Into::into)
 }
 
 #[derive(Debug, Clone, PartialEq)]

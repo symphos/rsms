@@ -4,27 +4,35 @@ use std::io::Cursor;
 
 use crate::codec::decode_cstring;
 use crate::datatypes::{DeliverSm, SubmitSm};
-use crate::version::{
-    SMPP_V50_DEST_ADDR_SIZE, SMPP_V50_SERVICE_TYPE_SIZE, SMPP_V50_SOURCE_ADDR_SIZE,
-};
+use crate::version::SmppVersion;
 
-pub fn decode_submit_sm_v50(_header_length: u32, body: &[u8]) -> Result<SubmitSm, RsmsError> {
+fn default_version(version: Option<SmppVersion>) -> SmppVersion {
+    version.unwrap_or(SmppVersion::V34)
+}
+
+pub fn decode_submit_sm(
+    version: Option<SmppVersion>,
+    _header_length: u32,
+    body: &[u8],
+) -> Result<SubmitSm, RsmsError> {
+    let v = default_version(version);
     let mut cursor = Cursor::new(body);
 
     if body.len() < 10 {
         return Err(RsmsError::Codec("SubmitSm body too short".to_string()));
     }
 
-    let service_type = decode_cstring(&mut cursor, SMPP_V50_SERVICE_TYPE_SIZE, "service_type")
+    let service_type = decode_cstring(&mut cursor, v.service_type_size(), "service_type")
         .map_err(|e| RsmsError::Codec(e.to_string()))?;
     let source_addr_ton = cursor.get_u8();
     let source_addr_npi = cursor.get_u8();
-    let source_addr = decode_cstring(&mut cursor, SMPP_V50_SOURCE_ADDR_SIZE, "source_addr")
+    let source_addr = decode_cstring(&mut cursor, v.source_addr_size(), "source_addr")
         .map_err(|e| RsmsError::Codec(e.to_string()))?;
     let dest_addr_ton = cursor.get_u8();
     let dest_addr_npi = cursor.get_u8();
-    let destination_addr = decode_cstring(&mut cursor, SMPP_V50_DEST_ADDR_SIZE, "destination_addr")
-        .map_err(|e| RsmsError::Codec(e.to_string()))?;
+    let destination_addr =
+        decode_cstring(&mut cursor, v.destination_addr_size(), "destination_addr")
+            .map_err(|e| RsmsError::Codec(e.to_string()))?;
     let esm_class = cursor.get_u8();
     let protocol_id = cursor.get_u8();
     let priority_flag = cursor.get_u8();
@@ -67,23 +75,29 @@ pub fn decode_submit_sm_v50(_header_length: u32, body: &[u8]) -> Result<SubmitSm
     })
 }
 
-pub fn decode_deliver_sm_v50(_header_length: u32, body: &[u8]) -> Result<DeliverSm, RsmsError> {
+pub fn decode_deliver_sm(
+    version: Option<SmppVersion>,
+    _header_length: u32,
+    body: &[u8],
+) -> Result<DeliverSm, RsmsError> {
+    let v = default_version(version);
     let mut cursor = Cursor::new(body);
 
     if body.len() < 6 {
         return Err(RsmsError::Codec("DeliverSm body too short".to_string()));
     }
 
-    let service_type = decode_cstring(&mut cursor, SMPP_V50_SERVICE_TYPE_SIZE, "service_type")
+    let service_type = decode_cstring(&mut cursor, v.service_type_size(), "service_type")
         .map_err(|e| RsmsError::Codec(e.to_string()))?;
     let source_addr_ton = cursor.get_u8();
     let source_addr_npi = cursor.get_u8();
-    let source_addr = decode_cstring(&mut cursor, SMPP_V50_SOURCE_ADDR_SIZE, "source_addr")
+    let source_addr = decode_cstring(&mut cursor, v.source_addr_size(), "source_addr")
         .map_err(|e| RsmsError::Codec(e.to_string()))?;
     let dest_addr_ton = cursor.get_u8();
     let dest_addr_npi = cursor.get_u8();
-    let destination_addr = decode_cstring(&mut cursor, SMPP_V50_DEST_ADDR_SIZE, "destination_addr")
-        .map_err(|e| RsmsError::Codec(e.to_string()))?;
+    let destination_addr =
+        decode_cstring(&mut cursor, v.destination_addr_size(), "destination_addr")
+            .map_err(|e| RsmsError::Codec(e.to_string()))?;
     let esm_class = cursor.get_u8();
     let protocol_id = cursor.get_u8();
     let priority_flag = cursor.get_u8();

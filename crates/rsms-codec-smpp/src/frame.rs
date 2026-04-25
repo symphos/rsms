@@ -32,8 +32,7 @@ pub fn decode_frames(buf: &mut BytesMut) -> Result<Vec<Vec<u8>>, RsmsError> {
         }
         let total = u32::from_be_bytes(buf[0..4].try_into().unwrap()) as usize;
         if !(16..=100_000).contains(&total) {
-            buf.advance(1);
-            continue;
+            return Err(RsmsError::Codec(format!("invalid SMPP PDU total_length: {}", total)));
         }
         if buf.len() < total {
             break;

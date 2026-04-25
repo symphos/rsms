@@ -5,7 +5,6 @@ use rsms_codec_sgip::CommandId as SgipCommandId;
 use rsms_codec_smgp::CommandId as SmgpCommandId;
 use rsms_codec_smpp::CommandId as SmppCommandId;
 use rsms_core::{ConnectionInfo, RawPdu, Frame, Result, SessionState};
-use rsms_pipeline::{PipelineBuilder, SimplePipeline, PipelineConfig};
 use rsms_session::ConnectionContext;
 use rsms_window::{Window, WindowConfig};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -33,8 +32,6 @@ pub struct Connection {
     write: Mutex<OwnedWriteHalf>,
     ready: AtomicBool,
     ctx: Mutex<ConnectionContext>,
-    #[allow(dead_code)]
-    pipeline: Mutex<Option<SimplePipeline>>,
     authenticated_account: Mutex<Option<String>>,
     window: Option<Window<u32, Vec<u8>, Vec<u8>>>,
     last_active: Mutex<Instant>,
@@ -48,7 +45,6 @@ impl Connection {
         let local_addr = stream.local_addr().ok();
         let remote_addr = peer_addr;
         let (read, write) = stream.into_split();
-        let pipeline = PipelineBuilder::new(PipelineConfig::default()).build();
         let conn_info = ConnectionInfo::new(peer_addr, local_addr);
         let conn = Arc::new(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
@@ -56,7 +52,6 @@ impl Connection {
             write: Mutex::new(write),
             ready: AtomicBool::new(false),
             ctx: Mutex::new(ConnectionContext::with_connection_info(config, conn_info)),
-            pipeline: Mutex::new(Some(pipeline)),
             authenticated_account: Mutex::new(None),
             window: None,
             last_active: Mutex::new(Instant::now()),
@@ -71,7 +66,6 @@ impl Connection {
         let local_addr = stream.local_addr().ok();
         let remote_addr = peer_addr;
         let (read, write) = stream.into_split();
-        let pipeline = PipelineBuilder::new(PipelineConfig::default()).build();
         let window_config = WindowConfig::new(window_size as usize, config.timeout);
         let window = Window::new(window_config);
         let conn_info = ConnectionInfo::new(peer_addr, local_addr);
@@ -82,7 +76,6 @@ impl Connection {
             write: Mutex::new(write),
             ready: AtomicBool::new(false),
             ctx: Mutex::new(ConnectionContext::with_connection_info(config, conn_info)),
-            pipeline: Mutex::new(Some(pipeline)),
             authenticated_account: Mutex::new(None),
             window: Some(window),
             last_active: Mutex::new(Instant::now()),
@@ -115,6 +108,7 @@ impl Connection {
     }
 
     pub async fn mark_disconnected(&self) {
+        self.ready.store(false, Ordering::Release);
         let ctx = self.ctx.lock().await;
         ctx.mark_disconnected();
     }
@@ -260,7 +254,7 @@ impl ProtocolConnection for Connection {
     }
 
     fn should_log(&self, level: tracing::Level) -> bool {
-        self.config.log_level.map_or(true, |max| level <= max)
+        self.config.log_level.map_or(true, |max| level >= max)
     }
 }
 
@@ -458,34 +452,45 @@ fn decode_frames_drain(buf: &mut Vec<u8>, protocol: &str) -> Result<Vec<Frame>> 
 
 fn encode_close_packet(protocol: &str) -> Option<Vec<u8>> {
     let command_id: u32;
+    let header_len: usize;
     let body_len: usize;
     match protocol {
         "cmpp" => {
             command_id = CmppCommandId::Terminate as u32;
+            header_len = 12;
             body_len = 0;
         }
         "smgp" => {
             command_id = SmgpCommandId::Exit as u32;
+            header_len = 12;
             body_len = 1;
         }
         "sgip" => {
             command_id = SgipCommandId::Unbind as u32;
+            header_len = 20;
             body_len = 0;
         }
         "smpp" => {
             command_id = SmppCommandId::UNBIND as u32;
+            header_len = 16;
             body_len = 0;
         }
         _ => return None,
     };
 
-    let total_len = 20 + body_len;
+    let total_len = header_len + body_len;
     let mut pdu = Vec::with_capacity(total_len);
     pdu.extend_from_slice(&(total_len as u32).to_be_bytes());
     pdu.extend_from_slice(&command_id.to_be_bytes());
-    pdu.extend_from_slice(&[0u8; 12]); // sequence ID
+    if protocol == "smpp" {
+        pdu.extend_from_slice(&[0u8; 4]);
+    }
+    pdu.extend_from_slice(&[0u8; 4]);
+    if protocol == "sgip" {
+        pdu.extend_from_slice(&[0u8; 8]);
+    }
     if protocol == "smgp" {
-        pdu.extend_from_slice(&[0u8; 1]); // reserved byte
+        pdu.extend_from_slice(&[0u8; 1]);
     }
     Some(pdu)
 }

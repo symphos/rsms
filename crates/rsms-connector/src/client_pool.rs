@@ -99,9 +99,9 @@ impl ClientPool {
         event_handler: Option<Arc<dyn ClientEventHandler>>,
     ) -> Arc<Self> {
         let config = client_config.unwrap_or_default();
-        let (event_tx, _event_rx) = mpsc::channel(100);
+        let (event_tx, event_rx) = mpsc::channel(100);
 
-        Arc::new(Self {
+        let pool = Arc::new(Self {
             inner: RwLock::new(ClientPoolInner::new(max_channels)),
             endpoint,
             client_handler,
@@ -111,7 +111,17 @@ impl ClientPool {
             event_tx,
             shutdown_flag: AtomicBool::new(false),
             on_connection_ready: RwLock::new(None),
-        })
+        });
+
+        let pool_clone = Arc::clone(&pool);
+        tokio::spawn(async move {
+            let mut rx = event_rx;
+            while let Some(event) = rx.recv().await {
+                pool_clone.on_connection_event(event).await;
+            }
+        });
+
+        pool
     }
 
     pub async fn set_on_connection_ready<F>(&self, callback: F)

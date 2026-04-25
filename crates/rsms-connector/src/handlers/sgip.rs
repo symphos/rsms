@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use bytes::BytesMut;
-use rsms_codec_sgip::{SgipMessage, CommandId, CommandStatus, Encodable, BindResp, ReportResp, DeliverResp, UnbindResp, decode_message};
+use rsms_codec_sgip::{SgipMessage, CommandId, CommandStatus, Encodable, BindResp, ReportResp, UnbindResp, decode_message};
 use rsms_core::{Frame, Result};
 use std::sync::Arc;
 
@@ -28,14 +28,14 @@ fn encode_sgip_pdu_header(command_id: CommandId, body_len: usize) -> Vec<u8> {
     pdu
 }
 
-fn encode_sgip_error_response(command_id: u32, status: CommandStatus) -> Vec<u8> {
+fn encode_sgip_error_response(command_id: u32, sequence: &[u8], status: CommandStatus) -> Vec<u8> {
     let resp_command_id = command_id | RESPONSE_COMMAND_MASK;
     let body_len = 4;
     let total_len = 20 + body_len;
     let mut pdu = Vec::with_capacity(total_len);
     pdu.extend_from_slice(&total_len.to_be_bytes());
     pdu.extend_from_slice(&resp_command_id.to_be_bytes());
-    pdu.extend_from_slice(&[0u8; 12]);
+    pdu.extend_from_slice(sequence);
     pdu.extend_from_slice(&status.as_u32().to_be_bytes());
     pdu
 }
@@ -55,8 +55,10 @@ impl crate::protocol::ProtocolHandler for SgipHandler {
                 tracing::debug!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "原始数据 (hex): {:02x?}", frame_bytes);
                 
                 if frame.len() >= 20 {
+                    let sequence = &frame_bytes[8..20];
                     let error_pdu = encode_sgip_error_response(
                         frame.command_id,
+                        sequence,
                         CommandStatus::ESME_RINVSYNTAX,
                     );
                     let _ = conn.write_frame(&error_pdu).await;
@@ -146,19 +148,10 @@ impl crate::protocol::ProtocolHandler for SgipHandler {
                  pdu.extend_from_slice(&body);
                  conn.write_frame(&pdu).await?;
                  tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "发送SGIP报告响应: result=0");
-                 return Ok(HandleResult::Stop);
+                 return Ok(HandleResult::Continue);
             }
              SgipMessage::Deliver(d) => {
                  tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "收到SGIP短信下发: user_number={}, sp_number={}", d.user_number, d.sp_number);
-                 
-                 let resp = DeliverResp { result: 0 };
-                 let mut body = BytesMut::new();
-                 resp.encode(&mut body).unwrap();
-                 
-                 let mut pdu = encode_sgip_pdu_header(CommandId::DeliverResp, body.len());
-                 pdu.extend_from_slice(&body);
-                 conn.write_frame(&pdu).await?;
-                 tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "发送SGIP下发响应: result=0");
                  return Ok(HandleResult::Continue);
             }
             SgipMessage::Unbind(_) => {

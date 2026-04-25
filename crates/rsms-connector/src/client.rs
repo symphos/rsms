@@ -459,7 +459,7 @@ impl ProtocolConnection for ClientConnection {
     }
 
     fn should_log(&self, level: tracing::Level) -> bool {
-        self.endpoint.log_level.map_or(true, |max| level <= max)
+        self.endpoint.log_level.map_or(true, |max| level >= max)
     }
 }
 
@@ -630,7 +630,11 @@ async fn run_client_read_loop(
             conn.touch();
 
             // Check for connection close commands (e.g., CMPP Terminate, SMGP Exit)
-            if frame.command_id == CmppCommandId::Terminate as u32 || frame.command_id == SmgpCommandId::Exit as u32 {
+            if frame.command_id == CmppCommandId::Terminate as u32
+                || frame.command_id == SmgpCommandId::Exit as u32
+                || frame.command_id == SmppCommandId::UNBIND as u32
+                || frame.command_id == SgipCommandId::Unbind as u32
+            {
                 tracing::info!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), command_id = frame.command_id, "received terminate command, closing connection");
                 should_close = true;
                 break;
@@ -854,87 +858,14 @@ fn build_smpp_enquire_link_pdu() -> Vec<u8> {
     pdu
 }
 
-/// SGIP Keepalive 使用 Submit 报文（手机号=00000000000）
+/// SGIP 无专用心跳命令，使用 Trace 命令（0x00001000）作为轻量保活
 fn build_sgip_keepalive_pdu() -> Vec<u8> {
-    let sp_number = "00000000000"; // 11个0作为保活手机号
-    let mut body = Vec::new();
+    let total_len = (20u32).to_be_bytes();
+    let command_id = (0x00001000u32).to_be_bytes();
     
-    // SP Number (21 bytes, null-padded string)
-    let sp_number_bytes = sp_number.as_bytes();
-    body.extend_from_slice(sp_number_bytes);
-    body.resize(body.len() + 21 - sp_number_bytes.len(), 0);
-    
-    // Charge Number (21 bytes, null-padded string)
-    body.extend_from_slice(sp_number_bytes);
-    body.resize(body.len() + 21 - sp_number_bytes.len(), 0);
-    
-    // User Count
-    body.push(1);
-    
-    // User Number (21 bytes)
-    body.extend_from_slice(sp_number_bytes);
-    body.resize(body.len() + 21 - sp_number_bytes.len(), 0);
-    
-    // Corp Id (5 bytes)
-    body.resize(body.len() + 5, 0);
-    
-    // Service Type (10 bytes)
-    body.resize(body.len() + 10, 0);
-    
-    // Fee Type
-    body.push(0);
-    
-    // Fee Value (6 bytes)
-    body.resize(body.len() + 6, 0);
-    
-    // Given Value (6 bytes)
-    body.resize(body.len() + 6, 0);
-    
-    // Agent Flag
-    body.push(0);
-    
-    // Morelate To MT Flag
-    body.push(0);
-    
-    // Priority
-    body.push(0);
-    
-    // Expire Time (16 bytes)
-    body.resize(body.len() + 16, 0);
-    
-    // Schedule Time (16 bytes)
-    body.resize(body.len() + 16, 0);
-    
-    // Report Flag
-    body.push(0);
-    
-    // TPPID
-    body.push(0);
-    
-    // TPUDHI
-    body.push(0);
-    
-    // Msg Fmt
-    body.push(0);
-    
-    // Message Type
-    body.push(0);
-    
-    // Message Length (4 bytes) - 0 length for keepalive
-    body.extend_from_slice(&0u32.to_be_bytes());
-    
-    // Reserve (8 bytes)
-    body.resize(body.len() + 8, 0);
-    
-    let total_len = (20 + body.len()) as u32;
-    let command_id = SgipCommandId::Submit as u32;
-    let sequence = [0u8; 12]; // 12 bytes sequence
-    
-    let mut pdu = Vec::with_capacity(20 + body.len());
-    pdu.extend_from_slice(&total_len.to_be_bytes());
-    pdu.extend_from_slice(&command_id.to_be_bytes());
-    pdu.extend_from_slice(&sequence);
-    pdu.extend_from_slice(&body);
-    
+    let mut pdu = Vec::with_capacity(20);
+    pdu.extend_from_slice(&total_len);
+    pdu.extend_from_slice(&command_id);
+    pdu.extend_from_slice(&[0u8; 12]);
     pdu
 }

@@ -14,7 +14,6 @@ rsms-codec-sgip = { path = "../rsms-codec-sgip" }
 rsms-codec-smgp = { path = "../rsms-codec-smgp" }
 rsms-codec-smpp = { path = "../rsms-codec-smpp" }
 rsms-core = { path = "../rsms-core" }
-rsms-pipeline = { path = "../rsms-pipeline" }
 rsms-ratelimit = { path = "../rsms-ratelimit" }
 rsms-session = { path = "../rsms-session" }
 rsms-window = { path = "../rsms-window" }

@@ -9,7 +9,6 @@ pub const RESPONSE_COMMAND_MASK: u32 = 0x80000000;
 pub trait SubmitLimiter: Send + Sync {
     async fn try_acquire_submit(&self) -> bool;
     async fn acquire_submit(&self, timeout: std::time::Duration) -> bool;
-    async fn release_submit(&self);
 }
 
 pub trait FrameDecoder: Send + Sync {

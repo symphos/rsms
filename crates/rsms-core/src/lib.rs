@@ -1,4 +1,5 @@
 mod connection_info;
+mod cstring;
 mod encoded_pdu;
 mod endpoint;
 mod error;
@@ -9,6 +10,7 @@ mod session;
 mod shutdown;
 
 pub use connection_info::ConnectionInfo;
+pub use cstring::{decode_cstring, encode_cstring, CstringError};
 pub use encoded_pdu::{EncodedPdu, RawPdu};
 pub use endpoint::EndpointConfig;
 pub use error::{Result, RsmsError};

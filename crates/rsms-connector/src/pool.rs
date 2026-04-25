@@ -220,9 +220,6 @@ impl AccountConnections {
         self.rate_limiter.acquire(timeout).await
     }
 
-    pub async fn release_submit(&self) {
-    }
-
     pub async fn inflight(&self) -> usize {
         self.inflight.load(Ordering::Acquire) as usize
     }
@@ -304,10 +301,6 @@ impl SubmitLimiter for AccountConnections {
 
     async fn acquire_submit(&self, timeout: std::time::Duration) -> bool {
         self.acquire_submit(timeout).await
-    }
-
-    async fn release_submit(&self) {
-        self.release_submit().await;
     }
 }
 

@@ -6,7 +6,6 @@ pub mod codec;
 pub mod datatypes;
 pub mod frame;
 pub mod message;
-pub mod registry;
 
 pub use codec::{CodecError, Decodable, Encodable, Pdu, PduHeader, MAX_PDU_SIZE};
 pub use datatypes::{
@@ -15,4 +14,3 @@ pub use datatypes::{
 };
 pub use frame::{decode_frames, FrameDecoder};
 pub use message::{decode_message, SgipMessage};
-pub use registry::PduRegistry;

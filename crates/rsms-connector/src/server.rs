@@ -236,10 +236,7 @@ async fn inbound_fetch_loop(
                             for pdu in pdus {
                                 if let Err(e) = conn.write_frame(pdu.as_bytes()).await {
                                     error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), account = %account, "send failed: {}", e);
-                                } else {
-                                    info!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), account = %account, "pushed message");
                                 }
-                                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                             }
                         }
                     }

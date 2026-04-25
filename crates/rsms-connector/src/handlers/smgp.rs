@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use bytes::BytesMut;
 use rsms_codec_smgp::{
     SmgpMessage, decode_message, CommandId, Encodable, LoginResp, 
-    ActiveTestResp, DeliverResp,
+    ActiveTestResp,
 };
 use rsms_core::{Frame, Result};
 use std::sync::Arc;
@@ -40,7 +40,23 @@ impl crate::protocol::ProtocolHandler for SmgpHandler {
         let frame_bytes = frame.data_as_slice();
         let msg = match decode_message(frame_bytes) {
             Ok(m) => m,
-            Err(_) => {
+            Err(e) => {
+                tracing::error!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "SMGP 消息解码失败: {e}");
+                let seq_id = if frame_bytes.len() >= 12 {
+                    u32::from_be_bytes([frame_bytes[8], frame_bytes[9], frame_bytes[10], frame_bytes[11]])
+                } else {
+                    0
+                };
+                let resp = LoginResp {
+                    status: 0x0000000A,
+                    authenticator: [0u8; 16],
+                    version: 0x30,
+                };
+                let mut body = BytesMut::new();
+                resp.encode(&mut body).unwrap();
+                let mut pdu = encode_pdu_header(CommandId::LoginResp, seq_id, body.len());
+                pdu.extend_from_slice(&body);
+                let _ = conn.write_frame(&pdu).await;
                 return Ok(HandleResult::Stop);
             }
         };
@@ -137,15 +153,6 @@ impl crate::protocol::ProtocolHandler for SmgpHandler {
                 if conn.should_log(tracing::Level::INFO) {
                     tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "收到SMGP Deliver消息: seq_id={}", sequence_id);
                 }
-                
-                let resp = DeliverResp { status: 0 };
-                let mut body = BytesMut::new();
-                resp.encode(&mut body).unwrap();
-                
-                let mut pdu = encode_pdu_header(CommandId::DeliverResp, sequence_id, body.len());
-                pdu.extend_from_slice(&body);
-                conn.write_frame(&pdu).await?;
-                tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "发送SMGP Deliver响应: status=0");
                 return Ok(HandleResult::Continue);
             }
             SmgpMessage::Exit { sequence_id } => {

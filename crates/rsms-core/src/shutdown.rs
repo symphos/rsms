@@ -36,35 +36,6 @@ impl SimpleShutdownHandle {
         }
     }
 
-    /// Create a new handle with separate sender for external coordination.
-    /// Returns (handle, sender) where sender can be used to trigger wait completion.
-    #[allow(dead_code)]
-    pub fn with_sender() -> (Self, oneshot::Sender<()>) {
-        let (tx, rx) = oneshot::channel();
-        (
-            Self {
-                shutdown_flag: Arc::new(AtomicBool::new(false)),
-                shutdown_tx: std::sync::Mutex::new(None),
-                wait_rx: std::sync::Mutex::new(Some(rx)),
-            },
-            tx,
-        )
-    }
-
-    /// Create a handle from existing components.
-    #[allow(dead_code)]
-    pub fn from_parts(
-        shutdown_flag: Arc<AtomicBool>,
-        wait_rx: oneshot::Receiver<()>,
-    ) -> Self {
-        Self {
-            shutdown_flag,
-            shutdown_tx: std::sync::Mutex::new(None),
-            wait_rx: std::sync::Mutex::new(Some(wait_rx)),
-        }
-    }
-
-    /// Check if shutdown has been signaled.
     pub fn is_shutdown_signaled(&self) -> Arc<AtomicBool> {
         self.shutdown_flag.clone()
     }
@@ -137,17 +108,5 @@ mod tests {
 
         handle.shutdown();
         assert!(handle.is_shutdown_signaled().load(Ordering::Acquire));
-    }
-
-    #[tokio::test]
-    async fn test_shutdown_handle_wait() {
-        let (mut handle, tx) = SimpleShutdownHandle::with_sender();
-
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            let _ = tx.send(());
-        });
-
-        handle.wait().await;
     }
 }
