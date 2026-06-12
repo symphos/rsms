@@ -276,6 +276,7 @@ pub fn decode_message(buf: &[u8]) -> Result<SgipMessage, RsmsError> {
         }
         0x80000005 => SgipMessage::ReportResp(ReportResp { result: 0 }),
         0x00001000 => {
+            let mut cursor = Cursor::new(body.as_slice());
             let trace_value = decode_pstring(&mut cursor, 21)?;
             let mut reserve = [0u8; 8];
             if cursor.remaining() >= 8 {
@@ -287,6 +288,7 @@ pub fn decode_message(buf: &[u8]) -> Result<SgipMessage, RsmsError> {
             })
         }
         0x80001000 => {
+            let mut cursor = Cursor::new(body.as_slice());
             let result = cursor
                 .try_get_u32()
                 .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;

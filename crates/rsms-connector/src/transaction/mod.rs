@@ -207,6 +207,12 @@ impl TransactionManager {
         };
 
         if let Some(entry) = entry {
+            // 匹配成功后清理两表，避免长生命周期客户端无界增长（msg_id 键条目 + seq 映射）
+            if let Some(mid) = entry.info.msg_id.as_deref() {
+                self.inner.transactions.remove(mid);
+            }
+            self.inner.seq_to_msg_id.remove(&entry.info.sequence_id);
+
             let callback = self.inner.callback.read().await;
             if let Some(ref cb) = *callback {
                 cb.on_report(&report, &entry.info).await;
@@ -333,8 +339,8 @@ mod tests {
 
         assert_eq!(cb.resp_ok.load(Ordering::Relaxed), 1);
         assert_eq!(cb.reports.load(Ordering::Relaxed), 1, "报告应按 msg_id 匹配成功");
-        // resp 后 seq 键应已让位给 msg_id 键（仍只占 1 个事务条目）
-        assert_eq!(tm.transaction_count().await, 1);
+        // 报告匹配后应清理该条目（修复内存泄漏），事务表清空
+        assert_eq!(tm.transaction_count().await, 0, "报告匹配后应清理事务条目");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -29,7 +29,7 @@ fn encode_error_response(command_id: u32, sequence_id: u32, status: CommandStatu
     let body_len = 4;
     let total_len = 12 + body_len;
     let mut pdu = Vec::with_capacity(total_len);
-    pdu.extend_from_slice(&total_len.to_be_bytes());
+    pdu.extend_from_slice(&(total_len as u32).to_be_bytes());
     pdu.extend_from_slice(&resp_command_id.to_be_bytes());
     pdu.extend_from_slice(&sequence_id.to_be_bytes());
     pdu.extend_from_slice(&status.as_u32().to_be_bytes());

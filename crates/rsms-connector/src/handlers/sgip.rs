@@ -33,7 +33,7 @@ fn encode_sgip_error_response(command_id: u32, sequence: &[u8], status: CommandS
     let body_len = 4;
     let total_len = 20 + body_len;
     let mut pdu = Vec::with_capacity(total_len);
-    pdu.extend_from_slice(&total_len.to_be_bytes());
+    pdu.extend_from_slice(&(total_len as u32).to_be_bytes());
     pdu.extend_from_slice(&resp_command_id.to_be_bytes());
     pdu.extend_from_slice(sequence);
     pdu.extend_from_slice(&status.as_u32().to_be_bytes());
