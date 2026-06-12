@@ -163,10 +163,10 @@ P1 的 window/decode/flush/锁/去拷贝改动均验证正确。但审查追查�
 
 验证：`cargo test --workspace --lib` 全绿（含四个新模糊测试）；四协议集成测试全绿（cmpp15/cmpp20-8/sgip8/smgp9/smpp9）；多账号压测复跑零丢失（见下）。
 
-### 审查记录的其余 follow-up（未在本轮处理）
-- **P1-M1**（critic/code-reviewer 共识）：`write_frames` 批量写中途失败会丢弃该批剩余 PDU 且可能在线上留半个 PDU（流错位）；`MessageSource` 为至多一次语义。建议改为「写错误即拆连接」而非 `sleep+continue`。**待办**。
-- **P1-M2**：`run_outbound_fetcher` 取消了逐条 `ready_for_fetch()`（改批粒度）。低风险，待办。
-- **1.4 transaction 锁**：仍暂缓（两表原子一致性，需并发测试）。
+### 审查记录的 follow-up
+- ✅ **P1-M1**（critic/code-reviewer 共识）：`write_frames` 批量写中途失败可能在线上留半个 PDU（流错位），剩余 PDU 又无法重发（`MessageSource` 至多一次）。**已修**：客户端/服务端写失败即 `mark_disconnected`，不复用错位的流。
+- ✅ **1.4 transaction 锁**：**已完成**——两表改 `DashMap`，`on_submit_resp` 用「先 msg_id 落键、再删 seq 键」保持一致性，配并发零漏匹配回归测试。
+- **P1-M2**：`run_outbound_fetcher` 取消逐条 `ready_for_fetch()`（改批粒度）。低风险；P1-M1 的「写失败即拆连接」已覆盖「向正在拆除的连接写入」的主要后果。视为可接受，暂不再改。
 
 ---
 
