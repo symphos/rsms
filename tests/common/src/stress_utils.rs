@@ -37,7 +37,7 @@ pub fn format_timestamp(use_4_digit_year: bool) -> String {
     } else {
         format!(
             "{:02}{:02}{:02}{:02}{:02}{:02}",
-            (y as u64) % 100, mth + 1, d, h, m, sec
+            y % 100, mth + 1, d, h, m, sec
         )
     }
 }

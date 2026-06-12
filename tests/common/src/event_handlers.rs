@@ -9,6 +9,12 @@ pub struct TestEventHandler {
     pub disconnected: Arc<AtomicUsize>,
 }
 
+impl Default for TestEventHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TestEventHandler {
     pub fn new() -> Self {
         Self {
@@ -48,6 +54,12 @@ impl ServerEventHandler for TestEventHandler {
 
 pub struct TestClientEventHandler {
     pub disconnected_count: Arc<AtomicUsize>,
+}
+
+impl Default for TestClientEventHandler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TestClientEventHandler {

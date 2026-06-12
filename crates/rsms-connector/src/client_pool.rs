@@ -16,8 +16,11 @@ struct ClientPoolInner {
     max_channels: u16,
 }
 
+type ReadyCallbackFn =
+    Arc<dyn Fn(Arc<ClientConnection>) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+
 pub struct ConnectionReadyCallback {
-    inner: Arc<dyn Fn(Arc<ClientConnection>) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>,
+    inner: ReadyCallbackFn,
 }
 
 impl ConnectionReadyCallback {

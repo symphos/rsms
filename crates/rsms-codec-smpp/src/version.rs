@@ -7,7 +7,7 @@ pub enum SmppVersion {
 impl SmppVersion {
     pub fn from_interface_version(v: u8) -> Option<Self> {
         match v {
-            0x34 | 0x33 | 0x32 => Some(SmppVersion::V34),
+            0x32..=0x34 => Some(SmppVersion::V34),
             0x50 | 0x51 => Some(SmppVersion::V50),
             _ => None,
         }

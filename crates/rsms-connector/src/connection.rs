@@ -271,7 +271,7 @@ impl ProtocolConnection for Connection {
     }
 
     fn should_log(&self, level: tracing::Level) -> bool {
-        self.config.log_level.map_or(true, |max| level >= max)
+        self.config.log_level.is_none_or(|max| level >= max)
     }
 }
 
@@ -311,6 +311,7 @@ impl RateLimiter for SubmitLimiterAdapter {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_connection(
     read: OwnedReadHalf,
     conn: Arc<Connection>,

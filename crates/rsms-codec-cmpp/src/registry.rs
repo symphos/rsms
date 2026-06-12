@@ -8,9 +8,12 @@ use crate::datatypes::{
     TerminateResp,
 };
 
+/// 按 command_id 分发的 PDU 解码函数
+type PduDecodeFn = fn(PduHeader, &[u8]) -> Result<Pdu, CodecError>;
+
 pub struct PduRegistry {
     version: CmppVersion,
-    entries: HashMap<u32, fn(PduHeader, &[u8]) -> Result<Pdu, CodecError>>,
+    entries: HashMap<u32, PduDecodeFn>,
 }
 
 static REGISTRY_CACHE: [OnceLock<PduRegistry>; 2] = [OnceLock::new(), OnceLock::new()];

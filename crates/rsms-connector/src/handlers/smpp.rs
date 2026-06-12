@@ -74,7 +74,7 @@ impl crate::protocol::ProtocolHandler for SmppHandler {
         let sequence_number = frame.sequence_id;
         
         let version = conn.protocol_version().await;
-        let smpp_version = version.and_then(|v| SmppVersion::from_interface_version(v));
+        let smpp_version = version.and_then(SmppVersion::from_interface_version);
         
         let msg = match decode_message_with_version(frame_bytes, smpp_version) {
             Ok(m) => m,

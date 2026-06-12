@@ -28,14 +28,14 @@ impl SmppSubmit {
                     .as_bytes()
                     .first()
                     .copied()
-                    .unwrap_or(b'0') as u8,
+                    .unwrap_or(b'0'),
                 self.inner
                     .destination_addr
                     .as_bytes()
                     .first()
                     .copied()
-                    .unwrap_or(b'0') as u8,
-                self.inner.short_message.first().copied().unwrap_or(b'0') as u8,
+                    .unwrap_or(b'0'),
+                self.inner.short_message.first().copied().unwrap_or(b'0'),
                 self.inner.short_message.len().min(5) as u8,
                 0,
                 0,

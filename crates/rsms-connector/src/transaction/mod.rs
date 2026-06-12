@@ -197,12 +197,11 @@ impl TransactionManager {
             // 兜底：扫描 seq_to_msg_id 找到 msg_id 对应的事务
             let mut found = None;
             for kv in self.inner.seq_to_msg_id.iter() {
-                if let Some(tx) = self.inner.transactions.get(kv.value()) {
-                    if tx.info.msg_id.as_deref() == Some(report.msg_id.as_str()) {
+                if let Some(tx) = self.inner.transactions.get(kv.value())
+                    && tx.info.msg_id.as_deref() == Some(report.msg_id.as_str()) {
                         found = Some(tx.clone());
                         break;
                     }
-                }
             }
             found
         };

@@ -484,7 +484,7 @@ impl ProtocolConnection for ClientConnection {
     }
 
     fn should_log(&self, level: tracing::Level) -> bool {
-        self.endpoint.log_level.map_or(true, |max| level >= max)
+        self.endpoint.log_level.is_none_or(|max| level >= max)
     }
 }
 
@@ -739,11 +739,10 @@ async fn run_client_read_loop(
                         };
                         if pdu_slice.len() >= seq_off + 4 {
                             let seq_id = u32::from_be_bytes([pdu_slice[seq_off], pdu_slice[seq_off + 1], pdu_slice[seq_off + 2], pdu_slice[seq_off + 3]]);
-                            if let Some(window) = conn_clone.window.as_ref() {
-                                if window.contains(&seq_id).await {
+                            if let Some(window) = conn_clone.window.as_ref()
+                                && window.contains(&seq_id).await {
                                     continue;
                                 }
-                            }
                         }
                         match conn_clone.send_request(pending_pdu).await {
                             Ok(_) => {}
@@ -761,7 +760,7 @@ async fn run_client_read_loop(
                 conn: &conn,
             };
 
-            if conn.endpoint.log_level.map_or(true, |max| tracing::Level::INFO <= max) {
+            if conn.endpoint.log_level.is_none_or(|max| tracing::Level::INFO <= max) {
                 tracing::info!(
                     conn_id = conn.id,
                     remote_ip = %conn.remote_ip(),
@@ -834,7 +833,7 @@ async fn run_outbound_fetcher(
         let slices: Vec<&[u8]> = pdus.iter().map(|p| p.as_bytes()).collect();
         match conn.write_frames(&slices).await {
             Ok(_) => {
-                if conn.endpoint.log_level.map_or(true, |max| tracing::Level::TRACE <= max) {
+                if conn.endpoint.log_level.is_none_or(|max| tracing::Level::TRACE <= max) {
                     tracing::trace!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), batch = slices.len(), "send batch success");
                 }
             }
