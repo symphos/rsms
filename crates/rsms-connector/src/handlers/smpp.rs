@@ -123,8 +123,9 @@ impl crate::protocol::ProtocolHandler for SmppHandler {
                 sc_interface_version: info.interface_version,
             };
             let mut body = BytesMut::new();
-            resp.encode(&mut body).unwrap();
-            
+            resp.encode(&mut body)
+                .map_err(|e| rsms_core::RsmsError::Codec(e.to_string()))?;
+
             let mut pdu = encode_smpp_pdu_header(info.resp_command_id, sequence_number, status, body.len());
             pdu.extend_from_slice(&body);
             conn.write_frame(&pdu).await?;
@@ -148,7 +149,8 @@ impl crate::protocol::ProtocolHandler for SmppHandler {
                 
                 let resp = EnquireLinkResp;
                 let mut body = BytesMut::new();
-                resp.encode(&mut body).unwrap();
+                resp.encode(&mut body)
+                    .map_err(|e| rsms_core::RsmsError::Codec(e.to_string()))?;
                 
                 let mut pdu = encode_smpp_pdu_header(CommandId::ENQUIRE_LINK_RESP, sequence_number, 0, body.len());
                 pdu.extend_from_slice(&body);
@@ -167,7 +169,8 @@ impl crate::protocol::ProtocolHandler for SmppHandler {
                 
                 let resp = UnbindResp;
                 let mut body = BytesMut::new();
-                resp.encode(&mut body).unwrap();
+                resp.encode(&mut body)
+                    .map_err(|e| rsms_core::RsmsError::Codec(e.to_string()))?;
                 
                 let mut pdu = encode_smpp_pdu_header(CommandId::UNBIND_RESP, sequence_number, 0, body.len());
                 pdu.extend_from_slice(&body);

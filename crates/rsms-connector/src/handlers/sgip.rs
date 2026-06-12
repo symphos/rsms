@@ -40,6 +40,20 @@ fn encode_sgip_error_response(command_id: u32, sequence: &[u8], status: CommandS
     pdu
 }
 
+/// 构造并发送 SGIP BindResp（三种认证结果共用）。
+async fn send_bind_resp(conn: &Arc<dyn ProtocolConnection>, result: u8) -> Result<()> {
+    let resp = BindResp {
+        result,
+        reserve: [0u8; 8],
+    };
+    let mut body = BytesMut::new();
+    resp.encode(&mut body)
+        .map_err(|e| rsms_core::RsmsError::Codec(e.to_string()))?;
+    let mut pdu = encode_sgip_pdu_header(CommandId::BindResp, body.len());
+    pdu.extend_from_slice(&body);
+    conn.write_frame(&pdu).await
+}
+
 #[async_trait]
 impl crate::protocol::ProtocolHandler for SgipHandler {
     fn name(&self) -> &'static str {
@@ -87,46 +101,18 @@ impl crate::protocol::ProtocolHandler for SgipHandler {
                      Ok(result) if result.status == 0 => {
                          tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "SGIP认证成功: account={}", result.account);
                          conn.set_authenticated_account(result.account.clone()).await;
-                         
-                         let resp = BindResp {
-                             result: 0,
-                             reserve: [0u8; 8],
-                         };
-                         let mut body = BytesMut::new();
-                         resp.encode(&mut body).unwrap();
-                         
-                         let mut pdu = encode_sgip_pdu_header(CommandId::BindResp, body.len());
-                         pdu.extend_from_slice(&body);
-                         conn.write_frame(&pdu).await?;
+                         send_bind_resp(&conn, 0).await?;
                          tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "发送SGIP登录响应: result=0");
                          return Ok(HandleResult::Continue);
                      }
                      Ok(result) => {
                          tracing::warn!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "SGIP认证失败: status={}", result.status);
-                         let resp = BindResp {
-                             result: result.status as u8,
-                             reserve: [0u8; 8],
-                         };
-                         let mut body = BytesMut::new();
-                         resp.encode(&mut body).unwrap();
-                         
-                         let mut pdu = encode_sgip_pdu_header(CommandId::BindResp, body.len());
-                         pdu.extend_from_slice(&body);
-                         conn.write_frame(&pdu).await?;
+                         send_bind_resp(&conn, result.status as u8).await?;
                          return Ok(HandleResult::Stop);
                      }
                      Err(e) => {
                          tracing::error!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "SGIP认证错误: {}", e);
-                         let resp = BindResp {
-                             result: 1,
-                             reserve: [0u8; 8],
-                         };
-                         let mut body = BytesMut::new();
-                         resp.encode(&mut body).unwrap();
-                         
-                         let mut pdu = encode_sgip_pdu_header(CommandId::BindResp, body.len());
-                         pdu.extend_from_slice(&body);
-                         conn.write_frame(&pdu).await?;
+                         send_bind_resp(&conn, 1).await?;
                          return Ok(HandleResult::Stop);
                      }
                  }
@@ -142,7 +128,8 @@ impl crate::protocol::ProtocolHandler for SgipHandler {
                  
                  let resp = ReportResp { result: 0 };
                  let mut body = BytesMut::new();
-                 resp.encode(&mut body).unwrap();
+                 resp.encode(&mut body)
+                     .map_err(|e| rsms_core::RsmsError::Codec(e.to_string()))?;
                  
                  let mut pdu = encode_sgip_pdu_header(CommandId::ReportResp, body.len());
                  pdu.extend_from_slice(&body);
@@ -159,7 +146,8 @@ impl crate::protocol::ProtocolHandler for SgipHandler {
                 
                 let resp = UnbindResp;
                 let mut body = BytesMut::new();
-                resp.encode(&mut body).unwrap();
+                resp.encode(&mut body)
+                    .map_err(|e| rsms_core::RsmsError::Codec(e.to_string()))?;
                 
                 let mut pdu = encode_sgip_pdu_header(CommandId::UnbindResp, body.len());
                 pdu.extend_from_slice(&body);
