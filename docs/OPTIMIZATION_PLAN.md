@@ -172,10 +172,8 @@ P1 的 window/decode/flush/锁/去拷贝改动均验证正确。但审查追查�
 
 ## 阶段 2（P2）：架构 / 可维护性
 
-### 2.1 移除死代码 crate `rsms-pipeline`
-- **现状**：除自身外无任何 crate/example/test 引用（仅文档与 `Cargo.toml` 成员）。`server.rs` 的 `mark_pipeline_ready()` 名不副实。
-- **决策点**（需你拍板）：(A) 从 workspace 移除该 crate 并清理 `mark_pipeline_ready()` 等悬挂命名；(B) 保留作为未来方向。**建议 A**。
-- **风险**：低（确认无外部引用后）。
+### 2.1 移除死代码 crate `rsms-pipeline` ✅ 已完成（2849f11）
+- 复核确认除自身外无引用；已删除 crate，并把 `mark_pipeline_ready()` 重命名为 `mark_ready()`（实际只是置 ready 位，与该 crate 无关）。
 
 ### 2.2 4 个 handler 去重
 - **位置**：`crates/rsms-connector/src/handlers/{cmpp,smgp,smpp,sgip}.rs`
@@ -187,16 +185,15 @@ P1 的 window/decode/flush/锁/去拷贝改动均验证正确。但审查追查�
 - **改动**：引入 `ServerBuilder`/`ClientBuilder`（或 `ServeConfig`/`ConnectConfig` + `with_*`），与既有 `EndpointConfig`/`AccountConfig` 风格一致；合并 `connect` 与 `connect_with_pool` 公共部分。
 - **风险**：中（对外 API 变更）。**需保留旧函数或提供迁移**：示例/测试同步更新。
 
-### 2.4 trait 清理
-- 合并 core / business 两处同名 `ProtocolConnection`（定义到 `rsms-core` 再 re-export）。
-- 评估 `ProtocolHandler::submit_limiter()`：返回值无人消费 → 删除或真正接入。
-- 评估 `ProtocolHandler` 是否值得保留多态（当前是字符串 match 派发）。
-- **风险**：中。跨 crate 改动，逐步验证编译。
+### 2.4 trait 清理 ⏭️ 经核实，多数前提不成立 → 跳过
+- **`submit_limiter()` 并非死代码**：在 `connection.rs:236/293` 经 `SubmitLimiterAdapter` 桥接到 business 的 `rate_limiter()`，而后者被真实业务 handler 使用（`tests/cmpp/cmpp_test.rs:148/175`）。删除会破坏限流桥接。
+- **两处同名 `ProtocolConnection` 是有意的双层视图**：connector 的全量 trait（handler↔连接，14 方法）+ business 的最小视图（4 方法），由适配器桥接。合并会迫使 business 层依赖更多。
+- 唯一残留是「同名」造成的认知成本（connection.rs 用 `as BusinessProtocolConnection` 别名）——纯命名问题，公开 API 重命名收益低，暂不做。
 
-### 2.5 crate 边界
-- `rsms-core` 的 tokio 依赖裁剪到必要 feature（如仅 `sync`）；评估 `EndpointConfig` 内 `tracing::Level` 是否外移。
-- smpp `address.rs` 的 ton/npi 死常量：合并为单个 `#[allow(dead_code)]` 模块或删除。
-- **风险**：低-中。
+### 2.5 crate 边界 ✅ 已完成（65b977f）
+- `rsms-core` tokio features 收窄 `["sync","rt","macros","time"]` → `["sync"]`，rt/macros 移 dev-deps。
+- SMPP `address.rs` ton/npi 逐项 `#[allow(dead_code)]` 合并为模块级单标注（保留为规范参考表）。
+- `EndpointConfig` 内 `tracing::Level`：用于按端点控制日志级别，属合理配置项，不外移。
 
 ### 阶段 2 验收
 - 全量测试（单元 + 四协议集成 + 压测）全绿；对外 API 变更在 README/示例中同步。
