@@ -789,10 +789,11 @@ async fn run_outbound_fetcher(
                 }
             }
             Err(e) => {
-                if conn.endpoint.log_level.map_or(true, |max| tracing::Level::DEBUG <= max) {
-                    tracing::debug!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "send failed: {}", e);
-                }
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                // 批量写失败可能在线上留下半个 PDU（流错位），且本批剩余 PDU 已无法重发。
+                // 标记连接断开并退出 fetcher——绝不复用一条可能错位的流（由上层重连）。
+                error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "send batch failed, closing connection: {}", e);
+                conn.mark_disconnected().await;
+                break;
             }
         }
     }

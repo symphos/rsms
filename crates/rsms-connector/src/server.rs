@@ -238,7 +238,9 @@ async fn inbound_fetch_loop(
                         }
                         let slices: Vec<&[u8]> = pdus.iter().map(|p| p.as_bytes()).collect();
                         if let Err(e) = conn.write_frames(&slices).await {
-                            error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), account = %account, "send failed: {}", e);
+                            // 写失败可能造成流错位；标记连接断开，避免后续 fetch 复用这条流。
+                            error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), account = %account, "send failed, marking connection disconnected: {}", e);
+                            conn.mark_disconnected().await;
                         }
                     }
                     Err(e) => {
