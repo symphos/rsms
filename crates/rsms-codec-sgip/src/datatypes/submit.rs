@@ -207,8 +207,14 @@ impl Decodable for Submit {
         let msg_fmt = buf.get_u8();
         let message_type = buf.get_u8();
         let message_length = buf.get_u32() as usize;
+        if buf.remaining() < message_length {
+            return Err(CodecError::Incomplete);
+        }
         let mut message_content = vec![0u8; message_length];
         buf.copy_to_slice(&mut message_content);
+        if buf.remaining() < 8 {
+            return Err(CodecError::Incomplete);
+        }
         let mut reserve = [0u8; 8];
         buf.copy_to_slice(&mut reserve);
 
@@ -334,5 +340,22 @@ mod tests {
         assert_eq!(decoded.service_type, "SMS");
         assert_eq!(decoded.fee_value, "000100");
         assert_eq!(decoded.user_numbers, vec!["13800138000"]);
+    }
+
+    #[test]
+    fn submit_decode_oversized_message_length_is_err_not_panic() {
+        // 回归（P0.2）：message_length 是 u32，谎报超大值（如 u32::MAX）时既不能
+        // 预分配 ~4GB，也不能在 copy_to_slice 处 panic —— 必须返回 Err。
+        // total_length 不变 ⇒ body_len 守卫通过，命中长度校验。
+        let marker = b"SGIP_RSMS_MARKER";
+        let submit = Submit::new().with_message("10655000000", "13800138000", marker);
+        let mut bytes = submit.to_pdu_bytes(1, 0x04051200, 10).to_vec();
+        let pos = bytes
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .expect("marker present");
+        // message_length 是内容前的大端 u32
+        bytes[pos - 4..pos].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(decode_pdu::<Submit>(&bytes).is_err());
     }
 }

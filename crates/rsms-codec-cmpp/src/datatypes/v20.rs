@@ -198,8 +198,14 @@ pub fn decode_submit_v20(
     }
 
     let msg_length = buf.get_u8() as usize;
+    if buf.remaining() < msg_length {
+        return Err(CodecError::Incomplete);
+    }
     let mut msg_content = vec![0u8; msg_length];
     buf.copy_to_slice(&mut msg_content);
+    if buf.remaining() < 8 {
+        return Err(CodecError::Incomplete);
+    }
     let mut reserve = [0u8; 8];
     buf.copy_to_slice(&mut reserve);
 

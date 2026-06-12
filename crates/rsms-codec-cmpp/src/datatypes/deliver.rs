@@ -105,6 +105,9 @@ impl Decodable for Deliver {
         let src_terminal_type = buf.get_u8();
         let registered_delivery = buf.get_u8();
         let msg_length = buf.get_u8() as usize;
+        if buf.remaining() < msg_length {
+            return Err(CodecError::Incomplete);
+        }
         let mut msg_content = vec![0u8; msg_length];
         buf.copy_to_slice(&mut msg_content);
         let link_id = decode_pstring(buf, 20).map_err(|_| CodecError::Incomplete)?;

@@ -146,6 +146,9 @@ impl Decodable for SubmitSm {
         let data_coding = buf.get_u8();
         let sm_default_msg_id = buf.get_u8();
         let sm_length = buf.get_u8();
+        if buf.remaining() < sm_length as usize {
+            return Err(CodecError::Incomplete);
+        }
         let mut short_message = vec![0u8; sm_length as usize];
         buf.copy_to_slice(&mut short_message);
 

@@ -77,8 +77,14 @@ impl Decodable for Deliver {
         let tpudhi = buf.get_u8();
         let msg_fmt = buf.get_u8();
         let message_length = buf.get_u32() as usize;
+        if buf.remaining() < message_length {
+            return Err(CodecError::Incomplete);
+        }
         let mut message_content = vec![0u8; message_length];
         buf.copy_to_slice(&mut message_content);
+        if buf.remaining() < 8 {
+            return Err(CodecError::Incomplete);
+        }
         let mut reserve = [0u8; 8];
         buf.copy_to_slice(&mut reserve);
 

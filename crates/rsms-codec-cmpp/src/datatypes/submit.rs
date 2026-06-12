@@ -223,6 +223,9 @@ impl Decodable for Submit {
 
         let dest_terminal_type = buf.get_u8();
         let msg_length = buf.get_u8() as usize;
+        if buf.remaining() < msg_length {
+            return Err(CodecError::Incomplete);
+        }
         let mut msg_content = vec![0u8; msg_length];
         buf.copy_to_slice(&mut msg_content);
         let link_id = decode_pstring(buf, 20).map_err(|_| CodecError::Incomplete)?;
@@ -374,5 +377,22 @@ mod tests {
         assert_eq!(decoded.fee_code, "000000");
         assert_eq!(decoded.src_id, "106900");
         assert_eq!(decoded.link_id, "ABC123");
+    }
+
+    #[test]
+    fn submit_decode_oversized_msg_length_is_err_not_panic() {
+        // 回归（P0.2）：内部 msg_length 字段谎报超长时，解码必须返回 Err 而非在
+        // copy_to_slice 处 panic（截断/恶意 PDU 远程 DoS 防护）。
+        // total_length 不变 ⇒ body_len 守卫仍通过，从而命中 copy_to_slice 边界。
+        let marker = b"HELLO_RSMS_MARKER";
+        let submit = Submit::new().with_message("9000", "13800138000", marker);
+        let mut bytes = Pdu::from(submit).to_pdu_bytes(10).as_slice().to_vec();
+        let pos = bytes
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .expect("marker present");
+        // msg_length 是消息内容前的单字节，篡改为 255（远大于实际剩余）
+        bytes[pos - 1] = 0xFF;
+        assert!(decode_pdu::<Submit>(&bytes).is_err());
     }
 }
