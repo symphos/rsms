@@ -203,10 +203,11 @@ P1 的 window/decode/flush/锁/去拷贝改动均验证正确。但审查追查�
 
 ## 阶段 3（P3）：clippy 清理
 
-- **现状**：约 40 条 warning，多数可 `cargo clippy --fix` 自动修：needless borrow ×31、unnecessary cast、`map_or` 化简、`if` 可合并、过复杂类型（建 `type` 别名）、函数参数过多（随 2.3 builder 化解决）。
-- **改动**：先 `--fix` 跑自动修，再人工处理剩余（复杂类型别名、`is_some()`+`unwrap()` 等），目标 `cargo clippy --workspace --all-targets` 0 warning。
-- **风险**：低。但 `--fix` 后必须全量测试，防止自动改动引入语义偏差。
-- 提交：`style: 清理 clippy 警告`
+✅ 已完成（848c5fc）
+- `cargo clippy --fix` 自动修约 20 处；手动加 5 个类型别名（`PduDecodeFn` / `ReadyCallbackFn` / `UnhealthyCallback`×3）消除「过复杂类型」；内部编排函数 `run_connection` 加 `#[allow(clippy::too_many_arguments)]`。
+- 结果：**`cargo clippy --workspace --lib` 0 警告**。
+- 验证：workspace 全部 lib 测试 + 15 个集成/longmsg/dynamic/transaction 目标（111 测试）全绿。
+- 注：`--all-targets` 因 rustc 1.94 在部分测试文件上的既有 ICE 无法纯净运行，故以 `--lib` 为准（见阶段0补强中的 ICE 说明）。
 
 ---
 
