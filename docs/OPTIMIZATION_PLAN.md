@@ -175,10 +175,11 @@ P1 的 window/decode/flush/锁/去拷贝改动均验证正确。但审查追查�
 ### 2.1 移除死代码 crate `rsms-pipeline` ✅ 已完成（2849f11）
 - 复核确认除自身外无引用；已删除 crate，并把 `mark_pipeline_ready()` 重命名为 `mark_ready()`（实际只是置 ready 位，与该 crate 无关）。
 
-### 2.2 4 个 handler 去重 ⏳ 待定（建议：仅做 handler 内安全去重）
-- **位置**：`crates/rsms-connector/src/handlers/{cmpp,smgp,smpp,sgip}.rs`
-- **建议做法**：每个 handler 内部把 3 个几乎相同的 auth-结果→响应分支收成一个**本文件内**的小助手（字节输出不变、低风险），顺带把 `resp.encode(...).unwrap()` 改 `?`（修审查 Medium 项）。**不做**跨协议 trait 抽象（关键 connect 路径上中-高风险，收益边际）。
-- 尚未实施。
+### 2.2 4 个 handler 去重 ✅ 已完成（b9d9393）
+- 每个 handler 内把重复的认证响应构造收成本文件助手：CMPP `send_connect_resp`（4 处）、SMGP `send_login_resp`（4 处）、SGIP `send_bind_resp`（3 处）；SMPP 本就用 `extract_bind_info` 去重过，仅修 unwrap。
+- 全部 `resp.encode(...).unwrap()` 改 `.map_err(RsmsError::Codec)?`（修审查 Medium 项；响应为定长结构实际不会失败，行为不变）。
+- 未做跨协议 trait 抽象（关键 connect 路径风险/收益不划算）。净减 48 行。
+- 验证：`cargo clippy -p rsms-connector --lib` 0 警告；四协议集成测试全绿（含 auth 路径）。
 
 ### 2.3 API builder 化 ✅ 已完成
 - 引入 `ServerBuilder`（替换 `serve()`）、`ClientBuilder`（替换 `connect()`，泛型 over decoder）；`connect_with_pool` 降为 `pub(crate)` 内部 API。**不保留旧签名**（按决策）。
