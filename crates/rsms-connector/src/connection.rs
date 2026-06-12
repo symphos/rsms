@@ -103,7 +103,7 @@ impl Connection {
         self.ctx.lock().await.session_state()
     }
 
-    pub async fn mark_pipeline_ready(&self) {
+    pub async fn mark_ready(&self) {
         self.ready.store(true, Ordering::Release);
     }
 
