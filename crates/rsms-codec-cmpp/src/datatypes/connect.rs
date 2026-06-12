@@ -50,9 +50,10 @@ impl Decodable for Connect {
         }
         let source_addr = decode_pstring(buf, 6).map_err(|_| CodecError::Incomplete)?;
         let mut authenticator_source = [0u8; 16];
-        buf.copy_to_slice(&mut authenticator_source);
-        let version = buf.get_u8();
-        let timestamp = buf.get_u32();
+        buf.try_copy_to_slice(&mut authenticator_source)
+            .map_err(|_| CodecError::Incomplete)?;
+        let version = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let timestamp = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
         Ok(Connect {
             source_addr,
             authenticator_source,
@@ -102,10 +103,11 @@ impl Decodable for ConnectResp {
         if buf.remaining() < Self::BODY_SIZE {
             return Err(CodecError::Incomplete);
         }
-        let status = buf.get_u32();
+        let status = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
         let mut authenticator_ismg = [0u8; 16];
-        buf.copy_to_slice(&mut authenticator_ismg);
-        let version = buf.get_u8();
+        buf.try_copy_to_slice(&mut authenticator_ismg)
+            .map_err(|_| CodecError::Incomplete)?;
+        let version = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         Ok(ConnectResp {
             status,
             authenticator_ismg,

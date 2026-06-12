@@ -194,4 +194,19 @@ mod tests {
         let out = encode_message(&m).unwrap();
         assert_eq!(out, raw);
     }
+
+    // 见 sgip message.rs 同名测试：解码路径对任意过短 body 不得 panic
+    #[test]
+    fn decode_message_short_body_never_panics() {
+        // 回归：实际解码路径（Submit/Deliver::decode）对任意过短 body 不得 panic
+        for cmd in [CommandId::Submit, CommandId::Deliver] {
+            for body_len in 0..48usize {
+                let total = 12 + body_len;
+                let mut pdu = vec![0u8; total];
+                pdu[0..4].copy_from_slice(&(total as u32).to_be_bytes());
+                pdu[4..8].copy_from_slice(&(cmd as u32).to_be_bytes());
+                let _ = decode_message(&pdu); // 不得 panic
+            }
+        }
+    }
 }

@@ -94,17 +94,26 @@ impl Decodable for Deliver {
         }
 
         let mut msg_id_bytes = [0u8; 10];
-        buf.copy_to_slice(&mut msg_id_bytes);
-        let is_report = buf.get_u8();
-        let msg_fmt = buf.get_u8();
+        buf.try_copy_to_slice(&mut msg_id_bytes)
+            .map_err(|_| CodecError::Incomplete)?;
+        let is_report = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let msg_fmt = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let recv_time = decode_pstring(buf, 14).map_err(|_| CodecError::Incomplete)?;
         let src_term_id = decode_pstring(buf, 21).map_err(|_| CodecError::Incomplete)?;
         let dest_term_id = decode_pstring(buf, 21).map_err(|_| CodecError::Incomplete)?;
-        let msg_length = buf.get_u8() as usize;
+        let msg_length = buf.try_get_u8().map_err(|_| CodecError::Incomplete)? as usize;
+        if buf.remaining() < msg_length {
+            return Err(CodecError::Incomplete);
+        }
         let mut msg_content = vec![0u8; msg_length];
-        buf.copy_to_slice(&mut msg_content);
+        buf.try_copy_to_slice(&mut msg_content)
+            .map_err(|_| CodecError::Incomplete)?;
+        if buf.remaining() < 8 {
+            return Err(CodecError::Incomplete);
+        }
         let mut reserve = [0u8; 8];
-        buf.copy_to_slice(&mut reserve);
+        buf.try_copy_to_slice(&mut reserve)
+            .map_err(|_| CodecError::Incomplete)?;
 
         let optional_params = OptionalParameters::decode_remaining(buf)?;
 
@@ -274,7 +283,7 @@ impl Decodable for DeliverResp {
         if buf.remaining() < Self::BODY_SIZE {
             return Err(CodecError::Incomplete);
         }
-        let status = buf.get_u32();
+        let status = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
         Ok(DeliverResp { status })
     }
 
@@ -346,7 +355,7 @@ impl Decodable for Query {
             return Err(CodecError::Incomplete);
         }
 
-        let query_type = buf.get_u8();
+        let query_type = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let query_time = decode_pstring(buf, 8).map_err(|_| CodecError::Incomplete)?;
         let query_code = decode_pstring(buf, 10).map_err(|_| CodecError::Incomplete)?;
         let reserve = decode_pstring(buf, 8).map_err(|_| CodecError::Incomplete)?;

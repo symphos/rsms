@@ -443,4 +443,43 @@ mod tests {
             }
         }
     }
+
+    /// Fuzz regression: a remote peer must not be able to crash the decode path
+    /// by sending a truncated/short PDU body. For every body-carrying command id
+    /// and every short body length, `decode_message_with_version` must return
+    /// (Ok or Err) without ever panicking.
+    #[test]
+    fn decode_message_short_body_never_panics() {
+        // Command ids that carry a body (requests + responses with payload).
+        let command_ids: [u32; 12] = [
+            0x00000001, // Connect
+            0x80000001, // ConnectResp
+            0x00000004, // Submit
+            0x80000004, // SubmitResp
+            0x00000005, // Deliver
+            0x80000005, // DeliverResp
+            0x00000006, // Query
+            0x80000006, // QueryResp
+            0x00000007, // Cancel
+            0x80000007, // CancelResp
+            // Submit/SubmitV20 share command id 0x04; exercised above. Include
+            // ActiveTestResp which also carries a 1-byte body.
+            0x80000008, // ActiveTestResp
+            0x00000002, // Terminate (no body, included for completeness)
+        ];
+
+        for &command_id in &command_ids {
+            for n in 0u32..48 {
+                let total_length = PduHeader::SIZE as u32 + n;
+                let mut pdu = vec![0u8; PduHeader::SIZE + n as usize];
+                pdu[0..4].copy_from_slice(&total_length.to_be_bytes());
+                pdu[4..8].copy_from_slice(&command_id.to_be_bytes());
+                // sequence_id (bytes 8..12) left as zero.
+
+                // Must not panic for either CMPP version.
+                let _ = decode_message_with_version(&pdu, Some(0x30));
+                let _ = decode_message_with_version(&pdu, Some(0x20));
+            }
+        }
+    }
 }

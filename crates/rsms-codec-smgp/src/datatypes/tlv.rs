@@ -94,8 +94,8 @@ impl Tlv {
         if buf.remaining() < 4 {
             return Err(CodecError::Incomplete);
         }
-        let tag = buf.get_u16();
-        let length = buf.get_u16() as usize;
+        let tag = buf.try_get_u16().map_err(|_| CodecError::Incomplete)?;
+        let length = buf.try_get_u16().map_err(|_| CodecError::Incomplete)? as usize;
 
         if buf.remaining() < length {
             return Err(CodecError::Incomplete);
@@ -105,19 +105,20 @@ impl Tlv {
             0 => Tlv::Empty { tag },
             1 => Tlv::Byte {
                 tag,
-                value: buf.get_u8(),
+                value: buf.try_get_u8().map_err(|_| CodecError::Incomplete)?,
             },
             2 => {
-                let value = buf.get_u16();
+                let value = buf.try_get_u16().map_err(|_| CodecError::Incomplete)?;
                 Tlv::Short { tag, value }
             }
             4 => {
-                let value = buf.get_u32();
+                let value = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
                 Tlv::Int { tag, value }
             }
             _ => {
                 let mut value = vec![0u8; length];
-                buf.copy_to_slice(&mut value);
+                buf.try_copy_to_slice(&mut value)
+                    .map_err(|_| CodecError::Incomplete)?;
                 Tlv::Octets { tag, value }
             }
         };

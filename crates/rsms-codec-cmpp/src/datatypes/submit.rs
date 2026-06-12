@@ -195,25 +195,26 @@ impl Decodable for Submit {
         }
 
         let mut msg_id = [0u8; 8];
-        buf.copy_to_slice(&mut msg_id);
-        let pk_total = buf.get_u8();
-        let pk_number = buf.get_u8();
-        let registered_delivery = buf.get_u8();
-        let msg_level = buf.get_u8();
+        buf.try_copy_to_slice(&mut msg_id)
+            .map_err(|_| CodecError::Incomplete)?;
+        let pk_total = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let pk_number = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let registered_delivery = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let msg_level = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let service_id = decode_pstring(buf, 10).map_err(|_| CodecError::Incomplete)?;
-        let fee_user_type = buf.get_u8();
+        let fee_user_type = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let fee_terminal_id = decode_pstring(buf, 32).map_err(|_| CodecError::Incomplete)?;
-        let fee_terminal_type = buf.get_u8();
-        let tppid = buf.get_u8();
-        let tpudhi = buf.get_u8();
-        let msg_fmt = buf.get_u8();
+        let fee_terminal_type = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let tppid = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let tpudhi = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let msg_fmt = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let msg_src = decode_pstring(buf, 6).map_err(|_| CodecError::Incomplete)?;
         let fee_type = decode_pstring(buf, 2).map_err(|_| CodecError::Incomplete)?;
         let fee_code = decode_pstring(buf, 6).map_err(|_| CodecError::Incomplete)?;
         let valid_time = decode_pstring(buf, 17).map_err(|_| CodecError::Incomplete)?;
         let at_time = decode_pstring(buf, 17).map_err(|_| CodecError::Incomplete)?;
         let src_id = decode_pstring(buf, 21).map_err(|_| CodecError::Incomplete)?;
-        let dest_usr_tl = buf.get_u8();
+        let dest_usr_tl = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
 
         let mut dest_terminal_ids = Vec::with_capacity(dest_usr_tl as usize);
         for _ in 0..dest_usr_tl {
@@ -221,13 +222,14 @@ impl Decodable for Submit {
             dest_terminal_ids.push(dest_id);
         }
 
-        let dest_terminal_type = buf.get_u8();
-        let msg_length = buf.get_u8() as usize;
+        let dest_terminal_type = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let msg_length = buf.try_get_u8().map_err(|_| CodecError::Incomplete)? as usize;
         if buf.remaining() < msg_length {
             return Err(CodecError::Incomplete);
         }
         let mut msg_content = vec![0u8; msg_length];
-        buf.copy_to_slice(&mut msg_content);
+        buf.try_copy_to_slice(&mut msg_content)
+            .map_err(|_| CodecError::Incomplete)?;
         let link_id = decode_pstring(buf, 20).map_err(|_| CodecError::Incomplete)?;
 
         Ok(Submit {
@@ -298,8 +300,9 @@ impl Decodable for SubmitResp {
             return Err(CodecError::Incomplete);
         }
         let mut msg_id = [0u8; 8];
-        buf.copy_to_slice(&mut msg_id);
-        let result = buf.get_u32();
+        buf.try_copy_to_slice(&mut msg_id)
+            .map_err(|_| CodecError::Incomplete)?;
+        let result = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
         Ok(SubmitResp { msg_id, result })
     }
 

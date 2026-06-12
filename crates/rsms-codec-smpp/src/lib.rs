@@ -6,6 +6,9 @@ pub mod registry;
 pub mod submit_decode;
 pub mod version;
 
+#[cfg(test)]
+mod tests;
+
 pub use codec::{
     decode_cstring, encode_cstring, CodecError, Decodable, Encodable, Pdu, PduHeader, MAX_PDU_SIZE,
 };

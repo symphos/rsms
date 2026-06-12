@@ -92,27 +92,28 @@ impl Decodable for DeliverSm {
             });
         }
         let service_type = decode_cstring(buf, 6, "service_type")?;
-        let source_addr_ton = buf.get_u8();
-        let source_addr_npi = buf.get_u8();
+        let source_addr_ton = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let source_addr_npi = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let source_addr = decode_cstring(buf, 21, "source_addr")?;
-        let dest_addr_ton = buf.get_u8();
-        let dest_addr_npi = buf.get_u8();
+        let dest_addr_ton = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let dest_addr_npi = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let destination_addr = decode_cstring(buf, 21, "destination_addr")?;
-        let esm_class = buf.get_u8();
-        let protocol_id = buf.get_u8();
-        let priority_flag = buf.get_u8();
+        let esm_class = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let protocol_id = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let priority_flag = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let schedule_delivery_time = decode_cstring(buf, 17, "schedule_delivery_time")?;
         let validity_period = decode_cstring(buf, 17, "validity_period")?;
-        let registered_delivery = buf.get_u8();
-        let replace_if_present_flag = buf.get_u8();
-        let data_coding = buf.get_u8();
-        let sm_default_msg_id = buf.get_u8();
-        let sm_length = buf.get_u8();
+        let registered_delivery = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let replace_if_present_flag = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let data_coding = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let sm_default_msg_id = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let sm_length = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         if buf.remaining() < sm_length as usize {
             return Err(CodecError::Incomplete);
         }
         let mut short_message = vec![0u8; sm_length as usize];
-        buf.copy_to_slice(&mut short_message);
+        buf.try_copy_to_slice(&mut short_message)
+            .map_err(|_| CodecError::Incomplete)?;
 
         let mut tlvs = Vec::new();
         while buf.has_remaining() {

@@ -18,9 +18,15 @@ impl SgipSequence {
     }
 
     pub fn decode(buf: &mut Cursor<&[u8]>) -> Result<Self, std::io::Error> {
-        let node_id = buf.get_u32();
-        let timestamp = buf.get_u32();
-        let number = buf.get_u32();
+        let node_id = buf
+            .try_get_u32()
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
+        let timestamp = buf
+            .try_get_u32()
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
+        let number = buf
+            .try_get_u32()
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
         Ok(Self {
             node_id,
             timestamp,

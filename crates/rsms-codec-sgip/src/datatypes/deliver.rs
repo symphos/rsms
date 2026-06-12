@@ -73,20 +73,22 @@ impl Decodable for Deliver {
 
         let user_number = decode_pstring(buf, 21).map_err(|_| CodecError::Incomplete)?;
         let sp_number = decode_pstring(buf, 21).map_err(|_| CodecError::Incomplete)?;
-        let tppid = buf.get_u8();
-        let tpudhi = buf.get_u8();
-        let msg_fmt = buf.get_u8();
-        let message_length = buf.get_u32() as usize;
+        let tppid = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let tpudhi = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let msg_fmt = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let message_length = buf.try_get_u32().map_err(|_| CodecError::Incomplete)? as usize;
         if buf.remaining() < message_length {
             return Err(CodecError::Incomplete);
         }
         let mut message_content = vec![0u8; message_length];
-        buf.copy_to_slice(&mut message_content);
+        buf.try_copy_to_slice(&mut message_content)
+            .map_err(|_| CodecError::Incomplete)?;
         if buf.remaining() < 8 {
             return Err(CodecError::Incomplete);
         }
         let mut reserve = [0u8; 8];
-        buf.copy_to_slice(&mut reserve);
+        buf.try_copy_to_slice(&mut reserve)
+            .map_err(|_| CodecError::Incomplete)?;
 
         Ok(Deliver {
             user_number,
@@ -129,7 +131,7 @@ impl Decodable for DeliverResp {
         if buf.remaining() < Self::BODY_SIZE {
             return Err(CodecError::Incomplete);
         }
-        let result = buf.get_u32();
+        let result = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
         Ok(DeliverResp { result })
     }
 
@@ -180,12 +182,13 @@ impl Decodable for Report {
         }
         let submit_sequence =
             crate::datatypes::SgipSequence::decode(buf).map_err(|_| CodecError::Incomplete)?;
-        let report_type = buf.get_u8();
+        let report_type = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let user_number = decode_pstring(buf, 21).map_err(|_| CodecError::Incomplete)?;
-        let state = buf.get_u8();
-        let error_code = buf.get_u8();
+        let state = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let error_code = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let mut reserve = [0u8; 8];
-        buf.copy_to_slice(&mut reserve);
+        buf.try_copy_to_slice(&mut reserve)
+            .map_err(|_| CodecError::Incomplete)?;
         Ok(Report {
             submit_sequence,
             report_type,
@@ -226,7 +229,7 @@ impl Decodable for ReportResp {
         if buf.remaining() < Self::BODY_SIZE {
             return Err(CodecError::Incomplete);
         }
-        let result = buf.get_u32();
+        let result = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
         Ok(ReportResp { result })
     }
 
@@ -282,7 +285,8 @@ impl Decodable for Trace {
 
         let trace_value = decode_pstring(buf, 21).map_err(|_| CodecError::Incomplete)?;
         let mut reserve = [0u8; 8];
-        buf.copy_to_slice(&mut reserve);
+        buf.try_copy_to_slice(&mut reserve)
+            .map_err(|_| CodecError::Incomplete)?;
 
         Ok(Trace {
             trace_value,
@@ -343,10 +347,11 @@ impl Decodable for TraceResp {
             return Err(CodecError::Incomplete);
         }
 
-        let result = buf.get_u32();
+        let result = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
         let trace_result = decode_pstring(buf, 21).map_err(|_| CodecError::Incomplete)?;
         let mut reserve = [0u8; 8];
-        buf.copy_to_slice(&mut reserve);
+        buf.try_copy_to_slice(&mut reserve)
+            .map_err(|_| CodecError::Incomplete)?;
 
         Ok(TraceResp {
             result,

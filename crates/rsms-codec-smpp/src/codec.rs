@@ -27,14 +27,14 @@ impl PduHeader {
         if buf.remaining() < Self::SIZE {
             return Err(CodecError::Incomplete);
         }
-        let command_length = buf.get_u32();
-        let command_id_raw = buf.get_u32();
+        let command_length = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
+        let command_id_raw = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
         let command_id = CommandId::try_from(command_id_raw)
             .map_err(|_| CodecError::InvalidCommandId(command_id_raw))?;
-        let command_status_raw = buf.get_u32();
+        let command_status_raw = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
         let command_status = CommandStatus::try_from(command_status_raw)
             .map_err(|_| CodecError::InvalidCommandStatus(command_status_raw))?;
-        let sequence_number = buf.get_u32();
+        let sequence_number = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
 
         if command_length < Self::SIZE as u32 {
             return Err(CodecError::InvalidPduLength {

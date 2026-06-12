@@ -53,8 +53,8 @@ impl Decodable for QuerySm {
             });
         }
         let message_id = decode_cstring(buf, 65, "message_id")?;
-        let source_addr_ton = buf.get_u8();
-        let source_addr_npi = buf.get_u8();
+        let source_addr_ton = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let source_addr_npi = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let source_addr = decode_cstring(buf, 21, "source_addr")?;
         Ok(Self {
             message_id,
@@ -98,7 +98,7 @@ impl Decodable for QuerySmResp {
             });
         }
         let message_id = decode_cstring(buf, 65, "message_id")?;
-        let message_state = buf.get_u8();
+        let message_state = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let message_state_text = if buf.has_remaining() {
             Some(decode_cstring(buf, 65, "message_state_text")?)
         } else {

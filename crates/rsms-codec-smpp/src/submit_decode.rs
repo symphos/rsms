@@ -24,30 +24,56 @@ pub fn decode_submit_sm(
 
     let service_type = decode_cstring(&mut cursor, v.service_type_size(), "service_type")
         .map_err(|e| RsmsError::Codec(e.to_string()))?;
-    let source_addr_ton = cursor.get_u8();
-    let source_addr_npi = cursor.get_u8();
+    let source_addr_ton = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+    let source_addr_npi = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
     let source_addr = decode_cstring(&mut cursor, v.source_addr_size(), "source_addr")
         .map_err(|e| RsmsError::Codec(e.to_string()))?;
-    let dest_addr_ton = cursor.get_u8();
-    let dest_addr_npi = cursor.get_u8();
+    let dest_addr_ton = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+    let dest_addr_npi = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
     let destination_addr =
         decode_cstring(&mut cursor, v.destination_addr_size(), "destination_addr")
             .map_err(|e| RsmsError::Codec(e.to_string()))?;
-    let esm_class = cursor.get_u8();
-    let protocol_id = cursor.get_u8();
-    let priority_flag = cursor.get_u8();
+    let esm_class = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+    let protocol_id = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+    let priority_flag = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
     let schedule_delivery_time = decode_cstring(&mut cursor, 17, "schedule_delivery_time")
         .map_err(|e| RsmsError::Codec(e.to_string()))?;
     let validity_period = decode_cstring(&mut cursor, 17, "validity_period")
         .map_err(|e| RsmsError::Codec(e.to_string()))?;
-    let registered_delivery = cursor.get_u8();
-    let replace_if_present_flag = cursor.get_u8();
-    let data_coding = cursor.get_u8();
-    let sm_default_msg_id = cursor.get_u8();
-    let sm_length = cursor.get_u8();
+    let registered_delivery = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+    let replace_if_present_flag = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+    let data_coding = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+    let sm_default_msg_id = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+    let sm_length = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
     let short_message = if sm_length > 0 && cursor.remaining() >= sm_length as usize {
         let mut msg = vec![0u8; sm_length as usize];
-        cursor.copy_to_slice(&mut msg);
+        cursor
+            .try_copy_to_slice(&mut msg)
+            .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
         msg
     } else {
         vec![]
@@ -89,30 +115,56 @@ pub fn decode_deliver_sm(
 
     let service_type = decode_cstring(&mut cursor, v.service_type_size(), "service_type")
         .map_err(|e| RsmsError::Codec(e.to_string()))?;
-    let source_addr_ton = cursor.get_u8();
-    let source_addr_npi = cursor.get_u8();
+    let source_addr_ton = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+    let source_addr_npi = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
     let source_addr = decode_cstring(&mut cursor, v.source_addr_size(), "source_addr")
         .map_err(|e| RsmsError::Codec(e.to_string()))?;
-    let dest_addr_ton = cursor.get_u8();
-    let dest_addr_npi = cursor.get_u8();
+    let dest_addr_ton = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+    let dest_addr_npi = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
     let destination_addr =
         decode_cstring(&mut cursor, v.destination_addr_size(), "destination_addr")
             .map_err(|e| RsmsError::Codec(e.to_string()))?;
-    let esm_class = cursor.get_u8();
-    let protocol_id = cursor.get_u8();
-    let priority_flag = cursor.get_u8();
+    let esm_class = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+    let protocol_id = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+    let priority_flag = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
     let schedule_delivery_time = decode_cstring(&mut cursor, 17, "schedule_delivery_time")
         .map_err(|e| RsmsError::Codec(e.to_string()))?;
     let validity_period = decode_cstring(&mut cursor, 17, "validity_period")
         .map_err(|e| RsmsError::Codec(e.to_string()))?;
-    let registered_delivery = cursor.get_u8();
-    let replace_if_present_flag = cursor.get_u8();
-    let data_coding = cursor.get_u8();
-    let sm_default_msg_id = cursor.get_u8();
-    let sm_length = cursor.get_u8();
+    let registered_delivery = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+    let replace_if_present_flag = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+    let data_coding = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+    let sm_default_msg_id = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+    let sm_length = cursor
+        .try_get_u8()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
     let short_message = if sm_length > 0 && cursor.remaining() >= sm_length as usize {
         let mut msg = vec![0u8; sm_length as usize];
-        cursor.copy_to_slice(&mut msg);
+        cursor
+            .try_copy_to_slice(&mut msg)
+            .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
         msg
     } else {
         vec![]

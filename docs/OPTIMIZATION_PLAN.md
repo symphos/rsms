@@ -135,6 +135,41 @@
 
 ---
 
+## 阶段 0 补强（P0.3）：解码器全量加固（由 P0/P1 代码审查触发）
+
+对已提交的 P0/P1 做了 `code-reviewer` + `critic` 双路对抗审查。结论：**两路均通过**（无 Critical/High），
+P1 的 window/decode/flush/锁/去拷贝改动均验证正确。但审查追查「sgip message.rs 是否可达」时，
+发现 **P0.2（解码越界防护）此前打错了路径**：
+
+| 协议 | 服务端实际解码路径 | P0.2 当时改的位置 | 实况 |
+|------|------|------|------|
+| CMPP | `decode_message_with_version`→registry→`datatypes::*::decode` | 同一处 ✅ | 实路径已修 |
+| SMPP | `decode_message_with_version`→`submit_decode.rs`（本就有守卫） | `datatypes/*`（**非实路径**） | 实路径本安全 |
+| SGIP | `decode_message`（**内联**解码） | `datatypes/*`（**非实路径**） | 实路径曾漏 |
+| SMGP | `decode_message`→`datatypes::*::decode` | **P0.2 完全没碰** | 实路径曾漏 |
+
+进一步用针对**实路径** `decode_message` 的截断测试实证：不止 `copy_to_slice`，**未受保护的
+`get_u8()`/`get_u32()` 在 body 过短时同样越界 panic**（`bytes` 在 under-read 时 panic）——
+这是比 P0.2 更广的一整面，最初的健壮性分析也没覆盖。`panic=unwind`（默认），故畸形 PDU
+会断开该连接（非整进程 DoS）。
+
+**全量加固（4 路并行 executor 完成）**：把四个 codec crate 解码路径里所有会 panic 的
+`get_u8/u16/u32/u64/copy_to_slice` 换成 fallible 的 `try_get_*`/`try_copy_to_slice`
+（映射 `CodecError::Incomplete` / `RsmsError::Codec`），共约 283 处；编码/`put_*`/测试代码不动。
+另：
+- SGIP/SMPP `message.rs` 顶部 `buf[H..total_length]` 切片按 `min(buf.len())` 钳制，防越界 panic。
+- 为四协议各加「短 body 不 panic」模糊回归（`decode_message_short_body_never_panics`，遍历各命令 × body_len 0..48），全部通过。
+- 发现并修复 **SMPP `src/tests.rs` 是孤儿模块**（从未被声明 → 此前根本没编译/运行），已在 lib.rs 接入，8 个 roundtrip 测试现在真正运行。
+
+验证：`cargo test --workspace --lib` 全绿（含四个新模糊测试）；四协议集成测试全绿（cmpp15/cmpp20-8/sgip8/smgp9/smpp9）；多账号压测复跑零丢失（见下）。
+
+### 审查记录的其余 follow-up（未在本轮处理）
+- **P1-M1**（critic/code-reviewer 共识）：`write_frames` 批量写中途失败会丢弃该批剩余 PDU 且可能在线上留半个 PDU（流错位）；`MessageSource` 为至多一次语义。建议改为「写错误即拆连接」而非 `sleep+continue`。**待办**。
+- **P1-M2**：`run_outbound_fetcher` 取消了逐条 `ready_for_fetch()`（改批粒度）。低风险，待办。
+- **1.4 transaction 锁**：仍暂缓（两表原子一致性，需并发测试）。
+
+---
+
 ## 阶段 2（P2）：架构 / 可维护性
 
 ### 2.1 移除死代码 crate `rsms-pipeline`

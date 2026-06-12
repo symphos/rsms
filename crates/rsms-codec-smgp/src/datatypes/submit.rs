@@ -167,19 +167,19 @@ impl Decodable for Submit {
             return Err(CodecError::Incomplete);
         }
 
-        let msg_type = buf.get_u8();
-        let need_report = buf.get_u8();
-        let priority = buf.get_u8();
+        let msg_type = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let need_report = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let priority = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let service_id = decode_pstring(buf, 10).map_err(|_| CodecError::Incomplete)?;
         let fee_type = decode_pstring(buf, 2).map_err(|_| CodecError::Incomplete)?;
         let fee_code = decode_pstring(buf, 6).map_err(|_| CodecError::Incomplete)?;
         let fixed_fee = decode_pstring(buf, 6).map_err(|_| CodecError::Incomplete)?;
-        let msg_fmt = buf.get_u8();
+        let msg_fmt = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let valid_time = decode_pstring(buf, 17).map_err(|_| CodecError::Incomplete)?;
         let at_time = decode_pstring(buf, 17).map_err(|_| CodecError::Incomplete)?;
         let src_term_id = decode_pstring(buf, 21).map_err(|_| CodecError::Incomplete)?;
         let charge_term_id = decode_pstring(buf, 21).map_err(|_| CodecError::Incomplete)?;
-        let dest_term_id_count = buf.get_u8();
+        let dest_term_id_count = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
 
         let mut dest_term_ids = Vec::with_capacity(dest_term_id_count as usize);
         for _ in 0..dest_term_id_count {
@@ -187,11 +187,19 @@ impl Decodable for Submit {
             dest_term_ids.push(dest_id);
         }
 
-        let msg_length = buf.get_u8() as usize;
+        let msg_length = buf.try_get_u8().map_err(|_| CodecError::Incomplete)? as usize;
+        if buf.remaining() < msg_length {
+            return Err(CodecError::Incomplete);
+        }
         let mut msg_content = vec![0u8; msg_length];
-        buf.copy_to_slice(&mut msg_content);
+        buf.try_copy_to_slice(&mut msg_content)
+            .map_err(|_| CodecError::Incomplete)?;
+        if buf.remaining() < 8 {
+            return Err(CodecError::Incomplete);
+        }
         let mut reserve = [0u8; 8];
-        buf.copy_to_slice(&mut reserve);
+        buf.try_copy_to_slice(&mut reserve)
+            .map_err(|_| CodecError::Incomplete)?;
 
         let optional_params = OptionalParameters::decode_remaining(buf)?;
 
@@ -250,8 +258,9 @@ impl Decodable for SubmitResp {
             return Err(CodecError::Incomplete);
         }
         let mut msg_id_bytes = [0u8; 10];
-        buf.copy_to_slice(&mut msg_id_bytes);
-        let status = buf.get_u32();
+        buf.try_copy_to_slice(&mut msg_id_bytes)
+            .map_err(|_| CodecError::Incomplete)?;
+        let status = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
         Ok(SubmitResp {
             msg_id: SmgpMsgId::new(msg_id_bytes),
             status,

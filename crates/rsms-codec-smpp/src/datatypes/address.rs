@@ -23,8 +23,8 @@ impl Address {
     }
 
     pub fn decode(buf: &mut Cursor<&[u8]>) -> Result<Self, CodecError> {
-        let ton = buf.get_u8();
-        let npi = buf.get_u8();
+        let ton = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let npi = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let address = decode_cstring(buf, MAX_ADDRESS_BYTES, "address")?;
         Ok(Self { ton, npi, address })
     }
