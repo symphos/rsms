@@ -48,6 +48,9 @@ git checkout -b feature/your-feature
 
 ### 2. 开发与测试
 
+> 注意：Rust 工具链运行在 WSL 中，`cargo` 不在 Windows PATH 上，需在 WSL 内执行
+> （例如 `wsl bash -lc "cd /mnt/g/RustProjects/rsms && cargo ..."`）。
+
 ```bash
 # 编译检查
 cargo build --workspace
@@ -55,14 +58,14 @@ cargo build --workspace
 # 运行单元测试
 cargo test --workspace --lib
 
-# 运行集成测试（按协议）
-cargo test -p cmpp-endpoint-example --test cmpp-integration-tests
-cargo test -p smgp-endpoint-example --test smgp-integration-tests
-cargo test -p smpp-endpoint-example --test smpp-integration-tests
-cargo test -p sgip-endpoint-example --test sgip-integration-tests
+# 运行集成测试（四协议，均在 rsms-tests 包中）
+cargo test -p rsms-tests --test cmpp-integration
+cargo test -p rsms-tests --test smgp-integration
+cargo test -p rsms-tests --test smpp-integration
+cargo test -p rsms-tests --test sgip-integration
 
 # 运行长短信测试
-cargo test -p cmpp-endpoint-example --test cmpp-longmsg-test
+cargo test -p rsms-tests --test cmpp-longmsg-test
 ```
 
 ### 3. 提交代码
