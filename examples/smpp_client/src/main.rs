@@ -26,7 +26,7 @@ use rsms_codec_smpp::{
     decode_message, BindTransmitter, CommandId, DeliverSmResp, Pdu, SmppMessage, SubmitSm,
 };
 use rsms_connector::client::{ClientContext, ClientHandler};
-use rsms_connector::{connect, MessageItem, MessageSource, SmppDecoder};
+use rsms_connector::{ClientBuilder, MessageItem, MessageSource, SmppDecoder};
 use rsms_core::{EncodedPdu, EndpointConfig, Frame, Result};
 use rsms_longmsg::{
     LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser,
@@ -356,15 +356,10 @@ async fn main() -> Result<()> {
 
     tracing::info!("正在连接 SMPP 服务端 {}...", SERVER_ADDR);
 
-    let conn = connect(
-        endpoint,
-        handler,
-        SmppDecoder,
-        None,
-        Some(msg_source as Arc<dyn MessageSource>),
-        None,
-    )
-    .await?;
+    let conn = ClientBuilder::new(endpoint, handler, SmppDecoder)
+        .message_source(msg_source as Arc<dyn MessageSource>)
+        .connect()
+        .await?;
 
     tracing::info!("TCP 连接已建立 (conn_id={})", conn.id);
 

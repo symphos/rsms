@@ -27,7 +27,7 @@ use rsms_codec_sgip::{
     decode_message, Deliver, Encodable, Report, SgipMessage, SgipSequence, SubmitResp,
 };
 use rsms_connector::{
-    serve, AccountConfig, AccountConfigProvider, AccountPoolConfig, AuthCredentials,
+    ServerBuilder, AccountConfig, AccountConfigProvider, AccountPoolConfig, AuthCredentials,
     AuthHandler, AuthResult, MessageItem, MessageSource, ProtocolConnection, ServerEventHandler,
 };
 use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Frame, RawPdu, Result};
@@ -551,19 +551,18 @@ async fn main() -> Result<()> {
         config.port
     );
 
-    let server = serve(
-        config,
-        vec![Arc::new(SgipBusinessHandler {
+    let server = ServerBuilder::new(config)
+        .handlers(vec![Arc::new(SgipBusinessHandler {
             msg_source: msg_source.clone(),
             merger: Arc::new(std::sync::Mutex::new(LongMessageMerger::new())),
-        })],
-        Some(Arc::new(SgipAuthHandler { accounts })),
-        Some(msg_source as Arc<dyn MessageSource>),
-        Some(Arc::new(SimpleAccountConfigProvider)),
-        Some(Arc::new(SgipServerEventHandler)),
-        Some(AccountPoolConfig::new()),
-    )
-    .await?;
+        })])
+        .auth_handler(Arc::new(SgipAuthHandler { accounts }))
+        .message_source(msg_source as Arc<dyn MessageSource>)
+        .account_config_provider(Arc::new(SimpleAccountConfigProvider))
+        .event_handler(Arc::new(SgipServerEventHandler))
+        .account_pool_config(AccountPoolConfig::new())
+        .serve()
+        .await?;
 
     tracing::info!("监听地址: {}", server.local_addr);
     server.run().await

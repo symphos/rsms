@@ -500,16 +500,65 @@ pub trait ClientHandler: Send + Sync {
     async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()>;
 }
 
-/// 连接到服务器并启动读循环。
-pub async fn connect<D: FrameDecoder + Send + Sync + 'static>(
+/// 客户端构建器：链式配置后调用 [`ClientBuilder::connect`] 建连并启动读循环。
+///
+/// ```ignore
+/// let conn = ClientBuilder::new(endpoint, Arc::new(MyClient), CmppDecoder)
+///     .message_source(source)
+///     .connect()
+///     .await?;
+/// ```
+pub struct ClientBuilder<D: FrameDecoder + Send + Sync + 'static> {
     endpoint: Arc<EndpointConfig>,
     client_handler: Arc<dyn ClientHandler>,
     decoder: D,
     client_config: Option<ClientConfig>,
     message_source: Option<Arc<dyn MessageSource>>,
     event_handler: Option<Arc<dyn ClientEventHandler>>,
-) -> Result<Arc<ClientConnection>> {
-    let config = client_config.unwrap_or_default();
+}
+
+impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
+    pub fn new(
+        endpoint: Arc<EndpointConfig>,
+        client_handler: Arc<dyn ClientHandler>,
+        decoder: D,
+    ) -> Self {
+        Self {
+            endpoint,
+            client_handler,
+            decoder,
+            client_config: None,
+            message_source: None,
+            event_handler: None,
+        }
+    }
+
+    pub fn client_config(mut self, config: ClientConfig) -> Self {
+        self.client_config = Some(config);
+        self
+    }
+
+    pub fn message_source(mut self, message_source: Arc<dyn MessageSource>) -> Self {
+        self.message_source = Some(message_source);
+        self
+    }
+
+    pub fn event_handler(mut self, event_handler: Arc<dyn ClientEventHandler>) -> Self {
+        self.event_handler = Some(event_handler);
+        self
+    }
+
+    /// 连接到服务器并启动读循环。
+    pub async fn connect(self) -> Result<Arc<ClientConnection>> {
+        let ClientBuilder {
+            endpoint,
+            client_handler,
+            decoder,
+            client_config,
+            message_source,
+            event_handler,
+        } = self;
+        let config = client_config.unwrap_or_default();
     let addr = format!("{}:{}", endpoint.host, endpoint.port);
     info!(%addr, "connecting to server");
     let stream = TcpStream::connect(&addr).await.map_err(RsmsError::Io)?;
@@ -549,6 +598,7 @@ pub async fn connect<D: FrameDecoder + Send + Sync + 'static>(
     }
 
     Ok(conn)
+    }
 }
 
 fn create_decoder(protocol: &str) -> Box<dyn FrameDecoder + Send + Sync> {
@@ -561,8 +611,8 @@ fn create_decoder(protocol: &str) -> Box<dyn FrameDecoder + Send + Sync> {
     }
 }
 
-/// 连接函数，由 ClientPool 调用，连接的生命周期由 Pool 管理
-pub async fn connect_with_pool(
+/// 连接函数，由 ClientPool 调用，连接的生命周期由 Pool 管理（内部 API）
+pub(crate) async fn connect_with_pool(
     stream: TcpStream,
     endpoint: Arc<EndpointConfig>,
     client_handler: Arc<dyn ClientHandler>,

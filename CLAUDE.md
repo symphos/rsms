@@ -48,7 +48,7 @@ The data flow through a single connection is: **frame decode → protocol messag
 | Crate | Role |
 |-------|------|
 | `rsms-core` | Foundational types: `Frame`, `RawPdu`, `EncodedPdu` trait, `EndpointConfig`, `IdGenerator` trait, `CString`/`PString` helpers |
-| `rsms-connector` | The orchestration crate. Server `serve()`, client `connect()`, `AccountPool`, `MessageSource`, per-protocol handlers, `TransactionManager` |
+| `rsms-connector` | The orchestration crate. Server `ServerBuilder`, client `ClientBuilder`, `AccountPool`, `MessageSource`, per-protocol handlers, `TransactionManager` |
 | `rsms-business` | `BusinessHandler` trait + `InboundContext` (where business logic processes inbound PDUs) |
 | `rsms-codec-{cmpp,smgp,smpp,sgip}` | Per-protocol encode/decode: header parsing + PDU (de)serialization |
 | `rsms-longmsg` | Long-message `LongMessageSplitter` / `LongMessageMerger` (8-bit and 16-bit UDH) |

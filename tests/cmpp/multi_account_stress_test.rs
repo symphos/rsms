@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use rsms_connector::{
     AuthCredentials, AuthHandler, AuthResult,
-    AccountConfigProvider, CmppDecoder, connect,
+    AccountConfigProvider, CmppDecoder, ClientBuilder,
     protocol::MessageSource,
 };
 use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler};
@@ -310,7 +310,7 @@ impl AuthHandler for PasswordAuthHandler {
     }
 }
 
-use rsms_connector::serve;
+use rsms_connector::ServerBuilder;
 
 async fn start_test_server(
     biz_handler: Arc<dyn rsms_business::BusinessHandler>,
@@ -326,17 +326,13 @@ async fn start_test_server(
     for (account, password) in ACCOUNTS {
         auth = auth.add_account(account, password);
     }
-    let server = serve(
-        cfg,
-        vec![biz_handler],
-        Some(Arc::new(auth)),
-        None,
-        Some(Arc::new(MockAccountConfigProvider::with_limits(10000, 4096)) as Arc<dyn AccountConfigProvider>),
-        None,
-        None,
-    )
-    .await
-    .expect("bind");
+    let server = ServerBuilder::new(cfg)
+        .handlers(vec![biz_handler])
+        .auth_handler(Arc::new(auth))
+        .account_config_provider(Arc::new(MockAccountConfigProvider::with_limits(10000, 4096)) as Arc<dyn AccountConfigProvider>)
+        .serve()
+        .await
+        .expect("bind");
     let port = server.local_addr.port();
     let account_pool = server.account_pool();
     let handle = tokio::spawn(async move { let _ = server.run().await; });
@@ -550,16 +546,12 @@ async fn stress_test_cmpp30_5accounts_5connections() {
                 30,
             ).with_window_size(WINDOW_SIZE).with_log_level(tracing::Level::WARN));
 
-            let conn = connect(
-                endpoint,
-                client_state.clone(),
-                CmppDecoder,
-                Some(ClientConfig::new()),
-                Some(msg_source.clone() as Arc<dyn MessageSource>),
-                None,
-            )
-            .await
-            .expect("connect");
+            let conn = ClientBuilder::new(endpoint, client_state.clone(), CmppDecoder)
+                .client_config(ClientConfig::new())
+                .message_source(msg_source.clone() as Arc<dyn MessageSource>)
+                .connect()
+                .await
+                .expect("connect");
 
             let connect_pdu = client_state.build_connect_pdu();
             conn.send_request(connect_pdu).await.expect("send connect");

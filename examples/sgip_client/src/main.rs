@@ -29,7 +29,7 @@ use rsms_codec_sgip::{
     Bind, CommandId, DeliverResp, Encodable, ReportResp, SgipSequence, Submit,
 };
 use rsms_connector::client::{ClientContext, ClientHandler};
-use rsms_connector::{connect, MessageItem, MessageSource, SgipDecoder};
+use rsms_connector::{ClientBuilder, MessageItem, MessageSource, SgipDecoder};
 use rsms_core::{EncodedPdu, EndpointConfig, Frame, RawPdu, Result};
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
@@ -386,15 +386,10 @@ async fn main() -> Result<()> {
 
     tracing::info!("正在连接 SGIP 服务端 {}...", SERVER_ADDR);
 
-    let conn = connect(
-        endpoint,
-        handler,
-        SgipDecoder,
-        None,
-        Some(msg_source as Arc<dyn MessageSource>),
-        None,
-    )
-    .await?;
+    let conn = ClientBuilder::new(endpoint, handler, SgipDecoder)
+        .message_source(msg_source as Arc<dyn MessageSource>)
+        .connect()
+        .await?;
 
     tracing::info!("TCP 连接已建立 (conn_id={})", conn.id);
 

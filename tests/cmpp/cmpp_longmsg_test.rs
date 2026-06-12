@@ -7,7 +7,7 @@ use rsms_codec_cmpp::{
     codec::PduHeader,
 };
 use rsms_connector::{
-    connect, serve, AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler,
+    ClientBuilder, ServerBuilder, AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler,
     AuthResult, ClientHandler, CmppDecoder,
 };
 use rsms_connector::client::{ClientConfig, ClientContext, ClientConnection};
@@ -259,17 +259,13 @@ async fn start_server(
     biz_handler: Arc<dyn BusinessHandler>,
 ) -> Result<(u16, Arc<rsms_connector::ConnectionPool>, tokio::task::JoinHandle<()>)> {
     let cfg = Arc::new(EndpointConfig::new("test-server", "127.0.0.1", 0, 8, 30));
-    let server = serve(
-        cfg,
-        vec![biz_handler],
-        Some(Arc::new(PasswordAuthHandler)),
-        None,
-        Some(Arc::new(MockAccountConfigProvider) as Arc<dyn AccountConfigProvider>),
-        None,
-        None,
-    )
-    .await
-    .expect("bind");
+    let server = ServerBuilder::new(cfg)
+        .handlers(vec![biz_handler])
+        .auth_handler(Arc::new(PasswordAuthHandler))
+        .account_config_provider(Arc::new(MockAccountConfigProvider) as Arc<dyn AccountConfigProvider>)
+        .serve()
+        .await
+        .expect("bind");
     let port = server.local_addr.port();
     let pool = server.pool();
     let handle = tokio::spawn(async move { let _ = server.run().await; });
@@ -280,15 +276,10 @@ async fn start_server(
 async fn connect_client(port: u16, version: u8) -> Result<(Arc<LongMsgClientHandler>, Arc<ClientConnection>)> {
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let handler = Arc::new(LongMsgClientHandler::new(version));
-    let conn = connect(
-        endpoint,
-        handler.clone(),
-        CmppDecoder,
-        Some(ClientConfig::new()),
-        None,
-        None,
-    )
-    .await?;
+    let conn = ClientBuilder::new(endpoint, handler.clone(), CmppDecoder)
+        .client_config(ClientConfig::new())
+        .connect()
+        .await?;
     let connect_pdu = handler.build_connect_pdu();
     conn.send_request(connect_pdu).await?;
     tokio::time::sleep(Duration::from_millis(200)).await;

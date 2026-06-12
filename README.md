@@ -31,7 +31,7 @@ rsms-codec-cmpp = { path = "crates/rsms-codec-cmpp" }
 ### 服务端示例
 
 ```rust
-use rsms_connector::{serve, AuthHandler, AuthCredentials, AuthResult};
+use rsms_connector::{ServerBuilder, AuthHandler, AuthCredentials, AuthResult};
 use rsms_business::BusinessHandler;
 use rsms_core::{EndpointConfig, Frame, Result};
 
@@ -62,12 +62,11 @@ async fn main() -> Result<()> {
         .with_protocol("cmpp")
         .with_log_level(tracing::Level::WARN));
 
-    let server = serve(
-        config,
-        vec![Arc::new(MyBiz)],
-        Some(Arc::new(MyAuth)),
-        None, None, None, None,
-    ).await?;
+    let server = ServerBuilder::new(config)
+        .handler(Arc::new(MyBiz))
+        .auth_handler(Arc::new(MyAuth))
+        .serve()
+        .await?;
 
     server.run().await
 }
@@ -76,7 +75,7 @@ async fn main() -> Result<()> {
 ### 客户端示例
 
 ```rust
-use rsms_connector::{connect, CmppDecoder, ClientHandler};
+use rsms_connector::{ClientBuilder, CmppDecoder, ClientHandler};
 use rsms_core::{EndpointConfig, Frame, Result};
 
 struct MyClient;
@@ -93,12 +92,9 @@ impl ClientHandler for MyClient {
 async fn main() -> Result<()> {
     let endpoint = Arc::new(EndpointConfig::new("client", "127.0.0.1", 7890, 500, 60));
 
-    let conn = connect(
-        endpoint,
-        Arc::new(MyClient),
-        CmppDecoder,
-        None, None, None,
-    ).await?;
+    let conn = ClientBuilder::new(endpoint, Arc::new(MyClient), CmppDecoder)
+        .connect()
+        .await?;
 
     conn.write_frame(&pdu_bytes).await?;
     Ok(())

@@ -1,4 +1,4 @@
-use rsms_connector::{serve, AuthHandler, ServerEventHandler, AccountConfigProvider};
+use rsms_connector::{ServerBuilder, AuthHandler, ServerEventHandler, AccountConfigProvider};
 use rsms_business::BusinessHandler;
 use rsms_core::EndpointConfig;
 use std::sync::Arc;
@@ -18,16 +18,13 @@ pub async fn start_test_server(
     }
     let cfg = Arc::new(cfg);
 
-    let server = serve(
-        cfg,
-        vec![biz_handler],
-        Some(auth_handler),
-        None,
-        Some(account_config),
-        Some(event_handler),
-        None,
-    )
-    .await?;
+    let server = ServerBuilder::new(cfg)
+        .handlers(vec![biz_handler])
+        .auth_handler(auth_handler)
+        .account_config_provider(account_config)
+        .event_handler(event_handler)
+        .serve()
+        .await?;
 
     let port = server.local_addr.port();
     let handle = tokio::spawn(async move {

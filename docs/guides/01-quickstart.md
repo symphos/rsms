@@ -102,7 +102,7 @@ pub trait AuthHandler: Send + Sync {
 
 ```rust
 use rsms_connector::{
-    serve, AuthHandler, AuthCredentials, AuthResult,
+    ServerBuilder, AuthHandler, AuthCredentials, AuthResult,
     AccountConfig, AccountConfigProvider,
 };
 use rsms_business::BusinessHandler;
@@ -143,15 +143,14 @@ async fn main() -> Result<()> {
     let config = Arc::new(EndpointConfig::new("cmpp-gateway", "0.0.0.0", 7890, 500, 60)
         .with_protocol("cmpp"));
 
-    let server = serve(
-        config,
-        vec![Arc::new(MyBiz)],
-        Some(Arc::new(MyAuth)),
-        None,   // MessageSource（可选）
-        None,   // AccountConfigProvider（可选）
-        None,   // ServerEventHandler（可选）
-        None,   // AccountPoolConfig（可选）
-    ).await?;
+    let server = ServerBuilder::new(config)
+        .handler(Arc::new(MyBiz))
+        .auth_handler(Arc::new(MyAuth))
+        // .message_source(s)          // MessageSource（可选）
+        // .account_config_provider(p) // AccountConfigProvider（可选）
+        // .event_handler(e)           // ServerEventHandler（可选）
+        // .account_pool_config(c)     // AccountPoolConfig（可选）
+        .serve().await?;
 
     server.run().await
 }
@@ -160,7 +159,7 @@ async fn main() -> Result<()> {
 ## 客户端最小示例
 
 ```rust
-use rsms_connector::{connect, CmppDecoder, ClientHandler, ClientConfig};
+use rsms_connector::{ClientBuilder, CmppDecoder, ClientHandler, ClientConfig};
 use rsms_core::{EndpointConfig, Frame, Result};
 
 struct MyClient;
@@ -177,14 +176,11 @@ impl ClientHandler for MyClient {
 async fn main() -> Result<()> {
     let endpoint = Arc::new(EndpointConfig::new("client", "127.0.0.1", 7890, 500, 60));
 
-    let conn = connect(
-        endpoint,
-        Arc::new(MyClient),
-        CmppDecoder,
-        Some(ClientConfig::default()),
-        None,   // MessageSource（可选）
-        None,   // ClientEventHandler（可选）
-    ).await?;
+    let conn = ClientBuilder::new(endpoint, Arc::new(MyClient), CmppDecoder)
+        .client_config(ClientConfig::default())
+        // .message_source(s)   // MessageSource（可选）
+        // .event_handler(e)    // ClientEventHandler（可选）
+        .connect().await?;
 
     // 发送消息
     let pdu_bytes = build_some_pdu();

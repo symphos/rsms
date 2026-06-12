@@ -175,15 +175,15 @@ P1 的 window/decode/flush/锁/去拷贝改动均验证正确。但审查追查�
 ### 2.1 移除死代码 crate `rsms-pipeline` ✅ 已完成（2849f11）
 - 复核确认除自身外无引用；已删除 crate，并把 `mark_pipeline_ready()` 重命名为 `mark_ready()`（实际只是置 ready 位，与该 crate 无关）。
 
-### 2.2 4 个 handler 去重
+### 2.2 4 个 handler 去重 ⏳ 待定（建议：仅做 handler 内安全去重）
 - **位置**：`crates/rsms-connector/src/handlers/{cmpp,smgp,smpp,sgip}.rs`
-- **改动**：抽取 auth 结果→响应的通用流程，参数化「构造 connect-resp + command id」的小 trait；`encode_pdu_header` 提取为共享工具。目标去除约 60-65% 重复。
-- **风险**：中。四协议响应结构有差异，需逐协议保持字节级一致；改完跑全部集成测试。
+- **建议做法**：每个 handler 内部把 3 个几乎相同的 auth-结果→响应分支收成一个**本文件内**的小助手（字节输出不变、低风险），顺带把 `resp.encode(...).unwrap()` 改 `?`（修审查 Medium 项）。**不做**跨协议 trait 抽象（关键 connect 路径上中-高风险，收益边际）。
+- 尚未实施。
 
-### 2.3 API builder 化
-- **位置**：`serve()` (server.rs)、`connect()`/`connect_with_pool()` (client.rs)
-- **改动**：引入 `ServerBuilder`/`ClientBuilder`（或 `ServeConfig`/`ConnectConfig` + `with_*`），与既有 `EndpointConfig`/`AccountConfig` 风格一致；合并 `connect` 与 `connect_with_pool` 公共部分。
-- **风险**：中（对外 API 变更）。**需保留旧函数或提供迁移**：示例/测试同步更新。
+### 2.3 API builder 化 ✅ 已完成
+- 引入 `ServerBuilder`（替换 `serve()`）、`ClientBuilder`（替换 `connect()`，泛型 over decoder）；`connect_with_pool` 降为 `pub(crate)` 内部 API。**不保留旧签名**（按决策）。
+- 全量迁移 ~30 文件：8 个 example + `tests/common` + ~20 个测试文件（9 server + 23 client 调用点），README/CLAUDE.md/docs 指南同步改为 builder 写法。
+- 验证：`cargo build --workspace --tests` 全绿；workspace 单测 + 11 个集成/dynamic/transaction 目标全绿；多账号 5×5×300s 四协议压测**零丢失、TPS 与基线一致**（CMPP/SMGP/SMPP 12,542.x，SGIP 12,563.5）。
 
 ### 2.4 trait 清理 ⏭️ 经核实，多数前提不成立 → 跳过
 - **`submit_limiter()` 并非死代码**：在 `connection.rs:236/293` 经 `SubmitLimiterAdapter` 桥接到 business 的 `rate_limiter()`，而后者被真实业务 handler 使用（`tests/cmpp/cmpp_test.rs:148/175`）。删除会破坏限流桥接。

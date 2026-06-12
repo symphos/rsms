@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use rsms_connector::{
     AuthCredentials, AuthHandler, AuthResult,
-    AccountConfig, AccountConfigProvider, CmppDecoder, connect,
+    AccountConfig, AccountConfigProvider, CmppDecoder, ClientBuilder, ServerBuilder,
     AccountPool,
 };
 use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler, ClientConnection};
@@ -146,15 +146,12 @@ async fn start_server(
         60,
     ));
     let auth = Arc::new(PasswordAuthHandler::new().add_account(TEST_ACCOUNT, TEST_PASSWORD));
-    let server = rsms_connector::serve(
-        cfg,
-        vec![],
-        Some(auth),
-        None,
-        Some(config_provider as Arc<dyn AccountConfigProvider>),
-        None,
-        None,
-    ).await?;
+    let server = ServerBuilder::new(cfg)
+        .handlers(vec![])
+        .auth_handler(auth)
+        .account_config_provider(config_provider as Arc<dyn AccountConfigProvider>)
+        .serve()
+        .await?;
     let port = server.local_addr.port();
     let account_pool = server.account_pool();
     let handle = tokio::spawn(async move { let _ = server.run().await; });
@@ -176,14 +173,11 @@ async fn create_connections(port: u16, count: usize) -> Vec<Arc<ClientConnection
         let client_handler = Arc::new(TestClientHandler::new());
         let client_config = ClientConfig::default();
 
-        let conn = connect(
-            endpoint,
-            client_handler,
-            CmppDecoder,
-            Some(client_config),
-            None,
-            None,
-        ).await.expect("connect failed");
+        let conn = ClientBuilder::new(endpoint, client_handler, CmppDecoder)
+            .client_config(client_config)
+            .connect()
+            .await
+            .expect("connect failed");
 
         let connect_pdu = build_connect_pdu(TEST_ACCOUNT, TEST_PASSWORD, CMPP_VERSION);
         conn.write_frame(connect_pdu.as_bytes()).await.expect("send connect failed");

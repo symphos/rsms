@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use rsms_connector::{
-    serve, connect, SmppDecoder,
+    ServerBuilder, ClientBuilder, SmppDecoder,
     AuthCredentials, AuthHandler, AuthResult,
     AccountConfigProvider,
     protocol::MessageSource,
@@ -353,17 +353,13 @@ async fn start_test_server(
         60,
     ).with_protocol("smpp").with_log_level(tracing::Level::WARN));
     let auth = Arc::new(PasswordAuthHandler::new().add_account(STRESS_TEST_SYSTEM_ID, STRESS_TEST_PASSWORD));
-    let server = serve(
-        cfg,
-        vec![biz_handler],
-        Some(auth),
-        None,
-        Some(Arc::new(MockAccountConfigProvider::with_limits(5000, 2048)) as Arc<dyn AccountConfigProvider>),
-        None,
-        None,
-    )
-    .await
-    .expect("bind");
+    let server = ServerBuilder::new(cfg)
+        .handlers(vec![biz_handler])
+        .auth_handler(auth)
+        .account_config_provider(Arc::new(MockAccountConfigProvider::with_limits(5000, 2048)) as Arc<dyn AccountConfigProvider>)
+        .serve()
+        .await
+        .expect("bind");
     let port = server.local_addr.port();
     let account_pool = server.account_pool();
     let handle = tokio::spawn(async move {
@@ -632,15 +628,11 @@ async fn run_stress_test(version: u8, num_connections: usize) {
 
         let mut conn = None;
         for retry in 0..50 {
-            match connect(
-                endpoint.clone(),
-                client_state.clone(),
-                SmppDecoder,
-                Some(ClientConfig::new()),
-                Some(msg_source.clone() as Arc<dyn MessageSource>),
-                None,
-            )
-            .await
+            match ClientBuilder::new(endpoint.clone(), client_state.clone(), SmppDecoder)
+                .client_config(ClientConfig::new())
+                .message_source(msg_source.clone() as Arc<dyn MessageSource>)
+                .connect()
+                .await
             {
                 Ok(c) => {
                     conn = Some(c);

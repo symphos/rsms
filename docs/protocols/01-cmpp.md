@@ -175,15 +175,11 @@ let message = decode_message_with_version(pdu, Some(version))?;
 let config = Arc::new(EndpointConfig::new("cmpp-gateway", "0.0.0.0", 7890, 500, 60)
     .with_protocol("cmpp"));
 
-let server = serve(
-    config,
-    vec![Arc::new(MyBizHandler)],
-    Some(Arc::new(CmppAuth::new())),
-    None,
-    Some(Arc::new(MyConfigProvider)),
-    None,
-    None,
-).await?;
+let server = ServerBuilder::new(config)
+    .handler(Arc::new(MyBizHandler))
+    .auth_handler(Arc::new(CmppAuth::new()))
+    .account_config_provider(Arc::new(MyConfigProvider))
+    .serve().await?;
 
 let port = server.local_addr.port();
 let account_pool = server.account_pool();
@@ -197,14 +193,9 @@ tokio::spawn(async move { let _ = server.run().await; });
 ```rust
 let endpoint = Arc::new(EndpointConfig::new("cmpp-client", "127.0.0.1", port, 500, 60));
 
-let conn = connect(
-    endpoint,
-    Arc::new(MyClientHandler),
-    CmppDecoder,
-    Some(ClientConfig::default()),
-    None,
-    None,
-).await?;
+let conn = ClientBuilder::new(endpoint, Arc::new(MyClientHandler), CmppDecoder)
+    .client_config(ClientConfig::default())
+    .connect().await?;
 
 // 发送 Connect
 let connect_pdu = build_connect_pdu("900001", "password", 0x30);

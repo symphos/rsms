@@ -152,7 +152,7 @@ impl ClientPool {
             }
         };
 
-        let conn = crate::connect_with_pool(
+        let conn = crate::client::connect_with_pool(
             stream,
             self.endpoint.clone(),
             self.client_handler.clone(),

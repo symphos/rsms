@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use rsms_connector::{
     AuthCredentials, AuthHandler, AuthResult,
-    AccountConfig, AccountConfigProvider, SmgpDecoder, connect,
+    AccountConfig, AccountConfigProvider, SmgpDecoder, ClientBuilder,
     AccountPool,
 };
 use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler, ClientConnection};
@@ -137,15 +137,12 @@ async fn start_server(
         60,
     ).with_protocol("smgp"));
     let auth = Arc::new(PasswordAuthHandler::new().add_account(TEST_ACCOUNT, TEST_PASSWORD));
-    let server = rsms_connector::serve(
-        cfg,
-        vec![],
-        Some(auth),
-        None,
-        Some(config_provider as Arc<dyn AccountConfigProvider>),
-        None,
-        None,
-    ).await?;
+    let server = rsms_connector::ServerBuilder::new(cfg)
+        .handlers(vec![])
+        .auth_handler(auth)
+        .account_config_provider(config_provider as Arc<dyn AccountConfigProvider>)
+        .serve()
+        .await?;
     let port = server.local_addr.port();
     let account_pool = server.account_pool();
     let handle = tokio::spawn(async move { let _ = server.run().await; });
@@ -165,14 +162,11 @@ async fn create_connections(port: u16, count: usize) -> Vec<Arc<ClientConnection
         ).with_protocol("smgp"));
 
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = connect(
-            endpoint,
-            client_handler,
-            SmgpDecoder,
-            Some(ClientConfig::default()),
-            None,
-            None,
-        ).await.expect("connect failed");
+        let conn = ClientBuilder::new(endpoint, client_handler, SmgpDecoder)
+            .client_config(ClientConfig::default())
+            .connect()
+            .await
+            .expect("connect failed");
 
         let login_pdu = build_login_pdu(TEST_ACCOUNT, TEST_PASSWORD);
         conn.write_frame(login_pdu.as_bytes()).await.expect("send login failed");

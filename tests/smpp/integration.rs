@@ -1,4 +1,4 @@
-use rsms_connector::{serve, SmppDecoder};
+use rsms_connector::{ServerBuilder, SmppDecoder};
 use rsms_connector::client::ClientHandler;
 use rsms_connector::{AuthHandler, AuthCredentials, AuthResult, ServerEventHandler, AccountConfigProvider};
 use rsms_business::BusinessHandler;
@@ -301,17 +301,14 @@ pub async fn start_test_server(
         8,
         idle_timeout_secs as u16,
     ).with_protocol("smpp"));
-    let server = serve(
-        cfg,
-        vec![biz_handler],
-        Some(auth_handler),
-        None,
-        Some(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>),
-        Some(event_handler),
-        None,
-    )
-    .await
-    .expect("bind");
+    let server = ServerBuilder::new(cfg)
+        .handlers(vec![biz_handler])
+        .auth_handler(auth_handler)
+        .account_config_provider(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>)
+        .event_handler(event_handler)
+        .serve()
+        .await
+        .expect("bind");
     let port = server.local_addr.port();
     let handle = tokio::spawn(async move {
         let _ = server.run().await;
@@ -333,17 +330,14 @@ pub async fn start_test_server_with_pool(
         8,
         idle_timeout_secs as u16,
     ).with_protocol("smpp"));
-    let server = serve(
-        cfg,
-        vec![biz_handler],
-        Some(auth_handler),
-        None,
-        Some(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>),
-        Some(event_handler),
-        None,
-    )
-    .await
-    .expect("bind");
+    let server = ServerBuilder::new(cfg)
+        .handlers(vec![biz_handler])
+        .auth_handler(auth_handler)
+        .account_config_provider(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>)
+        .event_handler(event_handler)
+        .serve()
+        .await
+        .expect("bind");
     let port = server.local_addr.port();
     let pool = server.pool();
     let pool_clone = pool.clone();
@@ -399,7 +393,7 @@ async fn get_conn_from_pool(pool: &Arc<rsms_connector::ConnectionPool>) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rsms_connector::connect;
+    use rsms_connector::ClientBuilder;
     use rsms_connector::client::ClientConfig;
     use std::sync::atomic::Ordering;
 
@@ -419,15 +413,10 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = connect(
-            endpoint,
-            client_handler.clone(),
-            SmppDecoder,
-            Some(ClientConfig::new()),
-            None,
-            None,
-        )
-        .await
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
+            .client_config(ClientConfig::new())
+            .connect()
+            .await
         .expect("connect");
 
         let bind_pdu = client_handler.build_bind_transmitter_pdu(system_id, password);
@@ -463,15 +452,10 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = connect(
-            endpoint,
-            client_handler.clone(),
-            SmppDecoder,
-            Some(ClientConfig::new()),
-            None,
-            None,
-        )
-        .await
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
+            .client_config(ClientConfig::new())
+            .connect()
+            .await
         .expect("connect");
 
         let bind_pdu = client_handler.build_bind_transceiver_pdu(system_id, password);
@@ -507,15 +491,10 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = connect(
-            endpoint,
-            client_handler.clone(),
-            SmppDecoder,
-            Some(ClientConfig::new()),
-            None,
-            None,
-        )
-        .await
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
+            .client_config(ClientConfig::new())
+            .connect()
+            .await
         .expect("connect");
 
         let bind_pdu = client_handler.build_bind_transmitter_pdu(system_id, "wrongpwd");
@@ -549,15 +528,10 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = connect(
-            endpoint,
-            client_handler.clone(),
-            SmppDecoder,
-            Some(ClientConfig::new()),
-            None,
-            None,
-        )
-        .await
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
+            .client_config(ClientConfig::new())
+            .connect()
+            .await
         .expect("connect");
 
         let bind_pdu = client_handler.build_bind_transmitter_pdu("unknown", "password");
@@ -592,15 +566,10 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = connect(
-            endpoint,
-            client_handler.clone(),
-            SmppDecoder,
-            Some(ClientConfig::new()),
-            None,
-            None,
-        )
-        .await
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
+            .client_config(ClientConfig::new())
+            .connect()
+            .await
         .expect("connect");
 
         let bind_pdu = client_handler.build_bind_transmitter_pdu(system_id, password);
@@ -638,15 +607,10 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = connect(
-            endpoint,
-            client_handler.clone(),
-            SmppDecoder,
-            Some(ClientConfig::new()),
-            None,
-            None,
-        )
-        .await
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
+            .client_config(ClientConfig::new())
+            .connect()
+            .await
         .expect("connect");
 
         let bind_pdu = client_handler.build_bind_transceiver_pdu(system_id, password);
@@ -684,15 +648,10 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = connect(
-            endpoint,
-            client_handler.clone(),
-            SmppDecoder,
-            Some(ClientConfig::new()),
-            None,
-            None,
-        )
-        .await
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
+            .client_config(ClientConfig::new())
+            .connect()
+            .await
         .expect("connect");
 
         let bind_pdu = client_handler.build_bind_transmitter_pdu(system_id, password);
@@ -726,15 +685,10 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = connect(
-            endpoint,
-            client_handler.clone(),
-            SmppDecoder,
-            Some(ClientConfig::new()),
-            None,
-            None,
-        )
-        .await
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
+            .client_config(ClientConfig::new())
+            .connect()
+            .await
         .expect("connect");
 
         let bind_pdu = client_handler.build_bind_transmitter_pdu(system_id, password);
@@ -769,15 +723,11 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = connect(
-            endpoint,
-            client_handler.clone(),
-            SmppDecoder,
-            Some(ClientConfig::new()),
-            None,
-            Some(client_evt.clone()),
-        )
-        .await
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
+            .client_config(ClientConfig::new())
+            .event_handler(client_evt.clone())
+            .connect()
+            .await
         .expect("connect");
 
         let bind_pdu = client_handler.build_bind_transmitter_pdu(system_id, password);

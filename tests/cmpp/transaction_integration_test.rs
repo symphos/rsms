@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use rsms_connector::client::{ClientContext, ClientHandler};
 use rsms_connector::transaction::{MessageCallback, SubmitInfo, ReportInfo, MoInfo};
-use rsms_connector::{connect, CmppDecoder, AccountConnections, AccountConfig};
+use rsms_connector::{ClientBuilder, CmppDecoder, AccountConnections, AccountConfig};
 use rsms_core::{ConnectionInfo, EndpointConfig, Frame, Result};
 use rsms_codec_cmpp::{Pdu, Connect, CommandId};
 use rsms_codec_cmpp::auth::compute_connect_auth;
@@ -123,7 +123,7 @@ impl MessageCallback for TestTransactionCallback {
     }
 }
 
-use rsms_connector::serve;
+use rsms_connector::ServerBuilder;
 use rsms_connector::AuthHandler;
 use rsms_business::BusinessHandler;
 use rsms_business::InboundContext;
@@ -221,17 +221,12 @@ async fn start_test_server(port: u16) -> tokio::task::JoinHandle<()> {
     let auth_handler: Arc<dyn AuthHandler> = Arc::new(TestAuthHandler::new());
     let biz_handler: Arc<dyn BusinessHandler> = Arc::new(TestBusinessHandler::new());
     
-    let server = serve(
-        config,
-        vec![biz_handler],
-        Some(auth_handler),
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    let server = ServerBuilder::new(config)
+        .handlers(vec![biz_handler])
+        .auth_handler(auth_handler)
+        .serve()
+        .await
+        .unwrap();
 
     tokio::spawn(async move {
         let _ = server.run().await;
@@ -260,16 +255,11 @@ async fn test_transaction_manager_integration() {
     let endpoint = Arc::new(EndpointConfig::new("test", "127.0.0.1", port, 100, 60));
     let handler = Arc::new(TransactionTestHandler::new());
     
-    let conn = connect(
-        endpoint,
-        handler.clone(),
-        CmppDecoder,
-        Some(Default::default()),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    let conn = ClientBuilder::new(endpoint, handler.clone(), CmppDecoder)
+        .client_config(Default::default())
+        .connect()
+        .await
+        .unwrap();
 
     conn.set_account_connections(Some(acc_connections.clone())).await;
 
@@ -341,16 +331,11 @@ async fn test_transaction_manager_multiple_submits() {
     let endpoint = Arc::new(EndpointConfig::new("test", "127.0.0.1", port, 100, 60));
     let handler = Arc::new(TransactionTestHandler::new());
     
-    let conn = connect(
-        endpoint,
-        handler.clone(),
-        CmppDecoder,
-        Some(Default::default()),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    let conn = ClientBuilder::new(endpoint, handler.clone(), CmppDecoder)
+        .client_config(Default::default())
+        .connect()
+        .await
+        .unwrap();
 
     conn.set_account_connections(Some(acc_connections.clone())).await;
 

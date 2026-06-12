@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use rsms_connector::{
-    serve, connect, SmppDecoder,
+    ServerBuilder, ClientBuilder, SmppDecoder,
     AuthCredentials, AuthHandler, AuthResult,
     AccountConfigProvider,
     protocol::MessageSource,
@@ -350,17 +350,13 @@ async fn start_test_server(
     for cred in &ACCOUNTS {
         auth = auth.add_account(cred.system_id, cred.password);
     }
-    let server = serve(
-        cfg,
-        vec![biz_handler],
-        Some(Arc::new(auth)),
-        None,
-        Some(Arc::new(MockAccountConfigProvider::with_limits(10000, 4096)) as Arc<dyn AccountConfigProvider>),
-        None,
-        None,
-    )
-    .await
-    .expect("bind");
+    let server = ServerBuilder::new(cfg)
+        .handlers(vec![biz_handler])
+        .auth_handler(Arc::new(auth))
+        .account_config_provider(Arc::new(MockAccountConfigProvider::with_limits(10000, 4096)) as Arc<dyn AccountConfigProvider>)
+        .serve()
+        .await
+        .expect("bind");
     let port = server.local_addr.port();
     let account_pool = server.account_pool();
     let handle = tokio::spawn(async move { let _ = server.run().await; });
@@ -604,16 +600,12 @@ async fn stress_test_smpp_5accounts_5connections() {
                 30,
             ).with_window_size(WINDOW_SIZE as u16).with_protocol("smpp").with_log_level(tracing::Level::WARN));
 
-            let conn = connect(
-                endpoint,
-                client_state.clone(),
-                SmppDecoder,
-                Some(ClientConfig::new()),
-                Some(msg_source.clone() as Arc<dyn MessageSource>),
-                None,
-            )
-            .await
-            .expect("connect");
+            let conn = ClientBuilder::new(endpoint, client_state.clone(), SmppDecoder)
+                .client_config(ClientConfig::new())
+                .message_source(msg_source.clone() as Arc<dyn MessageSource>)
+                .connect()
+                .await
+                .expect("connect");
 
             let bind_pdu = client_state.build_bind_transmitter_pdu();
             conn.send_request(bind_pdu).await.expect("send bind");

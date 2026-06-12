@@ -170,13 +170,10 @@ let pdu_bytes = bind.to_pdu_bytes(node_id, timestamp, seq_number);
 let config = Arc::new(EndpointConfig::new("sgip-gateway", "0.0.0.0", 7891, 500, 60)
     .with_protocol("sgip"));
 
-let server = serve(
-    config,
-    vec![Arc::new(MyBizHandler)],
-    Some(Arc::new(SgipAuth::new())),
-    None,
-    None, None, None,
-).await?;
+let server = ServerBuilder::new(config)
+    .handler(Arc::new(MyBizHandler))
+    .auth_handler(Arc::new(SgipAuth::new()))
+    .serve().await?;
 ```
 
 ## 客户端完整示例
@@ -187,13 +184,9 @@ let server = serve(
 let endpoint = Arc::new(EndpointConfig::new("sgip-client", "127.0.0.1", port, 500, 60)
     .with_protocol("sgip"));
 
-let conn = connect(
-    endpoint,
-    Arc::new(MyClientHandler),
-    SgipDecoder,
-    Some(ClientConfig::default()),
-    None, None,
-).await?;
+let conn = ClientBuilder::new(endpoint, Arc::new(MyClientHandler), SgipDecoder)
+    .client_config(ClientConfig::default())
+    .connect().await?;
 
 // 发送 Bind
 let bind = Bind {

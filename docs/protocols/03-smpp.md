@@ -159,13 +159,10 @@ let message = decode_message_with_version(pdu, Some(version))?;
 let config = Arc::new(EndpointConfig::new("smpp-gateway", "0.0.0.0", 7893, 500, 60)
     .with_protocol("smpp"));   // 必须设置！
 
-let server = serve(
-    config,
-    vec![Arc::new(MyBizHandler)],
-    Some(Arc::new(SmppAuth::new())),
-    None,
-    None, None, None,
-).await?;
+let server = ServerBuilder::new(config)
+    .handler(Arc::new(MyBizHandler))
+    .auth_handler(Arc::new(SmppAuth::new()))
+    .serve().await?;
 ```
 
 ## 客户端完整示例
@@ -176,13 +173,9 @@ let server = serve(
 let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 500, 60)
     .with_protocol("smpp"));   // 必须设置！
 
-let conn = connect(
-    endpoint,
-    Arc::new(MyClientHandler),
-    SmppDecoder,
-    Some(ClientConfig::default()),
-    None, None,
-).await?;
+let conn = ClientBuilder::new(endpoint, Arc::new(MyClientHandler), SmppDecoder)
+    .client_config(ClientConfig::default())
+    .connect().await?;
 
 // 发送 Bind
 let bind_pdu = BindTransmitter::new("SMPP", "pwd12345", "CMT", 0x34);

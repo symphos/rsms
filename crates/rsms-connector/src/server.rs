@@ -27,7 +27,17 @@ pub struct BoundServer {
     shutdown_flag: Arc<AtomicBool>,
 }
 
-pub async fn serve(
+/// 服务端构建器：链式配置后调用 [`ServerBuilder::serve`] 绑定监听并返回 [`BoundServer`]。
+///
+/// ```ignore
+/// let server = ServerBuilder::new(config)
+///     .handler(Arc::new(MyBiz))
+///     .auth_handler(Arc::new(MyAuth))
+///     .serve()
+///     .await?;
+/// server.run().await
+/// ```
+pub struct ServerBuilder {
     config: Arc<rsms_core::EndpointConfig>,
     handlers: Vec<Arc<dyn BusinessHandler>>,
     auth_handler: Option<Arc<dyn AuthHandler>>,
@@ -35,29 +45,83 @@ pub async fn serve(
     account_config_provider: Option<Arc<dyn AccountConfigProvider>>,
     event_handler: Option<Arc<dyn ServerEventHandler>>,
     account_pool_config: Option<AccountPoolConfig>,
-) -> Result<BoundServer> {
-    let addr = format!("{}:{}", config.host, config.port);
-    let listener = TcpListener::bind(&addr).await?;
-    let local_addr = listener.local_addr()?;
-    let pool = ConnectionPool::new();
+}
 
-    let default_account_config = AccountConfig::new();
-    let pool_config = account_pool_config.unwrap_or_default();
-    let account_pool = AccountPool::new(default_account_config, pool_config);
+impl ServerBuilder {
+    pub fn new(config: Arc<rsms_core::EndpointConfig>) -> Self {
+        Self {
+            config,
+            handlers: Vec::new(),
+            auth_handler: None,
+            message_source: None,
+            account_config_provider: None,
+            event_handler: None,
+            account_pool_config: None,
+        }
+    }
 
-    Ok(BoundServer {
-        local_addr,
-        config,
-        handlers,
-        pool,
-        account_pool,
-        account_config_provider,
-        listener: Arc::new(listener),
-        message_source,
-        event_handler,
-        auth_handler,
-        shutdown_flag: Arc::new(AtomicBool::new(false)),
-    })
+    /// 追加一个业务处理器。
+    pub fn handler(mut self, handler: Arc<dyn BusinessHandler>) -> Self {
+        self.handlers.push(handler);
+        self
+    }
+
+    /// 一次性设置业务处理器列表（覆盖已有）。
+    pub fn handlers(mut self, handlers: Vec<Arc<dyn BusinessHandler>>) -> Self {
+        self.handlers = handlers;
+        self
+    }
+
+    pub fn auth_handler(mut self, auth_handler: Arc<dyn AuthHandler>) -> Self {
+        self.auth_handler = Some(auth_handler);
+        self
+    }
+
+    pub fn message_source(mut self, message_source: Arc<dyn MessageSource>) -> Self {
+        self.message_source = Some(message_source);
+        self
+    }
+
+    pub fn account_config_provider(mut self, provider: Arc<dyn AccountConfigProvider>) -> Self {
+        self.account_config_provider = Some(provider);
+        self
+    }
+
+    pub fn event_handler(mut self, event_handler: Arc<dyn ServerEventHandler>) -> Self {
+        self.event_handler = Some(event_handler);
+        self
+    }
+
+    pub fn account_pool_config(mut self, config: AccountPoolConfig) -> Self {
+        self.account_pool_config = Some(config);
+        self
+    }
+
+    /// 绑定监听端口并构建服务器实例。
+    pub async fn serve(self) -> Result<BoundServer> {
+        let addr = format!("{}:{}", self.config.host, self.config.port);
+        let listener = TcpListener::bind(&addr).await?;
+        let local_addr = listener.local_addr()?;
+        let pool = ConnectionPool::new();
+
+        let default_account_config = AccountConfig::new();
+        let pool_config = self.account_pool_config.unwrap_or_default();
+        let account_pool = AccountPool::new(default_account_config, pool_config);
+
+        Ok(BoundServer {
+            local_addr,
+            config: self.config,
+            handlers: self.handlers,
+            pool,
+            account_pool,
+            account_config_provider: self.account_config_provider,
+            listener: Arc::new(listener),
+            message_source: self.message_source,
+            event_handler: self.event_handler,
+            auth_handler: self.auth_handler,
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+        })
+    }
 }
 
 impl BoundServer {
