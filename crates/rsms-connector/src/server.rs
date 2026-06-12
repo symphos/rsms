@@ -228,16 +228,17 @@ async fn inbound_fetch_loop(
                 
                 match source.fetch(account_str, 10).await {
                     Ok(messages) => {
+                        // 合并本次 fetch 的所有 PDU（含分组按序）为一批，单次 flush 写出。
+                        let mut pdus = Vec::new();
                         for item in messages {
-                            let pdus = match item {
-                                crate::protocol::MessageItem::Single(pdu) => vec![pdu],
-                                crate::protocol::MessageItem::Group { items } => items,
-                            };
-                            for pdu in pdus {
-                                if let Err(e) = conn.write_frame(pdu.as_bytes()).await {
-                                    error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), account = %account, "send failed: {}", e);
-                                }
+                            match item {
+                                crate::protocol::MessageItem::Single(pdu) => pdus.push(pdu),
+                                crate::protocol::MessageItem::Group { items } => pdus.extend(items),
                             }
+                        }
+                        let slices: Vec<&[u8]> = pdus.iter().map(|p| p.as_bytes()).collect();
+                        if let Err(e) = conn.write_frames(&slices).await {
+                            error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), account = %account, "send failed: {}", e);
                         }
                     }
                     Err(e) => {

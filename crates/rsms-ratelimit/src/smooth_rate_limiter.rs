@@ -7,12 +7,14 @@
 //! 4. fresh permits 需要等待 stableIntervalMicros
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub struct SmoothRateLimiter {
-    inner: Arc<RwLock<Inner>>,
+    // 临界区（reserve_and_get_wait_length）为纯同步短操作，且 guard 绝不跨 .await，
+    // 故用 std::sync::Mutex；所有路径都需写，RwLock 无读并发收益反而更重。
+    inner: Arc<Mutex<Inner>>,
 }
 
 struct Inner {
@@ -29,7 +31,7 @@ impl SmoothRateLimiter {
         let now = Instant::now();
         
         Self {
-            inner: Arc::new(RwLock::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 stored_permits: max_qps as f64,
                 max_stored_permits: max_qps as f64,
                 stable_interval,
@@ -45,10 +47,10 @@ impl SmoothRateLimiter {
         
         loop {
             let wait = {
-                let mut inner = self.inner.write().await;
+                let mut inner = self.inner.lock().unwrap();
                 inner.reserve_and_get_wait_length(1)
             };
-            
+
             if wait.is_zero() {
                 return true;
             }
@@ -69,7 +71,7 @@ impl SmoothRateLimiter {
     /// 非阻塞尝试获取 permit
     pub async fn try_acquire(&self) -> bool {
         let wait = {
-            let mut inner = self.inner.write().await;
+            let mut inner = self.inner.lock().unwrap();
             inner.reserve_and_get_wait_length(1)
         };
         wait.is_zero()
@@ -77,13 +79,13 @@ impl SmoothRateLimiter {
 
     /// 获取当前可用 permit 数
     pub async fn available_permits(&self) -> f64 {
-        let inner = self.inner.read().await;
+        let inner = self.inner.lock().unwrap();
         inner.stored_permits
     }
 
     /// 设置 QPS
     pub async fn set_rate(&self, permits_per_second: u64) {
-        let mut inner = self.inner.write().await;
+        let mut inner = self.inner.lock().unwrap();
         inner.max_stored_permits = permits_per_second as f64;
         inner.stable_interval = Duration::from_micros(1_000_000 / permits_per_second);
         inner.stored_permits = permits_per_second as f64;

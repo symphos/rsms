@@ -124,18 +124,25 @@ fn extract_smpp_header(data: &[u8]) -> (u32, u32) {
 
 fn decode_frames(buf: &mut Vec<u8>, min_len: usize, extract_header: fn(&[u8]) -> (u32, u32)) -> Result<Vec<Frame>> {
     let mut out = Vec::new();
-    while buf.len() >= 4 {
-        let total = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    // 用读游标 off 解析，结束后一次性 drain，避免每帧 drain 的 O(N·buflen) 搬移。
+    let mut off = 0usize;
+    while buf.len() - off >= 4 {
+        let total =
+            u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
         if total < min_len || total > 100_000 {
-            buf.drain(..1);
+            off += 1;
             continue;
         }
-        if total > buf.len() {
+        if total > buf.len() - off {
             break;
         }
-        let frame_data: Vec<u8> = buf.drain(..total).collect();
+        let frame_data = buf[off..off + total].to_vec();
+        off += total;
         let (command_id, sequence_id) = extract_header(&frame_data);
         out.push(Frame::new(command_id, sequence_id, RawPdu::from_vec(frame_data)));
+    }
+    if off > 0 {
+        buf.drain(..off);
     }
     Ok(out)
 }
@@ -308,6 +315,24 @@ impl ClientConnection {
         Ok(())
     }
 
+    /// 批量写入多帧，仅在末尾 flush 一次，减少每帧 flush 的 syscall 开销。
+    /// 帧按入参顺序写出（长短信分组在调用方保持连续即同序）。
+    pub async fn write_frames(&self, frames: &[&[u8]]) -> Result<()> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut w = self.write.lock().await;
+            for f in frames {
+                w.write_all(f).await?;
+            }
+            w.flush().await?;
+        }
+        self.touch();
+        self.touch_sent();
+        Ok(())
+    }
+
     pub async fn mark_connected(&self) {
         let g = self.ctx.lock().await;
         let _ = g.mark_connected();
@@ -375,8 +400,8 @@ impl ClientConnection {
         
         let (tx, rx) = oneshot::channel();
         
-        let pdu_vec = pdu_slice.to_vec();
-        let _future = match window.offer(sequence_id, pdu_vec, self.endpoint.timeout).await {
+        // 窗口仅用 sequence_id 做请求/响应匹配，不读取 payload，传空 Vec 避免每条消息整包拷贝
+        let _future = match window.offer(sequence_id, Vec::new(), self.endpoint.timeout).await {
             Ok(f) => {
                 tracing::trace!(conn_id = self.id, remote_ip = %self.remote_ip(), remote_port = self.remote_port(), "window.offer success, seq_id={}", sequence_id);
                 f
@@ -645,12 +670,12 @@ async fn run_client_read_loop(
                 && window.contains(&frame.sequence_id).await
             {
                 let response = frame.data.to_vec();
-                let response_for_caller = response.clone();
-                let _ = window.complete(&frame.sequence_id, response).await;
-                
+                // window.complete 不读取响应体，传空 Vec 避免一次整包 clone
+                let _ = window.complete(&frame.sequence_id, Vec::new()).await;
+
                 let mut pending = conn.pending_responses.lock().await;
                 if let Some(tx) = pending.remove(&frame.sequence_id) {
-                    let _ = tx.send(Ok(response_for_caller));
+                    let _ = tx.send(Ok(response));
                     tracing::debug!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), seq_id = frame.sequence_id, "response sent to caller via ResponseFuture");
                 }
                 
@@ -745,29 +770,29 @@ async fn run_outbound_fetcher(
             }
         };
 
+        if !conn.ready_for_fetch() {
+            break;
+        }
+        // 将一次 fetch 的所有 PDU（含长短信分组，按序）合并为一批，单次 flush 写出。
+        let mut pdus = Vec::new();
         for item in items {
-            if !conn.ready_for_fetch() {
-                break;
+            match item {
+                MessageItem::Single(pdu) => pdus.push(pdu),
+                MessageItem::Group { items } => pdus.extend(items),
             }
-            let pdus = match item {
-                MessageItem::Single(pdu) => vec![pdu],
-                MessageItem::Group { items } => items,
-            };
-            for pdu in pdus {
-                match conn.write_frame(pdu.as_bytes()).await {
-                    Ok(_) => {
-                        if conn.endpoint.log_level.map_or(true, |max| tracing::Level::TRACE <= max) {
-                            tracing::trace!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "send success");
-                        }
-                    }
-                    Err(e) => {
-                        if conn.endpoint.log_level.map_or(true, |max| tracing::Level::DEBUG <= max) {
-                            tracing::debug!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "send failed: {}", e);
-                        }
-                        tokio::time::sleep(Duration::from_millis(1)).await;
-                        break;
-                    }
+        }
+        let slices: Vec<&[u8]> = pdus.iter().map(|p| p.as_bytes()).collect();
+        match conn.write_frames(&slices).await {
+            Ok(_) => {
+                if conn.endpoint.log_level.map_or(true, |max| tracing::Level::TRACE <= max) {
+                    tracing::trace!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), batch = slices.len(), "send batch success");
                 }
+            }
+            Err(e) => {
+                if conn.endpoint.log_level.map_or(true, |max| tracing::Level::DEBUG <= max) {
+                    tracing::debug!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "send failed: {}", e);
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }
     }

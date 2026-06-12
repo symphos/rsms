@@ -96,6 +96,43 @@
 - 四协议单账号 + 多账号压测 TPS ≥ 基线、零丢失；`cargo test --workspace` 全绿。
 - 提交（建议按子项拆分）：`perf: ...`
 
+### 改动前压测基线（2026-06-12，多账号 5×5×300s，RUST_LOG=warn）
+> 采集自 `target/run_baseline.sh`（`*-multi-account-stress-test`，`--test-threads=1`）。
+
+| 协议 | MT Sent=Resp=Report=Matched | Errors | Pending | MO 收发 | TPS(压测300s) | TPS(总时间) | 总时间 |
+|------|------|------|------|------|------|------|------|
+| CMPP | 3,762,772 | 0 | 0 | 1,885,217 | 12,542.5 | 12,423.7 | 302.87s |
+| SMGP | 3,762,787 | 0 | 0 | 1,885,227 | 12,542.6 | 12,423.7 | 302.87s |
+| SMPP | 3,762,804 | 0 | 0 | 1,885,237 | 12,542.7 | 12,423.8 | 302.87s |
+| SGIP | 3,769,044 | 0 | 0 | 1,889,917 | 12,563.4 | 12,393.3 | 304.12s |
+
+四协议全部 `test result: ok`，零丢失（resp=sent、report 全匹配、MO 全收、pending=0）。
+
+**重要：基线是速率受限的（生产者按 2500/账号 限速，合计 12,500/s 目标）。**
+系统已在该目标速率下零丢失，未饱和。因此 P1 性能改动**不会体现为 TPS 上升**（已封顶在
+~12,500），其价值在于降低 CPU/锁竞争/拷贝开销、留出更多余量。该基线的作用是：
+(1) **零丢失回归基准**（改动后须保持四协议零丢失）；(2) 若要量化吞吐上限提升，需另跑
+一轮提高/解除限速的饱和压测（可选）。
+
+### 阶段 1 实测路径覆盖（来自热路径源码核对）
+- 压测 MT 走 `run_outbound_fetcher`→`write_frame`（不走 window），服务端经 `decode_frames_drain`→handler→`write_frame` 回 resp；故基线直接覆盖 **1.3 / 1.5 / 1.6**。
+- **1.1（window.offer）/ 1.2（send_request/读循环 clone）/ 1.4（transaction 锁）不在压测路径上**，靠单测+集成测试验证正确性，其性能收益面向 `send_request`/`TransactionManager` 使用方。
+
+### 阶段 1 实施记录（2026-06-12）
+- ✅ **1.1 window.offer**：`window.rs` 新增 `Notify`（`space_available`），`offer()` 用「先 `enable()` 注册再 try_offer」避免丢唤醒 + `select!{notified | sleep(remaining)}`，替代 50ms 轮询；`complete/fail/cancel`/超时清理后 `notify_waiters()`。新增单测 `test_offer_wakes_on_complete`。
+- ✅ **1.2 去拷贝**：`send_request` 不再把整包 `to_vec()` 塞进 window（窗口仅用 seq 匹配，传空 `Vec`）；读循环去掉响应体的多余 `.clone()`（`window.complete` 不读响应体）。
+- ✅ **1.3 decode 缓冲区**：`connection.rs::decode_frames_drain` 与 `client.rs::decode_frames` 改为读游标 `off` 解析 + 循环末一次性 `drain(..off)`，消除每帧 `drain(..total)` 的 O(N·buflen) 搬移；坏长度重同步用 `off += 1`。
+- ✅ **1.5 限流器锁**：`SmoothRateLimiter` `tokio::RwLock` → `std::sync::Mutex`（guard 不跨 await）。
+- ✅ **1.6 批量 flush**：`Connection`/`ClientConnection` 新增 `write_frames`（末尾单次 flush）；客户端 `run_outbound_fetcher` 与服务端外发循环按一次 fetch 的整批写出（分组连续保序）。
+- ⏸️ **1.4 transaction 锁——暂缓**：`TransactionManager` 用单写锁保证 `transactions`/`seq_to_msg_id` 两表在 `on_submit_resp`（按 seq 删 + 按 msg_id 插）与 `on_report` 之间的原子一致性。直接换 `DashMap` 会牺牲该一致性、可能造成偶发漏匹配报告；且该组件不在压测路径上、无可量化收益。**移至独立变更**，配并发测试再做。
+- 验证：`cargo test --workspace --lib` 全绿；15 个非压测 `rsms-tests` 目标全绿（含 longmsg/dynamic/transaction）；window 新增唤醒测试通过。
+
+### ⚠️ 工具链问题：rustc 1.94.0 ICE（与本次改动无关）
+- `cargo test` 编译部分 `tests/` 下测试文件时 rustc **崩溃（ICE）**：query stack 为 `early_lint_checks → lint_level_impl` 在「发射某 lint 诊断」时 panic（`alloc/vec/mod.rs:2873`）。
+- **已证实为既有问题**：将本次 P1 改动 `git stash` 回退到提交版后，`smpp-longmsg-test` 仍 ICE；且崩溃发生在测试文件自身 AST 早期 lint（早于解析外部 crate），与库改动无关。
+- **绕过方式**：`RUSTFLAGS='--cap-lints allow'`（仅抑制 lint 发射，不影响 codegen/运行时）。本仓库压测与全部测试均在此 flag 下通过。
+- 建议：升级/切换 rustc 版本，或向 rust-lang/rust 提 ICE 报告。
+
 ---
 
 ## 阶段 2（P2）：架构 / 可维护性
