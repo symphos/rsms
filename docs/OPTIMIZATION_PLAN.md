@@ -10,7 +10,6 @@
 - **分阶段、每阶段独立提交**，提交信息遵循 `feat`/`fix`/`refactor`/`perf` 前缀。
 - **行为不变的前提下重构**：P2/P3 不得改变对外语义；改动后 `cargo build --workspace` + `cargo test --workspace --lib` + 四协议集成测试必须全绿。
 - **P0/P1 改完必须补/跑回归**：P0 加针对性单测，P1 用压测验证 TPS 不退化且消息零丢失。
-- **工具链在 WSL**：所有 cargo 命令经 `wsl bash -lc "cd /mnt/g/RustProjects/rsms && cargo ..."` 执行。
 
 ---
 

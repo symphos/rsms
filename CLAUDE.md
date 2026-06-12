@@ -12,8 +12,6 @@ RSMS is a Rust multi-protocol SMS gateway middleware framework supporting four C
 
 ## Common commands
 
-> **Toolchain runs under WSL.** `cargo`/`rustc` are not on the Windows PATH — run all cargo commands inside WSL, e.g. `wsl bash -lc "cd /mnt/g/RustProjects/rsms && cargo build --workspace"`. The commands below are the WSL-side commands.
-
 ```bash
 # Build / lint
 cargo build --workspace

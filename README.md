@@ -209,9 +209,6 @@ use rsms_codec_smpp::{BindTransmitter, SubmitSm, ...};
 
 ## 运行测试
 
-> 注意：Rust 工具链运行在 WSL 中，`cargo` 不在 Windows PATH 上。请在 WSL 内执行，例如
-> `wsl bash -lc "cd /mnt/g/RustProjects/rsms && cargo test ..."`。
-
 ```bash
 # 单元测试
 cargo test -p rsms-core -p rsms-connector -p rsms-longmsg

@@ -48,9 +48,6 @@ git checkout -b feature/your-feature
 
 ### 2. 开发与测试
 
-> 注意：Rust 工具链运行在 WSL 中，`cargo` 不在 Windows PATH 上，需在 WSL 内执行
-> （例如 `wsl bash -lc "cd /mnt/g/RustProjects/rsms && cargo ..."`）。
-
 ```bash
 # 编译检查
 cargo build --workspace
