@@ -2,6 +2,7 @@
 //!
 //! SGIP is used by China Unicom for SMS transmission.
 
+pub mod adapter;
 pub mod codec;
 pub mod datatypes;
 pub mod frame;
