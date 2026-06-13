@@ -2,6 +2,10 @@
 
 Rust 多协议短信消息中间件框架，支持 **CMPP 2.0/3.0**、**SMGP 3.0.3**、**SMPP 3.4/5.0**、**SGIP 1.2** 四种运营商短信协议。
 
+> ⚠️ **WIP / 早期阶段**：当前版本 `0.0.1`，尚未发布。四协议收发、300s 压测零丢失、连接/资源长稳已验证，适合**受控试点**；作为关键生产链路前建议补充真实运营商联调与天级长稳（见 [`docs/OPTIMIZATION_PLAN.md`](docs/OPTIMIZATION_PLAN.md)）。
+>
+> 另有一项「**统一消息模型 / 协议窄腰**」架构演进正处于**设计与试点验证阶段**（设计见 [`docs/superpowers/specs/`](docs/superpowers/specs/)、计划见 [`docs/superpowers/plans/`](docs/superpowers/plans/)），**尚未落地**，现有四协议 API 不受影响。
+
 ## 特性
 
 - **四协议统一抽象** — 服务端/客户端 API 统一，切换协议只需改 Decoder 和 EndpointConfig
