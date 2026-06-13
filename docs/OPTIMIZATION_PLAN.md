@@ -305,6 +305,13 @@ P1 的 window/decode/flush/锁/去拷贝改动均验证正确。但审查追查�
 - ✅ **4A.6 编码截断**：10 处正文长度域 encode 前校验 `len ≤ u8/u32 上限`，超限返回 `CodecError::FieldValidation`（CMPP 4 + SMGP 2 + SMPP 2 + SGIP 2 u32）。四协议各加 encode 超长测试（cmpp43/smgp33/smpp10/sgip18 全绿）。
   - **遗留（→ 4D 死代码清理）**：`codec-cmpp/datatypes/v20.rs:159` `build_submit_v20_pdu`（pub、二级再导出、不返回 Result）同样截断，但**全仓零生产调用点**，生产 V2.0 encode 走已修的 `encode_pdu_submit_v20`，截断 bug **生产不可达**；`message.rs:321` 为 `#[cfg(test)]` 测试夹具。两者均建议作为死代码删除或改签名，不在 4A.6「生产可达缺陷」范围内强行改 API。
 
+### 4B 实施记录（2026-06-13）
+- ✅ **4B.1 pending drain**（commit 72963bb）：客户端 `mark_disconnected` 末尾 drain `pending_responses` 发 `ConnectionClosed`，在途请求立即失败而非挂到 `endpoint.timeout`。集成测试断开后 future 0.01s 内返回 Err（远短于 30s timeout）。
+- ⏭️ **4B.2 账号/线程回收——暂缓**（用户确认）：账号 map 回收存在 `remove` vs 重连 `get_or_create` 跨双层锁竞态，且账号数通常有界、严重性远低于已修的连接级泄漏（4A.1）；僵尸 `inbound_fetch_loop` 空转可单独安全解决但需共享计数 DashMap 重构 + 压测。仿阶段 2.4「收益/前提不足则暂缓」，移作独立专项。
+- ✅ **4B.3 protocol enum**：新增 `rsms_core::Protocol { Cmpp, Smgp, Smpp, Sgip }`，派生 `header_len()`/`seq_offset()`/`as_str()`/`Display`/`FromStr`；`EndpointConfig.protocol: String → Protocol`，`with_protocol(Protocol)`，从 `rsms_core`/`rsms_connector` 双导出。连接器内部（`send_request` 偏移、`decode_frames_drain`/`encode_close_packet`/handler 分发、server、keepalive、`create_decoder`）全部改枚举（偏移由 `seq_offset()` 派生）；迁移 6 示例 + 17 测试 + tests-common（`FromStr` 解析）+ 11 文档。拼错/漏设协议从「运行期丢消息」变为「编译期报错」。`Protocol` 3 单测 + clippy 零警告 + 全量回归 + 四协议集成全绿。
+- ✅ **4B.4 RawPdu::sequence_id 文档警告**：核实该 `EncodedPdu` 方法全仓零调用（连接层用 `Protocol::seq_offset` 解析），硬编码偏移 8–11 仅对 12B 头有效；改 trait 签名波及全部实现且无收益，故加文档警告标注「仅 CMPP/SMGP 适用，其它协议用 `Protocol::seq_offset`」。
+- ⏭️ **4B.5 错误分类——暂缓**：核实 `decode_frames_drain`（帧层）靠长度前缀自行判半包（`total > buf.len()-off 即 break`），不调 codec `decode_message`、不依赖 `CodecError::Incomplete`；业务层 decode 处理的是已切好的完整 PDU，不存在半包。故「连接层丢失半包语义」前提不成立，剩余仅业务层错误可读性、无明确消费者。仿 2.4 暂缓。
+
 ### 阶段 4 验收
 - 4A 每项 TDD（先写失败测试再修）；`cargo build --workspace` + `cargo test --workspace --lib` + 四协议集成测试全绿；四协议多账号压测复跑零丢失、TPS ≥ 基线。
 - 提交按子项拆分：`fix:`（4A/4B 缺陷）、`perf:`（4C）、`docs:`/`test:`（4D）。
