@@ -119,7 +119,7 @@ impl Connection {
             let ctx = self.ctx.lock().await;
             ctx.mark_disconnected();
         }
-        if let Some(close_pkt) = encode_close_packet(self.config.protocol) {
+        if let Some(close_pkt) = close_packet(self.config.protocol) {
             let _ = self.write_frame(&close_pkt).await;
         }
         {
@@ -344,7 +344,7 @@ pub async fn run_connection(
             Err(_) => {
                 if conn.is_idle(idle_timeout).await {
                     tracing::warn!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), idle_timeout_secs = idle_timeout.as_secs(), "connection idle timeout, closing");
-                    if let Some(close_pkt) = encode_close_packet(protocol) {
+                    if let Some(close_pkt) = close_packet(protocol) {
                         let _ = conn.write_frame(&close_pkt).await;
                     }
                     break;
@@ -374,14 +374,14 @@ pub async fn run_connection(
                 Protocol::Smpp => smpp_handler.handle_frame(&frame, conn_arc.clone()).await,
             };
 
-            // 影子比对：仅在 unified-shadow feature 开启时，对 SMGP 帧额外做统一模型解码。
+            // 影子比对：unified-shadow feature 开启时，对任意协议帧经 registry 做统一模型解码。
             // 只打日志，不接管实际处理，错误隔离不影响旧路径。
             #[cfg(feature = "unified-shadow")]
-            if protocol == Protocol::Smgp {
+            {
                 use rsms_model::ProtocolAdapter as _;
-                match rsms_codec_smgp::adapter::SmgpAdapter.decode(&frame) {
-                    Ok(unified) => tracing::debug!(conn_id = conn.id, ?unified, "shadow decode ok"),
-                    Err(e) => tracing::warn!(conn_id = conn.id, "shadow decode err: {e}"),
+                match crate::adapter_registry::adapter_for(protocol).decode(&frame) {
+                    Ok(unified) => tracing::debug!(conn_id = conn.id, proto = protocol.as_str(), ?unified, "shadow decode ok"),
+                    Err(e) => tracing::warn!(conn_id = conn.id, proto = protocol.as_str(), "shadow decode err: {e}"),
                 }
             }
 
@@ -537,4 +537,43 @@ fn encode_close_packet(protocol: Protocol) -> Option<Vec<u8>> {
         pdu.extend_from_slice(&[0u8; 1]);
     }
     Some(pdu)
+}
+
+/// 关闭包编码（全协议收敛经 adapter）：四协议均经 adapter 统一编码；adapter 意外失败兜底回旧实现。
+/// SMGP 此前旧实现发 13B（多 1 字节保留位）是 latent bug，现经 adapter 产出合规 12B
+/// （SMGP 3.0.3 Exit body 为空，见 codec `Exit::BODY_SIZE = 0`、解码器拒收 total_length≠12）——此为修复。
+fn close_packet(protocol: Protocol) -> Option<Vec<u8>> {
+    use rsms_model::ProtocolAdapter as _;
+    crate::adapter_registry::adapter_for(protocol)
+        .encode(&rsms_model::UnifiedMessage::Unbind, 0)
+        .ok()
+        .or_else(|| encode_close_packet(protocol))
+}
+
+#[cfg(test)]
+mod converge_close_gating {
+    use super::*;
+    use crate::adapter_registry::adapter_for;
+    use rsms_model::{ProtocolAdapter as _, UnifiedMessage};
+
+    /// 锁定全协议收敛：close_packet 对四协议均产出 adapter 字节。
+    #[test]
+    fn close_packet_uses_adapter_for_all_protocols() {
+        for p in [Protocol::Cmpp, Protocol::Smgp, Protocol::Sgip, Protocol::Smpp] {
+            let via = adapter_for(p).encode(&UnifiedMessage::Unbind, 0).ok();
+            assert_eq!(close_packet(p), via, "{p:?} close 应走 adapter 字节");
+        }
+    }
+
+    /// 记录修复：SMGP 关闭包现为合规 12B（adapter，Exit body 空），不再是旧 encode_close_packet 的 13B。
+    #[test]
+    fn smgp_close_fixed_to_12b() {
+        let fixed = close_packet(Protocol::Smgp).expect("smgp close");
+        assert_eq!(fixed.len(), 12, "SMGP 关闭包应为合规 12B");
+        assert_ne!(
+            fixed,
+            encode_close_packet(Protocol::Smgp).expect("legacy"),
+            "应已脱离旧 13B 实现（旧实现保留作兜底/回归对照）"
+        );
+    }
 }

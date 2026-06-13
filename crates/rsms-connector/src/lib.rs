@@ -6,6 +6,7 @@
 //!
 //! 单连接处理顺序：**帧解码 → CMPP 消息解码 → 会话占位 → 业务链**（见 `run_connection`）。
 
+pub mod adapter_registry;
 pub mod client;
 pub mod client_pool;
 pub mod connection;
