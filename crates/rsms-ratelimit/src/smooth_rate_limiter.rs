@@ -27,6 +27,8 @@ struct Inner {
 
 impl SmoothRateLimiter {
     pub fn new(max_qps: u64) -> Self {
+        // 下限钳制为 1，避免 max_qps=0（配置错误）导致整数除零 panic。
+        let max_qps = max_qps.max(1);
         let stable_interval = Duration::from_micros(1_000_000 / max_qps);
         let now = Instant::now();
         
@@ -85,6 +87,8 @@ impl SmoothRateLimiter {
 
     /// 设置 QPS
     pub async fn set_rate(&self, permits_per_second: u64) {
+        // 下限钳制为 1，避免 permits_per_second=0 导致整数除零 panic。
+        let permits_per_second = permits_per_second.max(1);
         let mut inner = self.inner.lock().unwrap();
         inner.max_stored_permits = permits_per_second as f64;
         inner.stable_interval = Duration::from_micros(1_000_000 / permits_per_second);
@@ -180,8 +184,24 @@ mod tests {
         
         println!("High QPS test: count={}, elapsed={:.2}s, actual_qps={:.1}", count, elapsed, actual_qps);
         
-        assert!(count >= target as u64 * 80 / 100, 
-            "Expected at least 80% of target, got {} out of {} ({:.1} QPS)", 
+        assert!(count >= target as u64 * 80 / 100,
+            "Expected at least 80% of target, got {} out of {} ({:.1} QPS)",
             count, target, actual_qps);
+    }
+
+    /// `max_qps=0`（配置错误/未初始化）不应触发整数除零 panic，应退化为至少 1 QPS。
+    #[tokio::test]
+    async fn new_with_zero_qps_does_not_panic() {
+        let limiter = SmoothRateLimiter::new(0);
+        // 构造不 panic，且仍可正常调用（退化为低速率）。
+        let _ = limiter.try_acquire().await;
+    }
+
+    /// 运行中 `set_rate(0)` 同样不应除零 panic。
+    #[tokio::test]
+    async fn set_rate_zero_does_not_panic() {
+        let limiter = SmoothRateLimiter::new(100);
+        limiter.set_rate(0).await;
+        let _ = limiter.try_acquire().await;
     }
 }
