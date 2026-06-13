@@ -1,10 +1,14 @@
 //! SmppAdapter：复用 decode_message + Pdu::to_pdu_bytes，做 SmppMessage ↔ UnifiedMessage 翻译。
 //! 验证窄腰对 TON/NPI（落 Address）与 TLV（落 tlvs）的吸收能力。
+//!
+//! 已知限制（本轮）：encode 不支持 Bind/BindResp（仅 Submit/SubmitResp/DeliverResp/心跳/解绑，
+//! 与 SMGP adapter 一致）；BindResp.status 暂填 0（SMPP 结果码在 command_status，decode 未透出）；
+//! Report 路径未解析 MESSAGE_STATE 等 TLV，status 暂为 Unknown。
 
 use crate::codec::Pdu;
 use crate::datatypes::{
-    DeliverSm, DeliverSmResp, EnquireLink, EnquireLinkResp, SubmitSm, SubmitSmResp, Tlv, Unbind,
-    UnbindResp,
+    CommandId, DeliverSm, DeliverSmResp, EnquireLink, EnquireLinkResp, SubmitSm, SubmitSmResp,
+    Tlv, Unbind, UnbindResp,
 };
 use crate::message::{decode_message, SmppMessage};
 use rsms_core::{Frame, Protocol, Result, RsmsError};
@@ -80,7 +84,7 @@ fn submit_to_unified(s: SubmitSm) -> UnifiedSubmit {
 
 fn deliver_to_unified(d: DeliverSm) -> UnifiedMessage {
     let dest = Address {
-        number: d.destination_addr.clone(),
+        number: d.destination_addr,
         ton: Some(d.dest_addr_ton),
         npi: Some(d.dest_addr_npi),
     };
@@ -94,6 +98,8 @@ fn deliver_to_unified(d: DeliverSm) -> UnifiedMessage {
             .unwrap_or_else(|| MessageId::Text(String::new()));
         UnifiedMessage::Report(UnifiedReport {
             msg_id,
+            // 注：DeliverSm 回执的 MESSAGE_STATE(0x0427)/NETWORK_ERROR_CODE 等 TLV 本轮未解析，
+            // status 暂为 Unknown，raw 仅含 short_message。精确状态解析待后续。
             status: DeliveryStatus::Unknown,
             dest,
             raw: d.short_message,
@@ -142,22 +148,25 @@ fn smpp_to_unified(msg: SmppMessage) -> UnifiedMessage {
         SmppMessage::BindTransceiver(b) => {
             UnifiedMessage::Bind(bind_to_unified(b.system_id, b.password, b.interface_version))
         }
-        SmppMessage::BindTransmitterResp(r) => {
-            UnifiedMessage::BindResp(rsms_model::UnifiedBindResp { status: r.sc_interface_version as u32 })
-        }
-        SmppMessage::BindReceiverResp(r) => {
-            UnifiedMessage::BindResp(rsms_model::UnifiedBindResp { status: r.sc_interface_version as u32 })
-        }
-        SmppMessage::BindTransceiverResp(r) => {
-            UnifiedMessage::BindResp(rsms_model::UnifiedBindResp { status: r.sc_interface_version as u32 })
+        // SMPP BindResp 的结果码在 PDU command_status，decode_message 读后丢弃、未透出；
+        // 本轮 BindResp.status 暂填 0（不可用 sc_interface_version 充当 status——它是服务端协议版本，非结果码）。
+        SmppMessage::BindTransmitterResp(_)
+        | SmppMessage::BindReceiverResp(_)
+        | SmppMessage::BindTransceiverResp(_) => {
+            UnifiedMessage::BindResp(rsms_model::UnifiedBindResp { status: 0 })
         }
         SmppMessage::EnquireLink(_) => UnifiedMessage::Ping,
         SmppMessage::EnquireLinkResp(_) => UnifiedMessage::PingResp,
         SmppMessage::Unbind(_) => UnifiedMessage::Unbind,
         SmppMessage::UnbindResp(_) => UnifiedMessage::UnbindResp,
         SmppMessage::Unknown { command_id, body } => UnifiedMessage::Unknown { command_id, raw: body },
-        // Query/Cancel/GenericNack 等次要消息本轮退化为 Unknown，不丢帧（仅 shadow 日志可见）
-        _ => UnifiedMessage::Unknown { command_id: 0, raw: vec![] },
+        // Query/Cancel/GenericNack 等次要消息本轮退化为 Unknown（仅 shadow 日志可见），
+        // 保留真实 command_id 便于诊断；match 改为穷尽，未来新增变体会触发编译错误而非静默归零。
+        SmppMessage::QuerySm(_) => UnifiedMessage::Unknown { command_id: CommandId::QUERY_SM as u32, raw: vec![] },
+        SmppMessage::QuerySmResp(_) => UnifiedMessage::Unknown { command_id: CommandId::QUERY_SM_RESP as u32, raw: vec![] },
+        SmppMessage::CancelSm(_) => UnifiedMessage::Unknown { command_id: CommandId::CANCEL_SM as u32, raw: vec![] },
+        SmppMessage::CancelSmResp(_) => UnifiedMessage::Unknown { command_id: CommandId::CANCEL_SM_RESP as u32, raw: vec![] },
+        SmppMessage::GenericNack(_) => UnifiedMessage::Unknown { command_id: CommandId::GENERIC_NACK as u32, raw: vec![] },
     }
 }
 
