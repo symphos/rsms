@@ -374,12 +374,16 @@ pub async fn run_connection(
                 Protocol::Smpp => smpp_handler.handle_frame(&frame, conn_arc.clone()).await,
             };
             
-            if let Err(e) = handle_result {
-                error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), protocol = %protocol, "handler error: {}", e);
-                continue;
-            }
-            
-            if handle_result.unwrap() == HandleResult::Continue {
+            // handler 错误即跳过该帧；仅 Continue 才进入业务链，其余（如 Stop）不处理。
+            let action = match handle_result {
+                Ok(action) => action,
+                Err(e) => {
+                    error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), protocol = %protocol, "handler error: {}", e);
+                    continue;
+                }
+            };
+
+            if action == HandleResult::Continue {
                 let id_gen = conn_arc.account_connections().await.map(|ac| ac.id_generator().clone());
                 if let Err(e) = run_chain(conn.config.clone(), conn_arc.clone() as Arc<dyn rsms_business::ProtocolConnection>, &handlers, &frame, id_gen).await {
                     error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "business: {}", e);
