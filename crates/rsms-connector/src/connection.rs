@@ -540,7 +540,9 @@ fn encode_close_packet(protocol: Protocol) -> Option<Vec<u8>> {
 }
 
 /// 关闭包编码（部分收敛）：CMPP/SGIP/SMPP 经 adapter 统一编码（已门控字节相等）；
-/// SMGP 旧实现带 1 字节保留位、与 adapter(12B) 不一致，保留旧实现以不改变上线字节。
+/// SMGP：adapter 的 12B 才符合 SMGP 3.0.3（Exit body 为空，见 codec `Exit::BODY_SIZE = 0`，
+/// 其解码器拒收 total_length≠12）；旧实现的 13B（多 1 字节保留位）是已知 latent bug，此处仅为
+/// 「不改变现有上线字节」而保留旧路径——对 SMGP 而言收敛是修复、非回归。
 /// 非 SMGP 协议若 adapter 编码意外失败，兜底回旧实现。
 fn close_packet(protocol: Protocol) -> Option<Vec<u8>> {
     use rsms_model::ProtocolAdapter as _;
@@ -569,8 +571,8 @@ mod converge_close_gating {
         }
     }
 
-    /// 锁定已知差异：SMGP 旧关闭包多 1 字节保留位，与 adapter(12B) 不一致，故保留旧路径。
-    /// 若此断言失败，说明差异已消除，可将 SMGP 也纳入收敛。
+    /// 锁定已知差异：SMGP 旧关闭包 13B（多 1 字节保留位）是已知 latent bug；adapter 的 12B 才符合
+    /// SMGP 3.0.3（Exit body 空）。保留旧路径仅为不改变上线字节；若此断言失败说明已对齐，可收敛 SMGP（属修复）。
     #[test]
     fn smgp_close_known_divergence() {
         let legacy = encode_close_packet(Protocol::Smgp);

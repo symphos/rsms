@@ -882,8 +882,9 @@ fn start_keepalive_task(conn: Arc<ClientConnection>, protocol: Protocol, idle_ti
 async fn send_keepalive_packet(conn: &Arc<ClientConnection>, protocol: Protocol) -> Result<()> {
     use rsms_model::ProtocolAdapter as _;
     // CMPP/SMPP 心跳经 adapter 统一编码（已门控字节相等，sequence_id=1 与旧实现一致）；
-    // adapter 意外失败兜底回旧构造器。SMGP（旧实现带保留字节，与 adapter 不一致）与
-    // SGIP（用 Trace 作保活、adapter 无 Ping）保留旧实现。
+    // adapter 意外失败兜底回旧构造器。SMGP 旧心跳 13B（多 1 字节保留位）是已知 latent bug——
+    // adapter 的 12B 才符合 SMGP 3.0.3（ActiveTest body 空，codec BODY_SIZE=0、解码器拒收≠12B）；
+    // 保留旧实现仅为不改变上线字节。SGIP 无专用心跳（用 Trace）、adapter 无 Ping，亦保留旧实现。
     let pdu = match protocol {
         Protocol::Cmpp => crate::adapter_registry::adapter_for(protocol)
             .encode(&rsms_model::UnifiedMessage::Ping, 1)
@@ -975,7 +976,8 @@ mod converge_keepalive_gating {
         );
     }
 
-    /// 锁定已知差异：SMGP 旧心跳多 1 字节保留位；SGIP 无 Ping（adapter 报错）。两者保留旧实现。
+    /// 锁定已知差异：SMGP 旧心跳 13B（多 1 字节保留位）是已知 latent bug，adapter 12B 才合规
+    /// （SMGP 3.0.3 ActiveTest body 空）；SGIP 无 Ping（adapter 报错）。两者保留旧实现（SMGP 为不改上线字节）。
     #[test]
     fn smgp_and_sgip_keepalive_known_divergence() {
         assert_ne!(
