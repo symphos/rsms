@@ -1,0 +1,9 @@
+[package]
+name = "rsms-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Protocol-agnostic unified SMS message model and ProtocolAdapter trait"
+
+[dependencies]
+rsms-core = { path = "../rsms-core" }
