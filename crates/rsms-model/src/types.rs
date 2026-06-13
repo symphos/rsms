@@ -111,6 +111,7 @@ pub struct SgipExtra {
     pub charge_number: String,
     pub corp_id: String,
     pub service_type: String,
+    /// SGIP fee_type 为单字节枚举，区别于 SMGP/CMPP 同名字段的字符串形式。
     pub fee_type: u8,
     pub fee_value: String,
     pub given_value: String,
@@ -127,12 +128,11 @@ pub struct SgipExtra {
 /// CMPP 特有方言字段（V3.0 Submit 中不进核心模型的部分）。
 /// 注：src_id→src，dest_terminal_ids→dests，msg_content→content，
 /// msg_fmt→encoding，registered_delivery→want_report，dest_usr_tl 由 dests.len() 推导。
+/// 本轮仅 V3.0：encode 恒生成 SubmitV30，故不带 version 字段（V2.0 支持时再加并附逻辑）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CmppExtra {
-    /// CMPP 版本魔数：0x30=V3.0（本轮唯一支持）。0x20 预留。
-    pub version: u8,
-    /// 8 字节 msg_id，空 Vec 视为 [0u8;8]。
-    pub msg_id: Vec<u8>,
+    /// 8 字节 msg_id（与 codec `Submit::msg_id` 同型，Default 即 [0u8;8]）。
+    pub msg_id: [u8; 8],
     pub pk_total: u8,
     pub pk_number: u8,
     pub msg_level: u8,
