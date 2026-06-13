@@ -430,6 +430,7 @@ dependencies = [
  "rsms-codec-smgp",
  "rsms-codec-smpp",
  "rsms-core",
+ "rsms-model",
  "rsms-ratelimit",
  "rsms-session",
  "rsms-window",
