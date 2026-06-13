@@ -40,6 +40,10 @@ path = "cmpp/transaction_manager_test.rs"
 name = "cmpp-soak-test"
 path = "cmpp/soak_test.rs"
 
+[[test]]
+name = "cmpp-fault-injection-test"
+path = "cmpp/fault_injection_test.rs"
+
 # SMGP
 [[test]]
 name = "smgp-integration"
