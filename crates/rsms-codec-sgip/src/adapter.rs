@@ -5,7 +5,7 @@
 //! （decode_message 丢弃 header SgipSequence，统一模型不携带它；真实连接序列生成在编排层别处）。
 
 use crate::codec::Encodable;
-use crate::datatypes::{DeliverResp, Report, SgipSequence, Submit, SubmitResp, Unbind, UnbindResp};
+use crate::datatypes::{CommandId, DeliverResp, Report, SgipSequence, Submit, SubmitResp, Unbind, UnbindResp};
 use crate::message::{decode_message, SgipMessage};
 use rsms_core::{Frame, Protocol, Result, RsmsError};
 use rsms_model::{
@@ -36,7 +36,8 @@ fn fmt_from_encoding(enc: Encoding) -> u8 {
     }
 }
 
-/// SGIP 状态码 → 统一 DeliveryStatus（state: 0=成功投递，其余按未知保留）。
+/// SGIP 状态码 → 统一 DeliveryStatus（state: 0=成功投递；其余取值——等待/投递中/已删除等——
+/// 完整映射待后续，本轮非 0 一律归 Unknown）。
 fn status_from_state(state: u8) -> DeliveryStatus {
     match state {
         0 => DeliveryStatus::Delivered,
@@ -45,6 +46,7 @@ fn status_from_state(state: u8) -> DeliveryStatus {
 }
 
 /// 把 SgipSequence 编为 12 字节大端，装进 MessageId::Binary。
+/// 仅作统一模型内部不透明标识（调用方按 MessageId 比对），不在适配器层反解回 SgipSequence。
 fn seq_to_msg_id(seq: SgipSequence) -> MessageId {
     let mut b = Vec::with_capacity(12);
     b.extend_from_slice(&seq.node_id.to_be_bytes());
@@ -57,7 +59,7 @@ fn submit_to_unified(s: Submit) -> UnifiedSubmit {
     UnifiedSubmit {
         src: Address::plain(s.sp_number),
         dests: s.user_numbers.into_iter().map(Address::plain).collect(),
-        content: s.message_content.clone(),
+        content: s.message_content,
         encoding: encoding_from_fmt(s.msg_fmt),
         want_report: s.report_flag != 0,
         concat: None,
@@ -82,6 +84,7 @@ fn submit_to_unified(s: Submit) -> UnifiedSubmit {
 }
 
 fn report_to_unified(r: Report) -> UnifiedReport {
+    // raw 仅含 report_type/state/error_code 摘要；reserve(8B) 不入 raw。
     let raw = vec![r.report_type, r.state, r.error_code];
     UnifiedReport {
         msg_id: seq_to_msg_id(r.submit_sequence),
@@ -94,6 +97,7 @@ fn report_to_unified(r: Report) -> UnifiedReport {
 fn sgip_to_unified(msg: SgipMessage) -> UnifiedMessage {
     match msg {
         SgipMessage::Submit(s) => UnifiedMessage::Submit(submit_to_unified(s)),
+        // SGIP SubmitResp 仅含 result，无 msg_id 字段；统一模型 msg_id 置空。
         SgipMessage::SubmitResp(r) => UnifiedMessage::SubmitResp(UnifiedSubmitResp {
             msg_id: MessageId::Text(String::new()),
             status: r.result,
@@ -109,7 +113,12 @@ fn sgip_to_unified(msg: SgipMessage) -> UnifiedMessage {
         }),
         SgipMessage::DeliverResp(_) => UnifiedMessage::DeliverResp,
         SgipMessage::Report(r) => UnifiedMessage::Report(report_to_unified(r)),
-        SgipMessage::ReportResp(_) => UnifiedMessage::DeliverResp,
+        // ReportResp 是独立 Report 命令的响应；统一模型暂无对应变体，退化为 Unknown 并保留真实
+        // command_id，不可伪装成 DeliverResp（那是 MO-Deliver 的响应，语义不同、会在路由层误判）。
+        SgipMessage::ReportResp(_) => UnifiedMessage::Unknown {
+            command_id: CommandId::ReportResp as u32,
+            raw: vec![],
+        },
         SgipMessage::Bind(b) => UnifiedMessage::Bind(rsms_model::UnifiedBind {
             client_id: b.login_name,
             authenticator: b.login_password.into_bytes(),
@@ -121,9 +130,15 @@ fn sgip_to_unified(msg: SgipMessage) -> UnifiedMessage {
         }
         SgipMessage::Unbind(_) => UnifiedMessage::Unbind,
         SgipMessage::UnbindResp(_) => UnifiedMessage::UnbindResp,
-        SgipMessage::Trace(_) | SgipMessage::TraceResp(_) => {
-            UnifiedMessage::Unknown { command_id: 0x1000, raw: vec![] }
-        }
+        // Trace/TraceResp 本轮退化为 Unknown（仅 shadow 日志可见），各自保留真实 command_id 便于诊断。
+        SgipMessage::Trace(t) => UnifiedMessage::Unknown {
+            command_id: CommandId::Trace as u32,
+            raw: t.trace_value.into_bytes(),
+        },
+        SgipMessage::TraceResp(_) => UnifiedMessage::Unknown {
+            command_id: CommandId::TraceResp as u32,
+            raw: vec![],
+        },
         SgipMessage::Unknown { command_id, body } => UnifiedMessage::Unknown { command_id, raw: body },
     }
 }
