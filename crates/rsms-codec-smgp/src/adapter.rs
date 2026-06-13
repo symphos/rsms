@@ -186,7 +186,8 @@ fn unified_to_smgp(msg: &UnifiedMessage, seq: u32) -> Result<SmgpMessage> {
         }
         UnifiedMessage::DeliverResp => SmgpMessage::DeliverResp {
             sequence_id: seq,
-            resp: DeliverResp { status: 0 },
+            // adapter 的 DeliverResp 不携带回执 MsgId（统一模型无此字段），置默认；仅用于 shadow/收敛。
+            resp: DeliverResp { msg_id: SmgpMsgId::default(), status: 0 },
         },
         UnifiedMessage::Ping => SmgpMessage::ActiveTest { sequence_id: seq },
         UnifiedMessage::PingResp => SmgpMessage::ActiveTestResp { sequence_id: seq },

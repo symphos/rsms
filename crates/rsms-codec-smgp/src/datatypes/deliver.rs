@@ -269,15 +269,18 @@ impl SmgpReport {
 /// SMGP Deliver 响应
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliverResp {
+    /// 回执的 MsgId（须回显所响应 Deliver 的 msg_id）。
+    pub msg_id: SmgpMsgId,
     pub status: u32,
 }
 
 impl DeliverResp {
-    pub const BODY_SIZE: usize = 4;
+    pub const BODY_SIZE: usize = 10 + 4;
 }
 
 impl Encodable for DeliverResp {
     fn encode(&self, buf: &mut BytesMut) -> Result<(), CodecError> {
+        buf.put_slice(&self.msg_id.bytes);
         buf.put_u32(self.status);
         Ok(())
     }
@@ -292,8 +295,14 @@ impl Decodable for DeliverResp {
         if buf.remaining() < Self::BODY_SIZE {
             return Err(CodecError::Incomplete);
         }
+        let mut msg_id_bytes = [0u8; 10];
+        buf.try_copy_to_slice(&mut msg_id_bytes)
+            .map_err(|_| CodecError::Incomplete)?;
         let status = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
-        Ok(DeliverResp { status })
+        Ok(DeliverResp {
+            msg_id: SmgpMsgId::new(msg_id_bytes),
+            status,
+        })
     }
 
     fn command_id() -> CommandId {
@@ -461,7 +470,7 @@ mod tests {
 
     #[test]
     fn deliver_resp_roundtrip() {
-        let resp = DeliverResp { status: 0 };
+        let resp = DeliverResp { msg_id: SmgpMsgId::default(), status: 0 };
         let bytes = Pdu::from(resp.clone()).to_pdu_bytes(1);
         let decoded = decode_pdu::<DeliverResp>(&bytes.as_slice()).unwrap();
         assert_eq!(decoded.status, 0);

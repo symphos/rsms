@@ -181,7 +181,7 @@ impl ClientHandler for ClientState {
                     }
                 }
             }
-            let resp = DeliverResp { status: 0 };
+            let resp = DeliverResp { msg_id: SmgpMsgId::default(), status: 0 };
             let resp_pdu: Pdu = resp.into();
             ctx.conn.write_frame(resp_pdu.to_pdu_bytes(frame.sequence_id).as_slice()).await?;
         }
