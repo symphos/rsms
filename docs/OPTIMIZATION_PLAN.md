@@ -312,9 +312,23 @@ P1 的 window/decode/flush/锁/去拷贝改动均验证正确。但审查追查�
 - ✅ **4B.4 RawPdu::sequence_id 文档警告**：核实该 `EncodedPdu` 方法全仓零调用（连接层用 `Protocol::seq_offset` 解析），硬编码偏移 8–11 仅对 12B 头有效；改 trait 签名波及全部实现且无收益，故加文档警告标注「仅 CMPP/SMGP 适用，其它协议用 `Protocol::seq_offset`」。
 - ⏭️ **4B.5 错误分类——暂缓**：核实 `decode_frames_drain`（帧层）靠长度前缀自行判半包（`total > buf.len()-off 即 break`），不调 codec `decode_message`、不依赖 `CodecError::Incomplete`；业务层 decode 处理的是已切好的完整 PDU，不存在半包。故「连接层丢失半包语义」前提不成立，剩余仅业务层错误可读性、无明确消费者。仿 2.4 暂缓。
 
+### 4C 实施记录（2026-06-13）
+- ✅ **4C.1 容量预留**（commit 36dff94）：CMPP/SMGP `to_pdu_bytes` 改 `BytesMut::with_capacity(12 + encoded_size())`（对齐 SGIP），消除编码热路径 realloc，并让各 PDU 的 `encoded_size()` 从死代码变真实调用者。压测 TPS 与基线一致。
+- ✅ **4C.3 核实为 agent 误报**：`server.rs` `inbound_fetch_loop` 的 `window_size` 是单次读局部变量（line 282），inc(284)/dec(315) 用同一值配对，不存在「两次独立读 window_size」的 TOCTOU。无需改。
+- ⏭️ **4C.2/4C.4/4C.5/4C.6 暂缓**：on_report 兜底 O(n)（正常路径 O(1)，命中率未知）、每响应 spawn drain（动 client 读循环有竞态风险）、锁类型对齐、解码去 `to_vec` —— 均为 speculative 微优化，无 profile 数据佐证收益，按 4C「需 profile 佐证」原则暂缓。
+
+### 4D 实施记录（2026-06-13）
+- ✅ **4D.1 公共 API doc**：补 `BusinessHandler`/`on_inbound`（写明「框架不自动发 Resp，业务必须 write_frame 回 Resp 否则窗口耗尽假死」核心契约）/`InboundContext`、`MessageSource`/`MessageItem`、longmsg 全部 pub API、四 codec `message.rs`(decode/encode_message) 与 `codec.rs`(Pdu/PduHeader/Encodable/Decodable) 的中文 doc。
+- ✅ **4A.6 遗留死代码清理**：删除 codec-cmpp `v20.rs::build_submit_v20_pdu`（pub、含截断隐患、全仓零生产调用）连同私有辅助 `encode_pstring_fixed`、2 个唯一调用测试、`datatypes/mod.rs`+`lib.rs` 再导出；生产 V2.0 编码走 `encode_pdu_submit_v20`。
+- ⏭️ **4D.2 CodecError 下沉暂缓**：跨 4 crate 架构改动，且 SMPP 的 `CodecError` 与 CMPP/SMGP/SGIP 不完全相同（去重不彻底），纯去重无功能收益、有破坏 `From` 实现风险，记为可单独专项。
+- ✅ **4D.3 测试盲区核实**：分段上限/Merger TTL/连接回收/pending drain 已在 4A/4B 补齐；`with_protocol` 误用经 4B.3 已变编译期（N/A）；半包语义 4B.5 已核实暂缓。无新增缺口。
+
 ### 阶段 4 验收
 - 4A 每项 TDD（先写失败测试再修）；`cargo build --workspace` + `cargo test --workspace --lib` + 四协议集成测试全绿；四协议多账号压测复跑零丢失、TPS ≥ 基线。
 - 提交按子项拆分：`fix:`（4A/4B 缺陷）、`perf:`（4C）、`docs:`/`test:`（4D）。
+
+### 阶段 4 收官小结（2026-06-13）
+二轮架构研究发现的缺陷处理完毕：**4A 全 6 项修复**（连接泄漏/除零/分段超长/死代码/Merger OOM/编码截断），**4B** 完成 4B.1（pending drain）/4B.3（protocol enum）/4B.4（RawPdu doc），**4C** 完成 4C.1（容量预留），**4D** 完成 4D.1（doc）+ 死代码清理。**暂缓项**（均经源码核实前提/收益不足，仿阶段 2.4）：4B.2（账号回收竞态）、4B.5（帧层不依赖 CodecError 判半包）、4C.2/4C.4/4C.5/4C.6（无 profile 的微优化）、4C.3（agent 误报）、4D.2（去重不彻底）。全程 TDD + 单测/集成/clippy 零警告 + 四协议压测零丢失/TPS 一致。
 
 ### 决策点（待确认）
 - **4B.3 protocol enum**：是否接受对外 API 破坏性变更（builder 已重构过，迁移成本可控）？
