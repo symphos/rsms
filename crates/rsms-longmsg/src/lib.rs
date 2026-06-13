@@ -8,11 +8,9 @@ pub mod reference_id;
 pub mod segment_bitmap;
 pub mod split;
 pub mod merge;
-pub mod cache;
 
 pub use frame::{LongMessageFrame, UdhHeader, UdhParser};
 pub use reference_id::ReferenceIdGenerator;
 pub use segment_bitmap::SegmentBitmap;
 pub use split::LongMessageSplitter;
 pub use merge::LongMessageMerger;
-pub use cache::{FrameCache, InMemoryFrameCache};
