@@ -92,22 +92,25 @@ impl Decodable for Bind {
             return Err(CodecError::Incomplete);
         }
 
-        let login_type = buf.get_u8();
+        let login_type = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
 
         let mut login_name_buf = [0u8; 16];
-        buf.copy_to_slice(&mut login_name_buf);
+        buf.try_copy_to_slice(&mut login_name_buf)
+            .map_err(|_| CodecError::Incomplete)?;
         let login_name = String::from_utf8_lossy(&login_name_buf)
             .trim_end_matches('\0')
             .to_string();
 
         let mut login_password_buf = [0u8; 16];
-        buf.copy_to_slice(&mut login_password_buf);
+        buf.try_copy_to_slice(&mut login_password_buf)
+            .map_err(|_| CodecError::Incomplete)?;
         let login_password = String::from_utf8_lossy(&login_password_buf)
             .trim_end_matches('\0')
             .to_string();
 
         let mut reserve = [0u8; 8];
-        buf.copy_to_slice(&mut reserve);
+        buf.try_copy_to_slice(&mut reserve)
+            .map_err(|_| CodecError::Incomplete)?;
 
         Ok(Bind {
             login_type,
@@ -175,9 +178,10 @@ impl Decodable for BindResp {
             return Err(CodecError::Incomplete);
         }
 
-        let result = buf.get_u8();
+        let result = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let mut reserve = [0u8; 8];
-        buf.copy_to_slice(&mut reserve);
+        buf.try_copy_to_slice(&mut reserve)
+            .map_err(|_| CodecError::Incomplete)?;
 
         Ok(BindResp { result, reserve })
     }

@@ -69,10 +69,10 @@ impl Decodable for Query {
         }
 
         let time = decode_pstring(buf, 8).map_err(|_| CodecError::Incomplete)?;
-        let query_type = buf.get_u8();
+        let query_type = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let query_code = decode_pstring(buf, 10).map_err(|_| CodecError::Incomplete)?;
         let reserve = decode_pstring(buf, 8).map_err(|_| CodecError::Incomplete)?;
-        let m_type = buf.get_u8();
+        let m_type = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
 
         Ok(Query {
             time,
@@ -143,16 +143,16 @@ impl Decodable for QueryResp {
         }
 
         let time = decode_pstring(buf, 8).map_err(|_| CodecError::Incomplete)?;
-        let query_type = buf.get_u8();
+        let query_type = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let query_code = decode_pstring(buf, 10).map_err(|_| CodecError::Incomplete)?;
-        let mt_ttl_msg = buf.get_u32();
-        let mt_suc = buf.get_u32();
-        let mt_fail = buf.get_u32();
-        let mo_rcv = buf.get_u32();
-        let mo_suc = buf.get_u32();
-        let mo_fail = buf.get_u32();
-        let mo_scs = buf.get_u32();
-        let mo_err = buf.get_u32();
+        let mt_ttl_msg = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
+        let mt_suc = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
+        let mt_fail = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
+        let mo_rcv = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
+        let mo_suc = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
+        let mo_fail = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
+        let mo_scs = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
+        let mo_err = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
 
         Ok(QueryResp {
             time,
@@ -200,7 +200,8 @@ impl Decodable for Cancel {
             return Err(CodecError::Incomplete);
         }
         let mut msg_id = [0u8; 8];
-        buf.copy_to_slice(&mut msg_id);
+        buf.try_copy_to_slice(&mut msg_id)
+            .map_err(|_| CodecError::Incomplete)?;
         Ok(Cancel { msg_id })
     }
 
@@ -234,7 +235,7 @@ impl Decodable for CancelResp {
         if buf.remaining() < Self::BODY_SIZE {
             return Err(CodecError::Incomplete);
         }
-        let success_id = buf.get_u32();
+        let success_id = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
         Ok(CancelResp { success_id })
     }
 

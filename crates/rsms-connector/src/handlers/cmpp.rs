@@ -29,7 +29,7 @@ fn encode_error_response(command_id: u32, sequence_id: u32, status: CommandStatu
     let body_len = 4;
     let total_len = 12 + body_len;
     let mut pdu = Vec::with_capacity(total_len);
-    pdu.extend_from_slice(&total_len.to_be_bytes());
+    pdu.extend_from_slice(&(total_len as u32).to_be_bytes());
     pdu.extend_from_slice(&resp_command_id.to_be_bytes());
     pdu.extend_from_slice(&sequence_id.to_be_bytes());
     pdu.extend_from_slice(&status.as_u32().to_be_bytes());
@@ -38,6 +38,26 @@ fn encode_error_response(command_id: u32, sequence_id: u32, status: CommandStatu
 
 fn is_version_supported(version: u8) -> bool {
     matches!(version, CMPP_VERSION_2_0 | CMPP_VERSION_3_0 | 0x00 | 0x01 | 0x7F)
+}
+
+/// 构造并发送 CMPP ConnectResp（version-unsupported 与三种认证结果共用）。
+async fn send_connect_resp(
+    conn: &Arc<dyn ProtocolConnection>,
+    sequence_id: u32,
+    version: u8,
+    status: u32,
+) -> Result<()> {
+    let resp = ConnectResp {
+        status,
+        authenticator_ismg: [0u8; 16],
+        version,
+    };
+    let mut body = BytesMut::new();
+    resp.encode(&mut body)
+        .map_err(|e| rsms_core::RsmsError::Codec(e.to_string()))?;
+    let mut pdu = encode_pdu_header(CommandId::ConnectResp, sequence_id, body.len());
+    pdu.extend_from_slice(&body);
+    conn.write_frame(&pdu).await
 }
 
 pub struct CmppHandler {
@@ -86,17 +106,7 @@ impl crate::protocol::ProtocolHandler for CmppHandler {
                 
                 if !is_version_supported(c.version) {
                     tracing::warn!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "不支持的CMPP版本: {:02x}", c.version);
-                    let resp = ConnectResp {
-                        status: 1,
-                        authenticator_ismg: [0u8; 16],
-                        version: CMPP_VERSION_3_0,
-                    };
-                    let mut body = BytesMut::new();
-                    resp.encode(&mut body).unwrap();
-                    
-                    let mut pdu = encode_pdu_header(CommandId::ConnectResp, sequence_id, body.len());
-                    pdu.extend_from_slice(&body);
-                    conn.write_frame(&pdu).await?;
+                    send_connect_resp(&conn, sequence_id, CMPP_VERSION_3_0, 1).await?;
                     return Ok(HandleResult::Stop);
                 }
                 
@@ -123,49 +133,18 @@ impl crate::protocol::ProtocolHandler for CmppHandler {
                     Ok(result) if result.status == 0 => {
                         tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "CMPP认证成功: account={}", result.account);
                         conn.set_authenticated_account(result.account.clone()).await;
-                        
-                        let resp = ConnectResp {
-                            status: 0,
-                            authenticator_ismg: [0u8; 16],
-                            version: c.version,
-                        };
-                        let mut body = BytesMut::new();
-                        resp.encode(&mut body).unwrap();
-                        
-                        let mut pdu = encode_pdu_header(CommandId::ConnectResp, sequence_id, body.len());
-                        pdu.extend_from_slice(&body);
-                        conn.write_frame(&pdu).await?;
+                        send_connect_resp(&conn, sequence_id, c.version, 0).await?;
                         tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "发送CMPP连接响应: status=0");
                         return Ok(HandleResult::Continue);
                     }
                     Ok(result) => {
                         tracing::warn!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "CMPP认证失败: status={}, message={:?}", result.status, result.message);
-                        let resp = ConnectResp {
-                            status: result.status,
-                            authenticator_ismg: [0u8; 16],
-                            version: c.version,
-                        };
-                        let mut body = BytesMut::new();
-                        resp.encode(&mut body).unwrap();
-                        
-                        let mut pdu = encode_pdu_header(CommandId::ConnectResp, sequence_id, body.len());
-                        pdu.extend_from_slice(&body);
-                        conn.write_frame(&pdu).await?;
+                        send_connect_resp(&conn, sequence_id, c.version, result.status).await?;
                         return Ok(HandleResult::Stop);
                     }
                     Err(e) => {
                         tracing::error!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "CMPP认证错误: {}", e);
-                        let resp = ConnectResp {
-                            status: 1,
-                            authenticator_ismg: [0u8; 16],
-                            version: c.version,
-                        };
-                        let mut body = BytesMut::new();
-                        resp.encode(&mut body).unwrap();
-                        
-                        let mut pdu = encode_pdu_header(CommandId::ConnectResp, sequence_id, body.len());
-                        pdu.extend_from_slice(&body);
-                        conn.write_frame(&pdu).await?;
+                        send_connect_resp(&conn, sequence_id, c.version, 1).await?;
                         return Ok(HandleResult::Stop);
                     }
                 }

@@ -21,12 +21,12 @@ use rsms_codec_cmpp::{
     CmppMessage, Deliver, Pdu, SubmitResp,
 };
 use rsms_connector::{
-    serve, BoundServer, AccountConfig, AccountConfigProvider, AccountPoolConfig,
+    ServerBuilder, BoundServer, AccountConfig, AccountConfigProvider, AccountPoolConfig,
     AuthCredentials, AuthHandler, AuthResult, MessageSource, MessageItem,
     ServerEventHandler, ProtocolConnection,
     SimpleIdGenerator,
 };
-use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Frame, IdGenerator, RawPdu, Result};
+use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Protocol, Frame, IdGenerator, RawPdu, Result};
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
 use std::collections::{HashMap, VecDeque};
@@ -513,7 +513,7 @@ async fn main() -> Result<()> {
 
     let config = Arc::new(
         EndpointConfig::new("cmpp-gateway", "0.0.0.0", 7890, 500, 60)
-            .with_protocol("cmpp")
+            .with_protocol(Protocol::Cmpp)
             .with_log_level(tracing::Level::INFO),
     );
 
@@ -523,19 +523,18 @@ async fn main() -> Result<()> {
         config.port
     );
 
-    let server = serve(
-        config,
-        vec![Arc::new(CmppBusinessHandler {
+    let server = ServerBuilder::new(config)
+        .handlers(vec![Arc::new(CmppBusinessHandler {
             msg_source: msg_source.clone(),
             merger: Arc::new(std::sync::Mutex::new(LongMessageMerger::new())),
-        })],
-        Some(Arc::new(CmppAuthHandler { accounts })),
-        Some(msg_source as Arc<dyn MessageSource>),
-        Some(Arc::new(SimpleAccountConfigProvider)),
-        Some(Arc::new(CmppServerEventHandler)),
-        Some(AccountPoolConfig::new()),
-    )
-    .await?;
+        })])
+        .auth_handler(Arc::new(CmppAuthHandler { accounts }))
+        .message_source(msg_source as Arc<dyn MessageSource>)
+        .account_config_provider(Arc::new(SimpleAccountConfigProvider))
+        .event_handler(Arc::new(CmppServerEventHandler))
+        .account_pool_config(AccountPoolConfig::new())
+        .serve()
+        .await?;
 
     tracing::info!("监听地址: {}", server.local_addr);
     server.run().await

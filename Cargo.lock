@@ -458,17 +458,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rsms-pipeline"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "bytes",
- "rsms-core",
- "thiserror",
- "tokio",
-]
-
-[[package]]
 name = "rsms-ratelimit"
 version = "0.0.1"
 dependencies = [

@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::Notify;
 use tokio::time;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -58,6 +59,8 @@ pub struct Window<K, R, P> {
     pending: Arc<Mutex<HashMap<K, WindowFuture<K, P>>>>,
     event_sender: Option<mpsc::Sender<WindowEvent<K>>>,
     shutdown_flag: Arc<AtomicBool>,
+    // 窗口腾出空间时唤醒 offer() 等待者，替代固定 50ms 轮询
+    space_available: Arc<Notify>,
     _phantom: PhantomData<R>,
 }
 
@@ -183,6 +186,7 @@ where
             pending: Arc::new(Mutex::new(HashMap::new())),
             event_sender: None,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
+            space_available: Arc::new(Notify::new()),
             _phantom: PhantomData,
         }
     }
@@ -216,41 +220,66 @@ where
         let start = Instant::now();
 
         loop {
-            if let Ok(future) = self.try_offer(key, params.clone()).await {
-                return Ok(future);
+            // 先注册等待句柄再尝试 offer，避免 try_offer 与 notify_waiters 之间的丢唤醒
+            let notified = self.space_available.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            match self.try_offer(key, params.clone()).await {
+                Ok(future) => return Ok(future),
+                Err(WindowError::WindowFull) => {}
+                // DuplicateKey 等非“窗口已满”错误直接返回，不轮询等待
+                Err(e) => return Err(e),
             }
-            if start.elapsed() >= timeout {
-                break;
+
+            let remaining = match timeout.checked_sub(start.elapsed()) {
+                Some(r) if !r.is_zero() => r,
+                _ => break,
+            };
+
+            // 被唤醒（有空间）或超时兜底，二者先到为准
+            tokio::select! {
+                _ = notified => {}
+                _ = time::sleep(remaining) => {}
             }
-            time::sleep(Duration::from_millis(50)).await;
         }
 
         Err(WindowError::OfferTimeout)
     }
 
     pub async fn complete(&self, key: &K, _response: R) -> Option<WindowFuture<K, P>> {
-        let mut pending = self.pending.lock().await;
-
-        if let Some(_future) = pending.remove(key) {
+        let removed = {
+            let mut pending = self.pending.lock().await;
+            pending.remove(key).is_some()
+        };
+        if removed {
             self.send_event(WindowEvent::<K>::Completed(*key));
+            self.space_available.notify_waiters();
         }
-
         None
     }
 
     pub async fn fail(&self, key: &K, error: WindowError) -> Option<WindowFuture<K, P>> {
-        let mut pending = self.pending.lock().await;
-
-        if let Some(_future) = pending.remove(key) {
+        let removed = {
+            let mut pending = self.pending.lock().await;
+            pending.remove(key).is_some()
+        };
+        if removed {
             self.send_event(WindowEvent::<K>::Failed(*key, error));
+            self.space_available.notify_waiters();
         }
-
         None
     }
 
     pub async fn cancel(&self, key: &K) -> Option<WindowFuture<K, P>> {
-        let mut pending = self.pending.lock().await;
-        pending.remove(key)
+        let removed = {
+            let mut pending = self.pending.lock().await;
+            pending.remove(key)
+        };
+        if removed.is_some() {
+            self.space_available.notify_waiters();
+        }
+        removed
     }
 
     pub async fn size(&self) -> usize {
@@ -277,6 +306,7 @@ where
         let pending = self.pending.clone();
         let config = self.config.clone();
         let sender = self.event_sender.clone();
+        let space_available = self.space_available.clone();
         let wait_rx = handle.take_wait_rx();
 
         tokio::spawn(async move {
@@ -295,12 +325,19 @@ where
                             }
                         }
 
+                        let mut any_removed = false;
                         for key in expired_keys {
-                            if pending.remove(&key).is_some()
-                                && let Some(tx) = &sender
-                            {
-                                let _ = tx.send(WindowEvent::Expired(key)).await;
+                            if pending.remove(&key).is_some() {
+                                any_removed = true;
+                                if let Some(tx) = &sender {
+                                    let _ = tx.send(WindowEvent::Expired(key)).await;
+                                }
                             }
+                        }
+                        drop(pending);
+                        if any_removed {
+                            // 超时清理腾出空间，唤醒等待的 offer()
+                            space_available.notify_waiters();
                         }
                     }
                     _ = async {
@@ -337,6 +374,7 @@ impl<K, R, P> Clone for Window<K, R, P> {
             pending: self.pending.clone(),
             event_sender: None,
             shutdown_flag: self.shutdown_flag.clone(),
+            space_available: self.space_available.clone(),
             _phantom: PhantomData,
         }
     }
@@ -385,5 +423,29 @@ mod tests {
 
         let result = window.try_offer(1u32, "req1".to_string()).await;
         assert!(matches!(result, Err(WindowError::DuplicateKey(_))));
+    }
+
+    #[tokio::test]
+    async fn test_offer_wakes_on_complete() {
+        // 窗口满 → offer 阻塞等待；complete 腾出空间应立即唤醒，而非等到超时
+        let config = WindowConfig::new(1, Duration::from_secs(5));
+        let window: Window<u32, &str, String> = Window::new(config);
+        window.try_offer(1u32, "req1".to_string()).await.unwrap();
+
+        let w2 = window.clone();
+        let offer_task = tokio::spawn(async move {
+            w2.offer(2u32, "req2".to_string(), Duration::from_secs(5)).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await; // 让 offer 进入等待
+        let start = Instant::now();
+        window.complete(&1, "resp1").await;
+
+        let result = offer_task.await.unwrap();
+        assert!(result.is_ok());
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "complete 后应被唤醒，而非等满 5s 超时"
+        );
     }
 }

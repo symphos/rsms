@@ -33,8 +33,9 @@ ERROR rsms_connector::connection: read error: Connection reset by peer
 通过 `EndpointConfig` 的 `log_level` 字段控制框架日志输出级别：
 
 ```rust
+use rsms_core::Protocol;
 let config = Arc::new(EndpointConfig::new("gateway", "0.0.0.0", 7890, 500, 60)
-    .with_protocol("cmpp")
+    .with_protocol(Protocol::Cmpp)
     .with_log_level(tracing::Level::WARN));
 ```
 

@@ -1,11 +1,11 @@
 use async_trait::async_trait;
 use rsms_connector::{
     AuthCredentials, AuthHandler, AuthResult,
-    AccountConfig, AccountConfigProvider, SmppDecoder, connect,
+    AccountConfig, AccountConfigProvider, SmppDecoder, ClientBuilder,
     AccountPool,
 };
 use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler, ClientConnection};
-use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Frame, Result};
+use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Frame, Result};
 use rsms_codec_smpp::{
     Pdu, CommandId, BindTransmitter, SubmitSm,
 };
@@ -115,17 +115,14 @@ async fn start_server(
         0,
         500,
         60,
-    ).with_protocol("smpp"));
+    ).with_protocol(Protocol::Smpp));
     let auth = Arc::new(PasswordAuthHandler::new().add_account(TEST_SYSTEM_ID, TEST_PASSWORD));
-    let server = rsms_connector::serve(
-        cfg,
-        vec![],
-        Some(auth),
-        None,
-        Some(config_provider as Arc<dyn AccountConfigProvider>),
-        None,
-        None,
-    ).await?;
+    let server = rsms_connector::ServerBuilder::new(cfg)
+        .handlers(vec![])
+        .auth_handler(auth)
+        .account_config_provider(config_provider as Arc<dyn AccountConfigProvider>)
+        .serve()
+        .await?;
     let port = server.local_addr.port();
     let account_pool = server.account_pool();
     let handle = tokio::spawn(async move { let _ = server.run().await; });
@@ -142,17 +139,14 @@ async fn create_connections(port: u16, count: usize) -> Vec<Arc<ClientConnection
             port,
             500,
             60,
-        ).with_protocol("smpp"));
+        ).with_protocol(Protocol::Smpp));
 
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = connect(
-            endpoint,
-            client_handler,
-            SmppDecoder,
-            Some(ClientConfig::default()),
-            None,
-            None,
-        ).await.expect("connect failed");
+        let conn = ClientBuilder::new(endpoint, client_handler, SmppDecoder)
+            .client_config(ClientConfig::default())
+            .connect()
+            .await
+            .expect("connect failed");
 
         let bind_pdu = build_bind_pdu(TEST_SYSTEM_ID, TEST_PASSWORD);
         conn.write_frame(bind_pdu.as_bytes()).await.expect("send bind failed");

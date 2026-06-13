@@ -23,8 +23,8 @@ impl Address {
     }
 
     pub fn decode(buf: &mut Cursor<&[u8]>) -> Result<Self, CodecError> {
-        let ton = buf.get_u8();
-        let npi = buf.get_u8();
+        let ton = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let npi = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let address = decode_cstring(buf, MAX_ADDRESS_BYTES, "address")?;
         Ok(Self { ton, npi, address })
     }
@@ -40,46 +40,31 @@ impl Address {
     }
 }
 
+/// SMPP TON（Type of Number）取值参考表，供构造地址时引用
+#[allow(dead_code)]
 pub mod ton {
-    #[allow(dead_code)]
     pub const UNKNOWN: u8 = 0x00;
-    #[allow(dead_code)]
     pub const INTERNATIONAL: u8 = 0x01;
-    #[allow(dead_code)]
     pub const NATIONAL: u8 = 0x02;
-    #[allow(dead_code)]
     pub const NETWORK_SPECIFIC: u8 = 0x03;
-    #[allow(dead_code)]
     pub const SUBSCRIBER_NUMBER: u8 = 0x04;
-    #[allow(dead_code)]
     pub const ALPHANUMERIC: u8 = 0x05;
-    #[allow(dead_code)]
     pub const ABBREVIATED: u8 = 0x06;
 }
 
+/// SMPP NPI（Numbering Plan Indicator）取值参考表
+#[allow(dead_code)]
 pub mod npi {
-    #[allow(dead_code)]
     pub const UNKNOWN: u8 = 0x00;
-    #[allow(dead_code)]
     pub const ISDN: u8 = 0x01;
-    #[allow(dead_code)]
     pub const DATA: u8 = 0x03;
-    #[allow(dead_code)]
     pub const TELEX: u8 = 0x04;
-    #[allow(dead_code)]
     pub const SCANNING: u8 = 0x05;
-    #[allow(dead_code)]
     pub const RESERVED_1: u8 = 0x06;
-    #[allow(dead_code)]
     pub const RESERVED_2: u8 = 0x07;
-    #[allow(dead_code)]
     pub const NATIONAL: u8 = 0x08;
-    #[allow(dead_code)]
     pub const PRIVATE: u8 = 0x09;
-    #[allow(dead_code)]
     pub const ERMES: u8 = 0x0A;
-    #[allow(dead_code)]
     pub const INTERNET: u8 = 0x0E;
-    #[allow(dead_code)]
     pub const WAP_CLIENT: u8 = 0x0F;
 }

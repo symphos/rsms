@@ -87,6 +87,15 @@ impl Encodable for SubmitSm {
         buf.put_u8(self.replace_if_present_flag);
         buf.put_u8(self.data_coding);
         buf.put_u8(self.sm_default_msg_id);
+        if self.short_message.len() > u8::MAX as usize {
+            return Err(CodecError::FieldValidation {
+                field: "short_message",
+                reason: format!(
+                    "正文长度 {} 超过 sm_length(u8) 上限 255",
+                    self.short_message.len()
+                ),
+            });
+        }
         buf.put_u8(self.short_message.len() as u8);
         buf.put_slice(&self.short_message);
         for tlv in &self.tlvs {
@@ -130,24 +139,28 @@ impl Decodable for SubmitSm {
             });
         }
         let service_type = decode_cstring(buf, 6, "service_type")?;
-        let source_addr_ton = buf.get_u8();
-        let source_addr_npi = buf.get_u8();
+        let source_addr_ton = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let source_addr_npi = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let source_addr = decode_cstring(buf, 21, "source_addr")?;
-        let dest_addr_ton = buf.get_u8();
-        let dest_addr_npi = buf.get_u8();
+        let dest_addr_ton = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let dest_addr_npi = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let destination_addr = decode_cstring(buf, 21, "destination_addr")?;
-        let esm_class = buf.get_u8();
-        let protocol_id = buf.get_u8();
-        let priority_flag = buf.get_u8();
+        let esm_class = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let protocol_id = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let priority_flag = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let schedule_delivery_time = decode_cstring(buf, 17, "schedule_delivery_time")?;
         let validity_period = decode_cstring(buf, 17, "validity_period")?;
-        let registered_delivery = buf.get_u8();
-        let replace_if_present_flag = buf.get_u8();
-        let data_coding = buf.get_u8();
-        let sm_default_msg_id = buf.get_u8();
-        let sm_length = buf.get_u8();
+        let registered_delivery = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let replace_if_present_flag = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let data_coding = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let sm_default_msg_id = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let sm_length = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        if buf.remaining() < sm_length as usize {
+            return Err(CodecError::Incomplete);
+        }
         let mut short_message = vec![0u8; sm_length as usize];
-        buf.copy_to_slice(&mut short_message);
+        buf.try_copy_to_slice(&mut short_message)
+            .map_err(|_| CodecError::Incomplete)?;
 
         let mut tlvs = Vec::new();
         while buf.has_remaining() {
@@ -210,5 +223,19 @@ impl Decodable for SubmitSmResp {
 
     fn command_id() -> CommandId {
         CommandId::SUBMIT_SM_RESP
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_oversized_msg_content_returns_err_not_truncate() {
+        // 4A.6：sm_length 是 u8（上限 255）。short_message 256 字节时旧代码
+        // `len() as u8` 静默截断为 0，修复后 encode 必须返回 Err。
+        let submit = SubmitSm::new().with_message("13800138000", "9000", &vec![0x41u8; 256]);
+        let mut buf = BytesMut::new();
+        assert!(submit.encode(&mut buf).is_err());
     }
 }

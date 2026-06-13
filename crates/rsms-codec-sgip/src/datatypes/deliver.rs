@@ -53,6 +53,16 @@ impl Encodable for Deliver {
         buf.put_u8(self.tppid);
         buf.put_u8(self.tpudhi);
         buf.put_u8(self.msg_fmt);
+        if self.message_content.len() > u32::MAX as usize {
+            return Err(CodecError::FieldValidation {
+                field: "message_content",
+                reason: format!(
+                    "正文长度 {} 超过 MessageLength(u32) 上限 {}",
+                    self.message_content.len(),
+                    u32::MAX
+                ),
+            });
+        }
         buf.put_u32(self.message_content.len() as u32);
         buf.put_slice(&self.message_content);
         buf.put_slice(&self.reserve);
@@ -73,14 +83,22 @@ impl Decodable for Deliver {
 
         let user_number = decode_pstring(buf, 21).map_err(|_| CodecError::Incomplete)?;
         let sp_number = decode_pstring(buf, 21).map_err(|_| CodecError::Incomplete)?;
-        let tppid = buf.get_u8();
-        let tpudhi = buf.get_u8();
-        let msg_fmt = buf.get_u8();
-        let message_length = buf.get_u32() as usize;
+        let tppid = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let tpudhi = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let msg_fmt = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let message_length = buf.try_get_u32().map_err(|_| CodecError::Incomplete)? as usize;
+        if buf.remaining() < message_length {
+            return Err(CodecError::Incomplete);
+        }
         let mut message_content = vec![0u8; message_length];
-        buf.copy_to_slice(&mut message_content);
+        buf.try_copy_to_slice(&mut message_content)
+            .map_err(|_| CodecError::Incomplete)?;
+        if buf.remaining() < 8 {
+            return Err(CodecError::Incomplete);
+        }
         let mut reserve = [0u8; 8];
-        buf.copy_to_slice(&mut reserve);
+        buf.try_copy_to_slice(&mut reserve)
+            .map_err(|_| CodecError::Incomplete)?;
 
         Ok(Deliver {
             user_number,
@@ -123,7 +141,7 @@ impl Decodable for DeliverResp {
         if buf.remaining() < Self::BODY_SIZE {
             return Err(CodecError::Incomplete);
         }
-        let result = buf.get_u32();
+        let result = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
         Ok(DeliverResp { result })
     }
 
@@ -174,12 +192,13 @@ impl Decodable for Report {
         }
         let submit_sequence =
             crate::datatypes::SgipSequence::decode(buf).map_err(|_| CodecError::Incomplete)?;
-        let report_type = buf.get_u8();
+        let report_type = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let user_number = decode_pstring(buf, 21).map_err(|_| CodecError::Incomplete)?;
-        let state = buf.get_u8();
-        let error_code = buf.get_u8();
+        let state = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let error_code = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let mut reserve = [0u8; 8];
-        buf.copy_to_slice(&mut reserve);
+        buf.try_copy_to_slice(&mut reserve)
+            .map_err(|_| CodecError::Incomplete)?;
         Ok(Report {
             submit_sequence,
             report_type,
@@ -220,7 +239,7 @@ impl Decodable for ReportResp {
         if buf.remaining() < Self::BODY_SIZE {
             return Err(CodecError::Incomplete);
         }
-        let result = buf.get_u32();
+        let result = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
         Ok(ReportResp { result })
     }
 
@@ -276,7 +295,8 @@ impl Decodable for Trace {
 
         let trace_value = decode_pstring(buf, 21).map_err(|_| CodecError::Incomplete)?;
         let mut reserve = [0u8; 8];
-        buf.copy_to_slice(&mut reserve);
+        buf.try_copy_to_slice(&mut reserve)
+            .map_err(|_| CodecError::Incomplete)?;
 
         Ok(Trace {
             trace_value,
@@ -337,10 +357,11 @@ impl Decodable for TraceResp {
             return Err(CodecError::Incomplete);
         }
 
-        let result = buf.get_u32();
+        let result = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
         let trace_result = decode_pstring(buf, 21).map_err(|_| CodecError::Incomplete)?;
         let mut reserve = [0u8; 8];
-        buf.copy_to_slice(&mut reserve);
+        buf.try_copy_to_slice(&mut reserve)
+            .map_err(|_| CodecError::Incomplete)?;
 
         Ok(TraceResp {
             result,
@@ -375,6 +396,16 @@ mod tests {
         let decoded = decode_pdu::<Deliver>(&bytes).unwrap();
         assert_eq!(decoded.message_content, b"MO reply");
         assert_eq!(decoded.user_number, "13800138000");
+    }
+
+    #[test]
+    fn encode_oversized_msg_content_ok_u32_field() {
+        // 4A.6：MessageLength 是 u32，256 字节正文远在上限内，encode 应正常 Ok。
+        let mut deliver = Deliver::new();
+        deliver.user_number = "13800138000".to_string();
+        deliver.message_content = vec![0x41u8; 256];
+        let mut buf = BytesMut::new();
+        assert!(deliver.encode(&mut buf).is_ok());
     }
 
     #[test]

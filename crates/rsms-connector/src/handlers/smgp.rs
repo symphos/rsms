@@ -30,6 +30,26 @@ fn encode_pdu_header(command_id: CommandId, sequence_id: u32, body_len: usize) -
     pdu
 }
 
+/// 构造并发送 SMGP LoginResp（解码错误与三种认证结果共用）。
+async fn send_login_resp(
+    conn: &Arc<dyn ProtocolConnection>,
+    sequence_id: u32,
+    version: u8,
+    status: u32,
+) -> Result<()> {
+    let resp = LoginResp {
+        status,
+        authenticator: [0u8; 16],
+        version,
+    };
+    let mut body = BytesMut::new();
+    resp.encode(&mut body)
+        .map_err(|e| rsms_core::RsmsError::Codec(e.to_string()))?;
+    let mut pdu = encode_pdu_header(CommandId::LoginResp, sequence_id, body.len());
+    pdu.extend_from_slice(&body);
+    conn.write_frame(&pdu).await
+}
+
 #[async_trait]
 impl crate::protocol::ProtocolHandler for SmgpHandler {
     fn name(&self) -> &'static str {
@@ -47,16 +67,7 @@ impl crate::protocol::ProtocolHandler for SmgpHandler {
                 } else {
                     0
                 };
-                let resp = LoginResp {
-                    status: 0x0000000A,
-                    authenticator: [0u8; 16],
-                    version: 0x30,
-                };
-                let mut body = BytesMut::new();
-                resp.encode(&mut body).unwrap();
-                let mut pdu = encode_pdu_header(CommandId::LoginResp, seq_id, body.len());
-                pdu.extend_from_slice(&body);
-                let _ = conn.write_frame(&pdu).await;
+                let _ = send_login_resp(&conn, seq_id, 0x30, 0x0000000A).await;
                 return Ok(HandleResult::Stop);
             }
         };
@@ -83,49 +94,18 @@ impl crate::protocol::ProtocolHandler for SmgpHandler {
                     Ok(result) if result.status == 0 => {
                         tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "SMGP认证成功: account={}", result.account);
                         conn.set_authenticated_account(result.account.clone()).await;
-                        
-                        let resp = LoginResp {
-                            status: 0,
-                            authenticator: [0u8; 16],
-                            version: l.version,
-                        };
-                        let mut body = BytesMut::new();
-                        resp.encode(&mut body).unwrap();
-                        
-                        let mut pdu = encode_pdu_header(CommandId::LoginResp, sequence_id, body.len());
-                        pdu.extend_from_slice(&body);
-                        conn.write_frame(&pdu).await?;
+                        send_login_resp(&conn, sequence_id, l.version, 0).await?;
                         tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "发送SMGP登录响应: status=0");
                         return Ok(HandleResult::Continue);
                     }
                     Ok(result) => {
                         tracing::warn!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "SMGP认证失败: status={}", result.status);
-                        let resp = LoginResp {
-                            status: result.status,
-                            authenticator: [0u8; 16],
-                            version: l.version,
-                        };
-                        let mut body = BytesMut::new();
-                        resp.encode(&mut body).unwrap();
-                        
-                        let mut pdu = encode_pdu_header(CommandId::LoginResp, sequence_id, body.len());
-                        pdu.extend_from_slice(&body);
-                        conn.write_frame(&pdu).await?;
+                        send_login_resp(&conn, sequence_id, l.version, result.status).await?;
                         return Ok(HandleResult::Stop);
                     }
                     Err(e) => {
                         tracing::error!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "SMGP认证错误: {}", e);
-                        let resp = LoginResp {
-                            status: 1,
-                            authenticator: [0u8; 16],
-                            version: l.version,
-                        };
-                        let mut body = BytesMut::new();
-                        resp.encode(&mut body).unwrap();
-                        
-                        let mut pdu = encode_pdu_header(CommandId::LoginResp, sequence_id, body.len());
-                        pdu.extend_from_slice(&body);
-                        conn.write_frame(&pdu).await?;
+                        send_login_resp(&conn, sequence_id, l.version, 1).await?;
                         return Ok(HandleResult::Stop);
                     }
                 }
@@ -141,7 +121,8 @@ impl crate::protocol::ProtocolHandler for SmgpHandler {
                 
                 let resp = ActiveTestResp { reserved: 0 };
                 let mut body = BytesMut::new();
-                resp.encode(&mut body).unwrap();
+                resp.encode(&mut body)
+                    .map_err(|e| rsms_core::RsmsError::Codec(e.to_string()))?;
                 
                 let mut pdu = encode_pdu_header(CommandId::ActiveTestResp, sequence_id, body.len());
                 pdu.extend_from_slice(&body);
@@ -160,7 +141,8 @@ impl crate::protocol::ProtocolHandler for SmgpHandler {
                 
                 let resp = rsms_codec_smgp::ExitResp { reserved: 0 };
                 let mut body = BytesMut::new();
-                resp.encode(&mut body).unwrap();
+                resp.encode(&mut body)
+                    .map_err(|e| rsms_core::RsmsError::Codec(e.to_string()))?;
                 
                 let mut pdu = encode_pdu_header(CommandId::ExitResp, sequence_id, body.len());
                 pdu.extend_from_slice(&body);

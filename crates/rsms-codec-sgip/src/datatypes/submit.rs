@@ -143,6 +143,16 @@ impl Encodable for Submit {
         buf.put_u8(self.tpudhi);
         buf.put_u8(self.msg_fmt);
         buf.put_u8(self.message_type);
+        if self.message_content.len() > u32::MAX as usize {
+            return Err(CodecError::FieldValidation {
+                field: "message_content",
+                reason: format!(
+                    "正文长度 {} 超过 MessageLength(u32) 上限 {}",
+                    self.message_content.len(),
+                    u32::MAX
+                ),
+            });
+        }
         buf.put_u32(self.message_content.len() as u32);
         buf.put_slice(&self.message_content);
         buf.put_slice(&self.reserve);
@@ -183,7 +193,7 @@ impl Decodable for Submit {
 
         let sp_number = decode_pstring(buf, 21).map_err(|_| CodecError::Incomplete)?;
         let charge_number = decode_pstring(buf, 21).map_err(|_| CodecError::Incomplete)?;
-        let user_count = buf.get_u8();
+        let user_count = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
 
         let mut user_numbers = Vec::with_capacity(user_count as usize);
         for _ in 0..user_count {
@@ -193,24 +203,32 @@ impl Decodable for Submit {
 
         let corp_id = decode_pstring(buf, 5).map_err(|_| CodecError::Incomplete)?;
         let service_type = decode_pstring(buf, 10).map_err(|_| CodecError::Incomplete)?;
-        let fee_type = buf.get_u8();
+        let fee_type = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let fee_value = decode_pstring(buf, 6).map_err(|_| CodecError::Incomplete)?;
         let given_value = decode_pstring(buf, 6).map_err(|_| CodecError::Incomplete)?;
-        let agent_flag = buf.get_u8();
-        let morelate_to_mt_flag = buf.get_u8();
-        let priority = buf.get_u8();
+        let agent_flag = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let morelate_to_mt_flag = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let priority = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let expire_time = decode_pstring(buf, 16).map_err(|_| CodecError::Incomplete)?;
         let schedule_time = decode_pstring(buf, 16).map_err(|_| CodecError::Incomplete)?;
-        let report_flag = buf.get_u8();
-        let tppid = buf.get_u8();
-        let tpudhi = buf.get_u8();
-        let msg_fmt = buf.get_u8();
-        let message_type = buf.get_u8();
-        let message_length = buf.get_u32() as usize;
+        let report_flag = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let tppid = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let tpudhi = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let msg_fmt = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let message_type = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let message_length = buf.try_get_u32().map_err(|_| CodecError::Incomplete)? as usize;
+        if buf.remaining() < message_length {
+            return Err(CodecError::Incomplete);
+        }
         let mut message_content = vec![0u8; message_length];
-        buf.copy_to_slice(&mut message_content);
+        buf.try_copy_to_slice(&mut message_content)
+            .map_err(|_| CodecError::Incomplete)?;
+        if buf.remaining() < 8 {
+            return Err(CodecError::Incomplete);
+        }
         let mut reserve = [0u8; 8];
-        buf.copy_to_slice(&mut reserve);
+        buf.try_copy_to_slice(&mut reserve)
+            .map_err(|_| CodecError::Incomplete)?;
 
         Ok(Submit {
             sp_number,
@@ -268,7 +286,7 @@ impl Decodable for SubmitResp {
         if buf.remaining() < Self::BODY_SIZE {
             return Err(CodecError::Incomplete);
         }
-        let result = buf.get_u32();
+        let result = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
         Ok(SubmitResp { result })
     }
 
@@ -334,5 +352,31 @@ mod tests {
         assert_eq!(decoded.service_type, "SMS");
         assert_eq!(decoded.fee_value, "000100");
         assert_eq!(decoded.user_numbers, vec!["13800138000"]);
+    }
+
+    #[test]
+    fn encode_oversized_msg_content_ok_u32_field() {
+        // 4A.6：MessageLength 是 u32，256 字节正文远在上限内，encode 应正常 Ok
+        // （不误伤回归；u32 域容得下，无需像 u8 协议那样报错）。
+        let submit = Submit::new().with_message("10655000000", "13800138000", &vec![0x41u8; 256]);
+        let mut buf = BytesMut::new();
+        assert!(submit.encode(&mut buf).is_ok());
+    }
+
+    #[test]
+    fn submit_decode_oversized_message_length_is_err_not_panic() {
+        // 回归（P0.2）：message_length 是 u32，谎报超大值（如 u32::MAX）时既不能
+        // 预分配 ~4GB，也不能在 copy_to_slice 处 panic —— 必须返回 Err。
+        // total_length 不变 ⇒ body_len 守卫通过，命中长度校验。
+        let marker = b"SGIP_RSMS_MARKER";
+        let submit = Submit::new().with_message("10655000000", "13800138000", marker);
+        let mut bytes = submit.to_pdu_bytes(1, 0x04051200, 10).to_vec();
+        let pos = bytes
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .expect("marker present");
+        // message_length 是内容前的大端 u32
+        bytes[pos - 4..pos].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(decode_pdu::<Submit>(&bytes).is_err());
     }
 }

@@ -1,11 +1,11 @@
 use async_trait::async_trait;
 use rsms_connector::{
-    serve, connect, SmgpDecoder,
+    ServerBuilder, ClientBuilder, SmgpDecoder,
     AuthCredentials, AuthHandler, AuthResult,
     AccountConfigProvider,
 };
 use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler};
-use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Frame, Result};
+use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Protocol, Frame, Result};
 use rsms_codec_smgp::{
     decode_message, SmgpMessage, Pdu,
     CommandId, Login, SmgpMsgId, Submit, SubmitResp, Deliver, DeliverResp,
@@ -337,19 +337,15 @@ async fn start_test_server(
         0,
         500,
         60,
-    ).with_protocol("smgp").with_log_level(tracing::Level::WARN));
+    ).with_protocol(Protocol::Smgp).with_log_level(tracing::Level::WARN));
     let auth = Arc::new(PasswordAuthHandler::new().add_account(STRESS_TEST_CLIENT_ID, STRESS_TEST_PASSWORD));
-    let server = serve(
-        cfg,
-        vec![biz_handler],
-        Some(auth),
-        None,
-        Some(Arc::new(MockAccountConfigProvider::with_limits(5000, 2048)) as Arc<dyn AccountConfigProvider>),
-        None,
-        None,
-    )
-    .await
-    .expect("bind");
+    let server = ServerBuilder::new(cfg)
+        .handlers(vec![biz_handler])
+        .auth_handler(auth)
+        .account_config_provider(Arc::new(MockAccountConfigProvider::with_limits(5000, 2048)) as Arc<dyn AccountConfigProvider>)
+        .serve()
+        .await
+        .expect("bind");
     let port = server.local_addr.port();
     let account_pool = server.account_pool();
     let handle = tokio::spawn(async move {
@@ -570,15 +566,10 @@ async fn run_stress_test(num_connections: usize) {
 
         let mut conn = None;
         for retry in 0..50 {
-            match connect(
-                endpoint.clone(),
-                client_state.clone(),
-                SmgpDecoder,
-                Some(ClientConfig::new()),
-                None,
-                None,
-            )
-            .await
+            match ClientBuilder::new(endpoint.clone(), client_state.clone(), SmgpDecoder)
+                .client_config(ClientConfig::new())
+                .connect()
+                .await
             {
                 Ok(c) => {
                     conn = Some(c);

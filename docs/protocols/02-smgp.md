@@ -142,16 +142,14 @@ Exit 包有 1 字节 `reserve` body（总长 21 字节，比其他协议多 1 �
 参考：`examples/smgp-endpoint/src/server.rs`
 
 ```rust
+use rsms_core::Protocol;
 let config = Arc::new(EndpointConfig::new("smgp-gateway", "0.0.0.0", 7892, 500, 60)
-    .with_protocol("smgp"));
+    .with_protocol(Protocol::Smgp));
 
-let server = serve(
-    config,
-    vec![Arc::new(MyBizHandler)],
-    Some(Arc::new(SmgpAuth::new())),
-    None,
-    None, None, None,
-).await?;
+let server = ServerBuilder::new(config)
+    .handler(Arc::new(MyBizHandler))
+    .auth_handler(Arc::new(SmgpAuth::new()))
+    .serve().await?;
 ```
 
 ## 客户端完整示例
@@ -160,15 +158,11 @@ let server = serve(
 
 ```rust
 let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 500, 60)
-    .with_protocol("smgp"));
+    .with_protocol(Protocol::Smgp));
 
-let conn = connect(
-    endpoint,
-    Arc::new(MyClientHandler),
-    SmgpDecoder,
-    Some(ClientConfig::default()),
-    None, None,
-).await?;
+let conn = ClientBuilder::new(endpoint, Arc::new(MyClientHandler), SmgpDecoder)
+    .client_config(ClientConfig::default())
+    .connect().await?;
 
 // 发送 Login
 let login_pdu = build_login_pdu("106900", "password");

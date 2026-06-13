@@ -11,7 +11,6 @@ members = [
     "crates/rsms-codec-smpp",
     "crates/rsms-longmsg",
     "crates/rsms-ratelimit",
-    "crates/rsms-pipeline",
     "crates/rsms-window",
     "tests/common",
     "tests",

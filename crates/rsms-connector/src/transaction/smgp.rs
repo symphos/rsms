@@ -24,17 +24,16 @@ impl SmgpSubmit {
             u64::from_be_bytes([
                 self.inner
                     .src_term_id
-                    .as_bytes()
-                    .get(0)
+                    .as_bytes().first()
                     .copied()
-                    .unwrap_or(b'0') as u8,
+                    .unwrap_or(b'0'),
                 self.inner
                     .dest_term_ids
                     .first()
-                    .and_then(|s| s.as_bytes().get(0))
+                    .and_then(|s| s.as_bytes().first())
                     .copied()
-                    .unwrap_or(b'0') as u8,
-                self.inner.msg_content.first().copied().unwrap_or(b'0') as u8,
+                    .unwrap_or(b'0'),
+                self.inner.msg_content.first().copied().unwrap_or(b'0'),
                 self.inner.msg_content.len().min(5) as u8,
                 0,
                 0,

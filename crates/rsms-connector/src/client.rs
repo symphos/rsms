@@ -10,7 +10,7 @@ use rsms_codec_cmpp::CommandId as CmppCommandId;
 use rsms_codec_sgip::CommandId as SgipCommandId;
 use rsms_codec_smgp::CommandId as SmgpCommandId;
 use rsms_codec_smpp::CommandId as SmppCommandId;
-use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Frame, Result, RsmsError, SessionState};
+use rsms_core::{ConnectionInfo, Protocol, RawPdu, EndpointConfig, Frame, Result, RsmsError, SessionState};
 use rsms_session::ConnectionContext;
 use rsms_window::{Window, WindowConfig};
 use std::collections::{HashMap, VecDeque};
@@ -124,18 +124,25 @@ fn extract_smpp_header(data: &[u8]) -> (u32, u32) {
 
 fn decode_frames(buf: &mut Vec<u8>, min_len: usize, extract_header: fn(&[u8]) -> (u32, u32)) -> Result<Vec<Frame>> {
     let mut out = Vec::new();
-    while buf.len() >= 4 {
-        let total = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    // 用读游标 off 解析，结束后一次性 drain，避免每帧 drain 的 O(N·buflen) 搬移。
+    let mut off = 0usize;
+    while buf.len() - off >= 4 {
+        let total =
+            u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
         if total < min_len || total > 100_000 {
-            buf.drain(..1);
+            off += 1;
             continue;
         }
-        if total > buf.len() {
+        if total > buf.len() - off {
             break;
         }
-        let frame_data: Vec<u8> = buf.drain(..total).collect();
+        let frame_data = buf[off..off + total].to_vec();
+        off += total;
         let (command_id, sequence_id) = extract_header(&frame_data);
         out.push(Frame::new(command_id, sequence_id, RawPdu::from_vec(frame_data)));
+    }
+    if off > 0 {
+        buf.drain(..off);
     }
     Ok(out)
 }
@@ -308,6 +315,24 @@ impl ClientConnection {
         Ok(())
     }
 
+    /// 批量写入多帧，仅在末尾 flush 一次，减少每帧 flush 的 syscall 开销。
+    /// 帧按入参顺序写出（长短信分组在调用方保持连续即同序）。
+    pub async fn write_frames(&self, frames: &[&[u8]]) -> Result<()> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut w = self.write.lock().await;
+            for f in frames {
+                w.write_all(f).await?;
+            }
+            w.flush().await?;
+        }
+        self.touch();
+        self.touch_sent();
+        Ok(())
+    }
+
     pub async fn mark_connected(&self) {
         let g = self.ctx.lock().await;
         let _ = g.mark_connected();
@@ -320,6 +345,14 @@ impl ClientConnection {
         g.mark_disconnected();
         if let Some(tx) = self.event_tx.lock().await.take() {
             let _ = tx.send(ConnectionEvent::disconnected(self.id)).await;
+        }
+        // 连接断开：立即让所有在途 send_request 失败，而非各自挂到 endpoint.timeout。
+        // 否则断开-重连场景下大量在途请求全部卡满超时窗口，造成延迟尖峰。
+        let mut pending = self.pending_responses.lock().await;
+        for (_, tx) in pending.drain() {
+            let _ = tx.send(Err(RsmsError::ConnectionClosed(
+                "connection closed while awaiting response".to_string(),
+            )));
         }
     }
     
@@ -363,10 +396,7 @@ impl ClientConnection {
         
         let window = self.window.as_ref().ok_or_else(|| RsmsError::Codec("Window not initialized".to_string()))?;
         
-        let seq_offset = match self.endpoint.protocol.as_str() {
-            "smpp" | "sgip" => 12,
-            _ => 8,
-        };
+        let seq_offset = self.endpoint.protocol.seq_offset();
         let sequence_id = if pdu_slice.len() >= seq_offset + 4 {
             u32::from_be_bytes([pdu_slice[seq_offset], pdu_slice[seq_offset + 1], pdu_slice[seq_offset + 2], pdu_slice[seq_offset + 3]])
         } else {
@@ -375,8 +405,8 @@ impl ClientConnection {
         
         let (tx, rx) = oneshot::channel();
         
-        let pdu_vec = pdu_slice.to_vec();
-        let _future = match window.offer(sequence_id, pdu_vec, self.endpoint.timeout).await {
+        // 窗口仅用 sequence_id 做请求/响应匹配，不读取 payload，传空 Vec 避免每条消息整包拷贝
+        let _future = match window.offer(sequence_id, Vec::new(), self.endpoint.timeout).await {
             Ok(f) => {
                 tracing::trace!(conn_id = self.id, remote_ip = %self.remote_ip(), remote_port = self.remote_port(), "window.offer success, seq_id={}", sequence_id);
                 f
@@ -459,7 +489,7 @@ impl ProtocolConnection for ClientConnection {
     }
 
     fn should_log(&self, level: tracing::Level) -> bool {
-        self.endpoint.log_level.map_or(true, |max| level >= max)
+        self.endpoint.log_level.is_none_or(|max| level >= max)
     }
 }
 
@@ -475,16 +505,65 @@ pub trait ClientHandler: Send + Sync {
     async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()>;
 }
 
-/// 连接到服务器并启动读循环。
-pub async fn connect<D: FrameDecoder + Send + Sync + 'static>(
+/// 客户端构建器：链式配置后调用 [`ClientBuilder::connect`] 建连并启动读循环。
+///
+/// ```ignore
+/// let conn = ClientBuilder::new(endpoint, Arc::new(MyClient), CmppDecoder)
+///     .message_source(source)
+///     .connect()
+///     .await?;
+/// ```
+pub struct ClientBuilder<D: FrameDecoder + Send + Sync + 'static> {
     endpoint: Arc<EndpointConfig>,
     client_handler: Arc<dyn ClientHandler>,
     decoder: D,
     client_config: Option<ClientConfig>,
     message_source: Option<Arc<dyn MessageSource>>,
     event_handler: Option<Arc<dyn ClientEventHandler>>,
-) -> Result<Arc<ClientConnection>> {
-    let config = client_config.unwrap_or_default();
+}
+
+impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
+    pub fn new(
+        endpoint: Arc<EndpointConfig>,
+        client_handler: Arc<dyn ClientHandler>,
+        decoder: D,
+    ) -> Self {
+        Self {
+            endpoint,
+            client_handler,
+            decoder,
+            client_config: None,
+            message_source: None,
+            event_handler: None,
+        }
+    }
+
+    pub fn client_config(mut self, config: ClientConfig) -> Self {
+        self.client_config = Some(config);
+        self
+    }
+
+    pub fn message_source(mut self, message_source: Arc<dyn MessageSource>) -> Self {
+        self.message_source = Some(message_source);
+        self
+    }
+
+    pub fn event_handler(mut self, event_handler: Arc<dyn ClientEventHandler>) -> Self {
+        self.event_handler = Some(event_handler);
+        self
+    }
+
+    /// 连接到服务器并启动读循环。
+    pub async fn connect(self) -> Result<Arc<ClientConnection>> {
+        let ClientBuilder {
+            endpoint,
+            client_handler,
+            decoder,
+            client_config,
+            message_source,
+            event_handler,
+        } = self;
+        let config = client_config.unwrap_or_default();
     let addr = format!("{}:{}", endpoint.host, endpoint.port);
     info!(%addr, "connecting to server");
     let stream = TcpStream::connect(&addr).await.map_err(RsmsError::Io)?;
@@ -509,7 +588,7 @@ pub async fn connect<D: FrameDecoder + Send + Sync + 'static>(
     });
 
     // 启动 keepalive 任务
-    let protocol = endpoint.protocol.clone();
+    let protocol = endpoint.protocol;
     let idle_timeout = endpoint.idle_time_sec as u32;
     start_keepalive_task(Arc::clone(&conn), protocol, idle_timeout);
 
@@ -524,20 +603,20 @@ pub async fn connect<D: FrameDecoder + Send + Sync + 'static>(
     }
 
     Ok(conn)
-}
-
-fn create_decoder(protocol: &str) -> Box<dyn FrameDecoder + Send + Sync> {
-    match protocol {
-        "cmpp" => Box::new(CmppDecoder),
-        "sgip" => Box::new(SgipDecoder),
-        "smgp" => Box::new(SmgpDecoder),
-        "smpp" => Box::new(SmppDecoder),
-        _ => Box::new(CmppDecoder),
     }
 }
 
-/// 连接函数，由 ClientPool 调用，连接的生命周期由 Pool 管理
-pub async fn connect_with_pool(
+fn create_decoder(protocol: Protocol) -> Box<dyn FrameDecoder + Send + Sync> {
+    match protocol {
+        Protocol::Cmpp => Box::new(CmppDecoder),
+        Protocol::Sgip => Box::new(SgipDecoder),
+        Protocol::Smgp => Box::new(SmgpDecoder),
+        Protocol::Smpp => Box::new(SmppDecoder),
+    }
+}
+
+/// 连接函数，由 ClientPool 调用，连接的生命周期由 Pool 管理（内部 API）
+pub(crate) async fn connect_with_pool(
     stream: TcpStream,
     endpoint: Arc<EndpointConfig>,
     client_handler: Arc<dyn ClientHandler>,
@@ -546,7 +625,7 @@ pub async fn connect_with_pool(
     event_handler: Option<Arc<dyn ClientEventHandler>>,
     event_tx: mpsc::Sender<ConnectionEvent>,
 ) -> Result<Arc<ClientConnection>> {
-    let decoder: Arc<tokio::sync::Mutex<Box<dyn FrameDecoder>>> = Arc::new(tokio::sync::Mutex::new(create_decoder(&endpoint.protocol)));
+    let decoder: Arc<tokio::sync::Mutex<Box<dyn FrameDecoder>>> = Arc::new(tokio::sync::Mutex::new(create_decoder(endpoint.protocol)));
     let decoder_for_conn = Arc::clone(&decoder);
     let config = client_config.unwrap_or_default();
     let conn = ClientConnection::new(stream, endpoint.clone(), config, decoder_for_conn).await;
@@ -569,7 +648,7 @@ pub async fn connect_with_pool(
     });
 
     // 启动 keepalive 任务
-    let protocol = endpoint.protocol.clone();
+    let protocol = endpoint.protocol;
     let idle_timeout = endpoint.idle_time_sec as u32;
     start_keepalive_task(Arc::clone(&conn), protocol, idle_timeout);
 
@@ -645,12 +724,12 @@ async fn run_client_read_loop(
                 && window.contains(&frame.sequence_id).await
             {
                 let response = frame.data.to_vec();
-                let response_for_caller = response.clone();
-                let _ = window.complete(&frame.sequence_id, response).await;
-                
+                // window.complete 不读取响应体，传空 Vec 避免一次整包 clone
+                let _ = window.complete(&frame.sequence_id, Vec::new()).await;
+
                 let mut pending = conn.pending_responses.lock().await;
                 if let Some(tx) = pending.remove(&frame.sequence_id) {
-                    let _ = tx.send(Ok(response_for_caller));
+                    let _ = tx.send(Ok(response));
                     tracing::debug!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), seq_id = frame.sequence_id, "response sent to caller via ResponseFuture");
                 }
                 
@@ -658,17 +737,13 @@ async fn run_client_read_loop(
                 tokio::spawn(async move {
                     while let Some(pending_pdu) = conn_clone.pop_pending().await {
                         let pdu_slice = pending_pdu.as_bytes_ref();
-                        let seq_off = match conn_clone.endpoint.protocol.as_str() {
-                            "smpp" | "sgip" => 12,
-                            _ => 8,
-                        };
+                        let seq_off = conn_clone.endpoint.protocol.seq_offset();
                         if pdu_slice.len() >= seq_off + 4 {
                             let seq_id = u32::from_be_bytes([pdu_slice[seq_off], pdu_slice[seq_off + 1], pdu_slice[seq_off + 2], pdu_slice[seq_off + 3]]);
-                            if let Some(window) = conn_clone.window.as_ref() {
-                                if window.contains(&seq_id).await {
+                            if let Some(window) = conn_clone.window.as_ref()
+                                && window.contains(&seq_id).await {
                                     continue;
                                 }
-                            }
                         }
                         match conn_clone.send_request(pending_pdu).await {
                             Ok(_) => {}
@@ -686,7 +761,7 @@ async fn run_client_read_loop(
                 conn: &conn,
             };
 
-            if conn.endpoint.log_level.map_or(true, |max| tracing::Level::INFO <= max) {
+            if conn.endpoint.log_level.is_none_or(|max| tracing::Level::INFO <= max) {
                 tracing::info!(
                     conn_id = conn.id,
                     remote_ip = %conn.remote_ip(),
@@ -745,29 +820,30 @@ async fn run_outbound_fetcher(
             }
         };
 
+        if !conn.ready_for_fetch() {
+            break;
+        }
+        // 将一次 fetch 的所有 PDU（含长短信分组，按序）合并为一批，单次 flush 写出。
+        let mut pdus = Vec::new();
         for item in items {
-            if !conn.ready_for_fetch() {
-                break;
+            match item {
+                MessageItem::Single(pdu) => pdus.push(pdu),
+                MessageItem::Group { items } => pdus.extend(items),
             }
-            let pdus = match item {
-                MessageItem::Single(pdu) => vec![pdu],
-                MessageItem::Group { items } => items,
-            };
-            for pdu in pdus {
-                match conn.write_frame(pdu.as_bytes()).await {
-                    Ok(_) => {
-                        if conn.endpoint.log_level.map_or(true, |max| tracing::Level::TRACE <= max) {
-                            tracing::trace!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "send success");
-                        }
-                    }
-                    Err(e) => {
-                        if conn.endpoint.log_level.map_or(true, |max| tracing::Level::DEBUG <= max) {
-                            tracing::debug!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "send failed: {}", e);
-                        }
-                        tokio::time::sleep(Duration::from_millis(1)).await;
-                        break;
-                    }
+        }
+        let slices: Vec<&[u8]> = pdus.iter().map(|p| p.as_bytes()).collect();
+        match conn.write_frames(&slices).await {
+            Ok(_) => {
+                if conn.endpoint.log_level.is_none_or(|max| tracing::Level::TRACE <= max) {
+                    tracing::trace!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), batch = slices.len(), "send batch success");
                 }
+            }
+            Err(e) => {
+                // 批量写失败可能在线上留下半个 PDU（流错位），且本批剩余 PDU 已无法重发。
+                // 标记连接断开并退出 fetcher——绝不复用一条可能错位的流（由上层重连）。
+                error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "send batch failed, closing connection: {}", e);
+                conn.mark_disconnected().await;
+                break;
             }
         }
     }
@@ -776,7 +852,7 @@ async fn run_outbound_fetcher(
 }
 
 /// 启动客户端 keepalive 任务
-fn start_keepalive_task(conn: Arc<ClientConnection>, protocol: String, idle_timeout: u32) {
+fn start_keepalive_task(conn: Arc<ClientConnection>, protocol: Protocol, idle_timeout: u32) {
     let keepalive_interval = Duration::from_secs(idle_timeout as u64 / 2);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(keepalive_interval);
@@ -790,7 +866,7 @@ fn start_keepalive_task(conn: Arc<ClientConnection>, protocol: String, idle_time
             
             let elapsed = conn.last_sent_elapsed();
             if elapsed >= keepalive_interval {
-                if let Err(e) = send_keepalive_packet(&conn, &protocol).await {
+                if let Err(e) = send_keepalive_packet(&conn, protocol).await {
                     error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), protocol = %protocol, "keepalive failed: {}", e);
                 } else {
                     tracing::debug!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), protocol = %protocol, "keepalive sent");
@@ -803,13 +879,12 @@ fn start_keepalive_task(conn: Arc<ClientConnection>, protocol: String, idle_time
 }
 
 /// 发送保活报文
-async fn send_keepalive_packet(conn: &Arc<ClientConnection>, protocol: &str) -> Result<()> {
+async fn send_keepalive_packet(conn: &Arc<ClientConnection>, protocol: Protocol) -> Result<()> {
     let pdu = match protocol {
-        "sgip" => build_sgip_keepalive_pdu(),
-        "smgp" => build_smgp_active_test_pdu(),
-        "smpp" => build_smpp_enquire_link_pdu(),
-        "cmpp" => build_cmpp_active_test_pdu(),
-        _ => return Err(RsmsError::Other(format!("unsupported protocol: {}", protocol))),
+        Protocol::Sgip => build_sgip_keepalive_pdu(),
+        Protocol::Smgp => build_smgp_active_test_pdu(),
+        Protocol::Smpp => build_smpp_enquire_link_pdu(),
+        Protocol::Cmpp => build_cmpp_active_test_pdu(),
     };
     
     conn.write_frame(&pdu).await?;

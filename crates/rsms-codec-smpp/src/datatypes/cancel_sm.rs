@@ -59,11 +59,11 @@ impl Decodable for CancelSm {
         }
         let service_type = decode_cstring(buf, 6, "service_type")?;
         let message_id = decode_cstring(buf, 65, "message_id")?;
-        let source_addr_ton = buf.get_u8();
-        let source_addr_npi = buf.get_u8();
+        let source_addr_ton = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let source_addr_npi = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let source_addr = decode_cstring(buf, 21, "source_addr")?;
-        let dest_addr_ton = buf.get_u8();
-        let dest_addr_npi = buf.get_u8();
+        let dest_addr_ton = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let dest_addr_npi = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let destination_addr = decode_cstring(buf, 21, "destination_addr")?;
         Ok(Self {
             service_type,

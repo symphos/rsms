@@ -19,7 +19,7 @@ use rsms_codec_cmpp::{
     Pdu, Submit,
 };
 use rsms_connector::client::{ClientContext, ClientHandler};
-use rsms_connector::{connect, MessageItem, MessageSource, CmppDecoder};
+use rsms_connector::{ClientBuilder, MessageItem, MessageSource, CmppDecoder};
 use rsms_core::{EncodedPdu, EndpointConfig, Frame, Result};
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
@@ -364,15 +364,10 @@ async fn main() -> Result<()> {
 
     tracing::info!("正在连接 CMPP 服务端 {}...", SERVER_ADDR);
 
-    let conn = connect(
-        endpoint,
-        handler,
-        CmppDecoder,
-        None,
-        Some(msg_source as Arc<dyn MessageSource>),
-        None,
-    )
-    .await?;
+    let conn = ClientBuilder::new(endpoint, handler, CmppDecoder)
+        .message_source(msg_source as Arc<dyn MessageSource>)
+        .connect()
+        .await?;
 
     tracing::info!("TCP 连接已建立 (conn_id={})", conn.id);
 

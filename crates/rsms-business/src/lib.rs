@@ -3,15 +3,42 @@ use async_trait::async_trait;
 use rsms_core::{EndpointConfig, Frame, IdGenerator, Result};
 use std::sync::Arc;
 
+/// 入站消息的上下文，由框架在每次 `BusinessHandler::on_inbound` 调用前构造并传入。
 pub struct InboundContext {
+    /// 当前连接所属的端点配置（含协议、鉴权、日志级别等元数据）。
     pub endpoint: Arc<EndpointConfig>,
+    /// 当前协议连接句柄，可用于向对端写回响应帧（`write_frame`）。
     pub conn: Arc<dyn ProtocolConnection>,
+    /// 该账号的序列号/消息 ID 生成器。
+    ///
+    /// 服务端连接在账号完成鉴权后由框架注入；客户端连接始终有值。
+    /// 鉴权前收到的帧（如 Connect PDU 本身）此字段为 `None`，
+    /// 业务方使用前需先 `if let Some(gen) = &ctx.id_generator`。
     pub id_generator: Option<Arc<dyn IdGenerator>>,
 }
 
+/// 业务逻辑处理器，由用户实现并注册到服务端或客户端。
+///
+/// 框架在每收到一个完整入站帧后调用 `on_inbound`，并将上下文与原始帧同时传入。
+/// 实现需保证线程安全（`Send + Sync`），通常以 `Arc<MyHandler>` 挂载。
 #[async_trait]
 pub trait BusinessHandler: Send + Sync {
+    /// 返回该处理器的唯一名称，用于日志和调试追踪。
     fn name(&self) -> &'static str;
+
+    /// 处理一条入站帧。
+    ///
+    /// **框架核心契约**：框架不自动发送 `SubmitResp`/`SubmitSmResp`。
+    /// 业务方收到 Submit 类 PDU 后，**必须**自行通过 `ctx.conn.write_frame()` 写回响应帧，
+    /// 否则对端滑动窗口将被耗尽，导致吞吐假死（对端无法继续发送新消息）。
+    ///
+    /// # 参数
+    /// - `ctx`：当前连接的上下文，含端点配置、连接句柄和 ID 生成器。
+    /// - `frame`：收到的原始帧字节，含完整 PDU（包括协议头）。
+    ///
+    /// # 返回
+    /// 返回 `Ok(())` 表示处理成功，框架继续下一个处理器；
+    /// 返回 `Err` 时框架中断处理链并记录错误（连接不会被强制断开）。
     async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()>;
 }
 

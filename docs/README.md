@@ -49,7 +49,7 @@ Rust 实现的多协议短信网关框架，支持 **CMPP 2.0/3.0**、**SMGP 3.0
 | Crate | 说明 |
 |-------|------|
 | `rsms-core` | 核心类型：`Frame`、`RawPdu`、`EncodedPdu` trait、`EndpointConfig` |
-| `rsms-connector` | 连接管理：服务端 `serve()`、客户端 `connect()`、`AccountPool`、`MessageSource` |
+| `rsms-connector` | 连接管理：服务端 `ServerBuilder`、客户端 `ClientBuilder`、`AccountPool`、`MessageSource` |
 | `rsms-business` | 业务处理器：`BusinessHandler` trait、`run_chain()` |
 | `rsms-codec-cmpp` | CMPP 2.0/3.0 协议编解码 |
 | `rsms-codec-smgp` | SMGP 3.0.3 协议编解码 |

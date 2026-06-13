@@ -6,11 +6,11 @@ use rsms_codec_smgp::{
     datatypes::tlv::{Tlv, tlv_tags},
 };
 use rsms_connector::{
-    connect, serve, AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler,
+    ClientBuilder, ServerBuilder, AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler,
     AuthResult, SmgpDecoder,
 };
 use rsms_connector::client::{ClientConfig, ClientConnection, ClientContext, ClientHandler};
-use rsms_core::{ConnectionInfo, Frame, RawPdu, EndpointConfig, Result};
+use rsms_core::{ConnectionInfo, Frame, RawPdu, EndpointConfig, Protocol, Result};
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
 use rsms_longmsg::split::SmsAlphabet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -208,18 +208,14 @@ impl ClientHandler for LongMsgClientHandler {
 async fn start_server(
     biz_handler: Arc<dyn BusinessHandler>,
 ) -> Result<(u16, Arc<rsms_connector::ConnectionPool>, tokio::task::JoinHandle<()>)> {
-    let cfg = Arc::new(EndpointConfig::new("test-server", "127.0.0.1", 0, 8, 30).with_protocol("smgp"));
-    let server = serve(
-        cfg,
-        vec![biz_handler],
-        Some(Arc::new(PasswordAuthHandler)),
-        None,
-        Some(Arc::new(MockAccountConfigProvider) as Arc<dyn AccountConfigProvider>),
-        None,
-        None,
-    )
-    .await
-    .expect("bind");
+    let cfg = Arc::new(EndpointConfig::new("test-server", "127.0.0.1", 0, 8, 30).with_protocol(Protocol::Smgp));
+    let server = ServerBuilder::new(cfg)
+        .handlers(vec![biz_handler])
+        .auth_handler(Arc::new(PasswordAuthHandler))
+        .account_config_provider(Arc::new(MockAccountConfigProvider) as Arc<dyn AccountConfigProvider>)
+        .serve()
+        .await
+        .expect("bind");
     let port = server.local_addr.port();
     let pool = server.pool();
     let handle = tokio::spawn(async move { let _ = server.run().await; });
@@ -230,15 +226,10 @@ async fn start_server(
 async fn connect_client(port: u16) -> Result<(Arc<LongMsgClientHandler>, Arc<ClientConnection>)> {
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let handler = Arc::new(LongMsgClientHandler::new());
-    let conn = connect(
-        endpoint,
-        handler.clone(),
-        SmgpDecoder,
-        Some(ClientConfig::new()),
-        None,
-        None,
-    )
-    .await?;
+    let conn = ClientBuilder::new(endpoint, handler.clone(), SmgpDecoder)
+        .client_config(ClientConfig::new())
+        .connect()
+        .await?;
     let login_pdu = handler.build_login_pdu();
     conn.send_request(login_pdu).await?;
     tokio::time::sleep(Duration::from_millis(200)).await;

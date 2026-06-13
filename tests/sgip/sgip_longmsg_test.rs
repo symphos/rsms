@@ -6,10 +6,10 @@ use rsms_codec_sgip::{
 };
 use rsms_connector::client::{ClientConfig, ClientContext, ClientHandler};
 use rsms_connector::{
-    connect, serve, AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler, AuthResult,
+    ClientBuilder, ServerBuilder, AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler, AuthResult,
     SgipDecoder,
 };
-use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Frame, RawPdu, Result};
+use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Protocol, Frame, RawPdu, Result};
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
 use std::collections::HashMap;
@@ -267,19 +267,15 @@ async fn start_server(
 ) -> Result<(u16, Arc<rsms_connector::ConnectionPool>, tokio::task::JoinHandle<()>)> {
     let cfg = Arc::new(
         EndpointConfig::new("sgip-longmsg-server", "127.0.0.1", 0, 8, 30)
-            .with_protocol("sgip"),
+            .with_protocol(Protocol::Sgip),
     );
-    let server = serve(
-        cfg,
-        vec![biz_handler],
-        Some(Arc::new(PasswordAuthHandler::new().add_account(TEST_ACCOUNT, TEST_PASSWORD))),
-        None,
-        Some(Arc::new(MockAccountConfigProvider) as Arc<dyn AccountConfigProvider>),
-        None,
-        None,
-    )
-    .await
-    .expect("bind");
+    let server = ServerBuilder::new(cfg)
+        .handlers(vec![biz_handler])
+        .auth_handler(Arc::new(PasswordAuthHandler::new().add_account(TEST_ACCOUNT, TEST_PASSWORD)))
+        .account_config_provider(Arc::new(MockAccountConfigProvider) as Arc<dyn AccountConfigProvider>)
+        .serve()
+        .await
+        .expect("bind");
     let port = server.local_addr.port();
     let pool = server.pool();
     let pool_clone = pool.clone();
@@ -295,18 +291,13 @@ async fn connect_client(
 ) -> Result<(Arc<LongMsgClientHandler>, Arc<rsms_connector::client::ClientConnection>)> {
     let endpoint = Arc::new(
         EndpointConfig::new("sgip-longmsg-client", "127.0.0.1", port, 8, 30)
-            .with_protocol("sgip"),
+            .with_protocol(Protocol::Sgip),
     );
     let handler = Arc::new(LongMsgClientHandler::new());
-    let conn = connect(
-        endpoint,
-        handler.clone(),
-        SgipDecoder,
-        Some(ClientConfig::new()),
-        None,
-        None,
-    )
-    .await?;
+    let conn = ClientBuilder::new(endpoint, handler.clone(), SgipDecoder)
+        .client_config(ClientConfig::new())
+        .connect()
+        .await?;
     let bind_pdu = handler.build_bind_pdu();
     conn.write_frame(bind_pdu.as_bytes()).await?;
     for _ in 0..20 {

@@ -138,10 +138,18 @@ impl CmppMessage {
     }
 }
 
+/// 解码一条 CMPP PDU 字节序列为 `CmppMessage`，版本默认为 V3.0。
+///
+/// 等价于 `decode_message_with_version(pdu, None)`。
 pub fn decode_message(pdu: &[u8]) -> Result<CmppMessage, RsmsError> {
     decode_message_with_version(pdu, None)
 }
 
+/// 解码一条 CMPP PDU 字节序列为 `CmppMessage`，并指定协议版本。
+///
+/// `version` 为协议版本字节（如 `0x20` = V2.0，`0x30` = V3.0）；
+/// 传入 `None` 或无法识别的值时默认按 V3.0 解码。
+/// Submit 和 Deliver 的 V2.0/V3.0 结构不同，版本错误会导致解码失败或字段偏移错误。
 pub fn decode_message_with_version(
     pdu: &[u8],
     version: Option<u8>,
@@ -239,6 +247,9 @@ pub fn decode_message_with_version(
     Ok(msg)
 }
 
+/// 将 `CmppMessage` 编码为完整的 PDU 字节序列（含协议头）。
+///
+/// `Unknown` 变体会将原始 body 原样写回，不做任何校验。
 pub fn encode_message(msg: &CmppMessage) -> Result<Vec<u8>, RsmsError> {
     let seq = msg.sequence_id();
     let pdu = match msg {
@@ -440,6 +451,45 @@ mod tests {
                     assert_eq!(s.dest_usr_tl, 1);
                 }
                 _ => panic!("expected SubmitV20 message for version {:02x}", version),
+            }
+        }
+    }
+
+    /// Fuzz regression: a remote peer must not be able to crash the decode path
+    /// by sending a truncated/short PDU body. For every body-carrying command id
+    /// and every short body length, `decode_message_with_version` must return
+    /// (Ok or Err) without ever panicking.
+    #[test]
+    fn decode_message_short_body_never_panics() {
+        // Command ids that carry a body (requests + responses with payload).
+        let command_ids: [u32; 12] = [
+            0x00000001, // Connect
+            0x80000001, // ConnectResp
+            0x00000004, // Submit
+            0x80000004, // SubmitResp
+            0x00000005, // Deliver
+            0x80000005, // DeliverResp
+            0x00000006, // Query
+            0x80000006, // QueryResp
+            0x00000007, // Cancel
+            0x80000007, // CancelResp
+            // Submit/SubmitV20 share command id 0x04; exercised above. Include
+            // ActiveTestResp which also carries a 1-byte body.
+            0x80000008, // ActiveTestResp
+            0x00000002, // Terminate (no body, included for completeness)
+        ];
+
+        for &command_id in &command_ids {
+            for n in 0u32..48 {
+                let total_length = PduHeader::SIZE as u32 + n;
+                let mut pdu = vec![0u8; PduHeader::SIZE + n as usize];
+                pdu[0..4].copy_from_slice(&total_length.to_be_bytes());
+                pdu[4..8].copy_from_slice(&command_id.to_be_bytes());
+                // sequence_id (bytes 8..12) left as zero.
+
+                // Must not panic for either CMPP version.
+                let _ = decode_message_with_version(&pdu, Some(0x30));
+                let _ = decode_message_with_version(&pdu, Some(0x20));
             }
         }
     }

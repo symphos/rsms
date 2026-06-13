@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use rsms_connector::{
-    connect, AuthCredentials, AuthHandler, AuthResult,
+    ClientBuilder, AuthCredentials, AuthHandler, AuthResult,
     ClientEventHandler, ClientHandler, MessageSource, MessageItem, ProtocolConnection,
     ServerEventHandler, AccountConfig, AccountConfigProvider,
     CmppDecoder,
@@ -367,7 +367,7 @@ impl ClientHandler for TestClientHandler {
     }
 }
 
-use rsms_connector::serve;
+use rsms_connector::ServerBuilder;
 
 /// 启动测试服务器
 async fn start_test_server(
@@ -383,17 +383,14 @@ async fn start_test_server(
         8,
         idle_timeout_secs as u16,
     ));
-    let server = serve(
-        cfg,
-        vec![biz_handler],
-        Some(auth_handler),
-        None,
-        Some(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>),
-        Some(event_handler),
-        None,
-    )
-    .await
-    .expect("bind");
+    let server = ServerBuilder::new(cfg)
+        .handlers(vec![biz_handler])
+        .auth_handler(auth_handler)
+        .account_config_provider(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>)
+        .event_handler(event_handler)
+        .serve()
+        .await
+        .expect("bind");
     let port = server.local_addr.port();
     let handle = tokio::spawn(async move {
         let _ = server.run().await;
@@ -416,17 +413,14 @@ async fn start_test_server_with_pool(
         8,
         idle_timeout_secs as u16,
     ));
-    let server = serve(
-        cfg,
-        vec![biz_handler],
-        Some(auth_handler),
-        None,
-        Some(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>),
-        Some(event_handler),
-        None,
-    )
-    .await
-    .expect("bind");
+    let server = ServerBuilder::new(cfg)
+        .handlers(vec![biz_handler])
+        .auth_handler(auth_handler)
+        .account_config_provider(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>)
+        .event_handler(event_handler)
+        .serve()
+        .await
+        .expect("bind");
     let port = server.local_addr.port();
     let pool = server.pool();
     let pool_clone = pool.clone();
@@ -450,16 +444,11 @@ async fn test_connect_with_valid_password() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new());
-    let conn = connect(
-        endpoint,
-        client_handler.clone(),
-        CmppDecoder,
-        Some(ClientConfig::new()),
-        None,
-        None,
-    )
-    .await
-    .expect("connect");
+    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+        .client_config(ClientConfig::new())
+        .connect()
+        .await
+        .expect("connect");
 
     let connect_pdu = client_handler.build_connect_pdu("106900", "password123");
     conn.send_request(connect_pdu).await.expect("send connect");
@@ -486,16 +475,11 @@ async fn test_connect_with_invalid_password() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new());
-    let conn = connect(
-        endpoint,
-        client_handler.clone(),
-        CmppDecoder,
-        Some(ClientConfig::new()),
-        None,
-        None,
-    )
-    .await
-    .expect("connect");
+    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+        .client_config(ClientConfig::new())
+        .connect()
+        .await
+        .expect("connect");
 
     let connect_pdu = client_handler.build_connect_pdu("106900", "wrongpassword");
     conn.send_request(connect_pdu).await.expect("send connect");
@@ -523,16 +507,11 @@ async fn test_submit_and_response() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new());
-    let conn = connect(
-        endpoint,
-        client_handler.clone(),
-        CmppDecoder,
-        Some(ClientConfig::new()),
-        None,
-        None,
-    )
-    .await
-    .expect("connect");
+    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+        .client_config(ClientConfig::new())
+        .connect()
+        .await
+        .expect("connect");
 
     let connect_pdu = client_handler.build_connect_pdu("106900", "password123");
     conn.send_request(connect_pdu).await.expect("send connect");
@@ -565,16 +544,11 @@ async fn test_terminate() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new());
-    let conn = connect(
-        endpoint,
-        client_handler.clone(),
-        CmppDecoder,
-        Some(ClientConfig::new()),
-        None,
-        None,
-    )
-    .await
-    .expect("connect");
+    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+        .client_config(ClientConfig::new())
+        .connect()
+        .await
+        .expect("connect");
 
     let connect_pdu = client_handler.build_connect_pdu("106900", "password123");
     conn.send_request(connect_pdu).await.expect("send connect");
@@ -605,16 +579,12 @@ async fn test_no_heartbeat_disconnect() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new());
-    let conn = connect(
-        endpoint,
-        client_handler.clone(),
-        CmppDecoder,
-        Some(ClientConfig::new()),
-        None,
-        Some(client_evt.clone()),
-    )
-    .await
-    .expect("connect");
+    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+        .client_config(ClientConfig::new())
+        .event_handler(client_evt.clone())
+        .connect()
+        .await
+        .expect("connect");
 
     let connect_pdu = client_handler.build_connect_pdu("106900", "password123");
     conn.send_request(connect_pdu).await.expect("send connect");
@@ -641,16 +611,11 @@ async fn test_submit_without_auth_returns_error() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new());
-    let conn = connect(
-        endpoint,
-        client_handler.clone(),
-        CmppDecoder,
-        Some(ClientConfig::new()),
-        None,
-        None,
-    )
-    .await
-    .expect("connect");
+    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+        .client_config(ClientConfig::new())
+        .connect()
+        .await
+        .expect("connect");
 
     let connect_pdu = client_handler.build_connect_pdu("106900", "wrongpassword");
     conn.send_request(connect_pdu).await.expect("send connect");
@@ -728,16 +693,11 @@ async fn test_deliver_mo() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new());
-    let conn = connect(
-        endpoint,
-        client_handler.clone(),
-        CmppDecoder,
-        Some(ClientConfig::new()),
-        None,
-        None,
-    )
-    .await
-    .expect("connect");
+    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+        .client_config(ClientConfig::new())
+        .connect()
+        .await
+        .expect("connect");
 
     let connect_pdu = client_handler.build_connect_pdu("106900", "password123");
     conn.send_request(connect_pdu).await.expect("send connect");
@@ -775,16 +735,11 @@ async fn test_deliver_report() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new());
-    let conn = connect(
-        endpoint,
-        client_handler.clone(),
-        CmppDecoder,
-        Some(ClientConfig::new()),
-        None,
-        None,
-    )
-    .await
-    .expect("connect");
+    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+        .client_config(ClientConfig::new())
+        .connect()
+        .await
+        .expect("connect");
 
     let connect_pdu = client_handler.build_connect_pdu("106900", "password123");
     conn.send_request(connect_pdu).await.expect("send connect");
@@ -843,17 +798,14 @@ async fn start_test_server_with_rate_limit(
         30,
     ));
     let config_provider = Arc::new(RateLimitConfigProvider::new(max_qps, window_size_ms));
-    let server = serve(
-        cfg,
-        vec![biz_handler],
-        Some(auth_handler),
-        None,
-        Some(config_provider),
-        Some(event_handler),
-        None,
-    )
-    .await
-    .expect("bind");
+    let server = ServerBuilder::new(cfg)
+        .handlers(vec![biz_handler])
+        .auth_handler(auth_handler)
+        .account_config_provider(config_provider)
+        .event_handler(event_handler)
+        .serve()
+        .await
+        .expect("bind");
     let port = server.local_addr.port();
     let handle = tokio::spawn(async move {
         let _ = server.run().await;
@@ -877,16 +829,11 @@ async fn test_submit_rate_limit_exceeded() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new());
-    let conn = connect(
-        endpoint,
-        client_handler.clone(),
-        CmppDecoder,
-        Some(ClientConfig::new()),
-        None,
-        None,
-    )
-    .await
-    .expect("connect");
+    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+        .client_config(ClientConfig::new())
+        .connect()
+        .await
+        .expect("connect");
 
     let connect_pdu = client_handler.build_connect_pdu("106900", "password123");
     conn.send_request(connect_pdu).await.expect("send connect");
@@ -1039,16 +986,13 @@ async fn test_auth_correct_password() {
     let ts = Arc::new(TestClientEventHandler::new());
     let ms = Arc::new(TestMessageSource);
 
-    let conn = connect(
-        endpoint,
-        handler.clone(),
-        CmppDecoder,
-        Some(ClientConfig::new()),
-        Some(ms),
-        Some(ts),
-    )
-    .await
-    .unwrap();
+    let conn = ClientBuilder::new(endpoint, handler.clone(), CmppDecoder)
+        .client_config(ClientConfig::new())
+        .message_source(ms)
+        .event_handler(ts)
+        .connect()
+        .await
+        .unwrap();
 
     let connect_pdu = handler.build_connect_pdu("900001", "testpass");
     conn.send_request(connect_pdu).await.unwrap();
@@ -1076,16 +1020,13 @@ async fn test_auth_wrong_password() {
     let ts = Arc::new(TestClientEventHandler::new());
     let ms = Arc::new(TestMessageSource);
 
-    let conn = connect(
-        endpoint,
-        handler.clone(),
-        CmppDecoder,
-        Some(ClientConfig::new()),
-        Some(ms),
-        Some(ts),
-    )
-    .await
-    .unwrap();
+    let conn = ClientBuilder::new(endpoint, handler.clone(), CmppDecoder)
+        .client_config(ClientConfig::new())
+        .message_source(ms)
+        .event_handler(ts)
+        .connect()
+        .await
+        .unwrap();
 
     let connect_pdu = handler.build_connect_pdu("900001", "wrong");
     conn.send_request(connect_pdu).await.unwrap();
@@ -1115,16 +1056,13 @@ async fn test_auth_unknown_account() {
     let ts = Arc::new(TestClientEventHandler::new());
     let ms = Arc::new(TestMessageSource);
 
-    let conn = connect(
-        endpoint,
-        handler.clone(),
-        CmppDecoder,
-        Some(ClientConfig::new()),
-        Some(ms),
-        Some(ts),
-    )
-    .await
-    .unwrap();
+    let conn = ClientBuilder::new(endpoint, handler.clone(), CmppDecoder)
+        .client_config(ClientConfig::new())
+        .message_source(ms)
+        .event_handler(ts)
+        .connect()
+        .await
+        .unwrap();
 
     let connect_pdu = handler.build_connect_pdu("123456", "pwd");
     conn.send_request(connect_pdu).await.unwrap();
@@ -1153,16 +1091,13 @@ async fn test_submit_message() {
     let ts = Arc::new(TestClientEventHandler::new());
     let ms = Arc::new(TestMessageSource);
 
-    let conn = connect(
-        endpoint,
-        handler.clone(),
-        CmppDecoder,
-        Some(ClientConfig::new()),
-        Some(ms),
-        Some(ts),
-    )
-    .await
-    .unwrap();
+    let conn = ClientBuilder::new(endpoint, handler.clone(), CmppDecoder)
+        .client_config(ClientConfig::new())
+        .message_source(ms)
+        .event_handler(ts)
+        .connect()
+        .await
+        .unwrap();
 
     let connect_pdu = handler.build_connect_pdu("900001", "pwd");
     conn.send_request(connect_pdu).await.unwrap();

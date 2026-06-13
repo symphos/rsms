@@ -67,9 +67,9 @@ impl Decodable for BindTransmitter {
         let system_id = decode_cstring(buf, MAX_SYSTEM_ID_LENGTH, "system_id")?;
         let password = decode_cstring(buf, MAX_PASSWORD_LENGTH, "password")?;
         let system_type = decode_cstring(buf, MAX_SYSTEM_TYPE_LENGTH, "system_type")?;
-        let interface_version = buf.get_u8();
-        let addr_ton = buf.get_u8();
-        let addr_npi = buf.get_u8();
+        let interface_version = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let addr_ton = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let addr_npi = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         let address_range = decode_cstring(buf, 41, "address_range")?;
         Ok(Self {
             system_id,
@@ -108,7 +108,7 @@ impl Decodable for BindTransmitterResp {
             });
         }
         let system_id = decode_cstring(buf, MAX_SYSTEM_ID_LENGTH, "system_id")?;
-        let sc_interface_version = buf.get_u8();
+        let sc_interface_version = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         Ok(Self {
             system_id,
             sc_interface_version,

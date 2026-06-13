@@ -22,7 +22,7 @@ Offset  Length  Field
 12      4       Sequence_Number
 ```
 
-> **关键差异**：SMPP Header 多了 4 字节 `Command_Status`，因此 sequence_id 在 bytes 12-15（而非 CMPP/SMGP 的 bytes 8-11）。客户端 `EndpointConfig` 必须加 `.with_protocol("smpp")`，否则 sequence_id 提取位置错误。
+> **关键差异**：SMPP Header 多了 4 字节 `Command_Status`，因此 sequence_id 在 bytes 12-15（而非 CMPP/SMGP 的 bytes 8-11）。客户端 `EndpointConfig` 必须加 `.with_protocol(Protocol::Smpp)`，否则 sequence_id 提取位置错误。
 
 ## 认证方式
 
@@ -156,16 +156,14 @@ let message = decode_message_with_version(pdu, Some(version))?;
 参考：`examples/smpp-endpoint/src/server.rs`
 
 ```rust
+use rsms_core::Protocol;
 let config = Arc::new(EndpointConfig::new("smpp-gateway", "0.0.0.0", 7893, 500, 60)
-    .with_protocol("smpp"));   // 必须设置！
+    .with_protocol(Protocol::Smpp));   // 必须设置！
 
-let server = serve(
-    config,
-    vec![Arc::new(MyBizHandler)],
-    Some(Arc::new(SmppAuth::new())),
-    None,
-    None, None, None,
-).await?;
+let server = ServerBuilder::new(config)
+    .handler(Arc::new(MyBizHandler))
+    .auth_handler(Arc::new(SmppAuth::new()))
+    .serve().await?;
 ```
 
 ## 客户端完整示例
@@ -174,15 +172,11 @@ let server = serve(
 
 ```rust
 let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 500, 60)
-    .with_protocol("smpp"));   // 必须设置！
+    .with_protocol(Protocol::Smpp));   // 必须设置！
 
-let conn = connect(
-    endpoint,
-    Arc::new(MyClientHandler),
-    SmppDecoder,
-    Some(ClientConfig::default()),
-    None, None,
-).await?;
+let conn = ClientBuilder::new(endpoint, Arc::new(MyClientHandler), SmppDecoder)
+    .client_config(ClientConfig::default())
+    .connect().await?;
 
 // 发送 Bind
 let bind_pdu = BindTransmitter::new("SMPP", "pwd12345", "CMT", 0x34);

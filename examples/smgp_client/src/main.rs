@@ -4,7 +4,7 @@ use rsms_codec_smgp::{
     CommandId, DeliverResp, Login, Pdu, SmgpMessage, Submit,
 };
 use rsms_connector::client::{ClientContext, ClientHandler};
-use rsms_connector::{connect, MessageItem, MessageSource, SmgpDecoder};
+use rsms_connector::{ClientBuilder, MessageItem, MessageSource, SmgpDecoder};
 use rsms_core::{EncodedPdu, EndpointConfig, Frame, Result};
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
@@ -304,15 +304,10 @@ async fn main() -> Result<()> {
 
     tracing::info!("正在连接 SMGP 服务端 {}...", SERVER_ADDR);
 
-    let conn = connect(
-        endpoint,
-        handler,
-        SmgpDecoder,
-        None,
-        Some(msg_source as Arc<dyn MessageSource>),
-        None,
-    )
-    .await?;
+    let conn = ClientBuilder::new(endpoint, handler, SmgpDecoder)
+        .message_source(msg_source as Arc<dyn MessageSource>)
+        .connect()
+        .await?;
 
     tracing::info!("TCP 连接已建立 (conn_id={})", conn.id);
 

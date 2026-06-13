@@ -29,10 +29,10 @@ use rsms_codec_smpp::{
     SubmitSmResp, Tlv,
 };
 use rsms_connector::{
-    serve, AccountConfig, AccountConfigProvider, AccountPoolConfig, AuthCredentials,
+    ServerBuilder, AccountConfig, AccountConfigProvider, AccountPoolConfig, AuthCredentials,
     AuthHandler, AuthResult, MessageItem, MessageSource, ProtocolConnection, ServerEventHandler,
 };
-use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Frame, RawPdu, Result};
+use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Protocol, Frame, RawPdu, Result};
 use rsms_longmsg::{
     LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser,
     split::SmsAlphabet,
@@ -536,7 +536,7 @@ async fn main() -> Result<()> {
 
     let config = Arc::new(
         EndpointConfig::new("smpp-gateway", "0.0.0.0", 7893, 500, 60)
-            .with_protocol("smpp")
+            .with_protocol(Protocol::Smpp)
             .with_log_level(tracing::Level::INFO),
     );
 
@@ -548,19 +548,18 @@ async fn main() -> Result<()> {
 
     let merger = Arc::new(std::sync::Mutex::new(LongMessageMerger::new()));
 
-    let server = serve(
-        config,
-        vec![Arc::new(SmppBusinessHandler {
+    let server = ServerBuilder::new(config)
+        .handlers(vec![Arc::new(SmppBusinessHandler {
             msg_source: msg_source.clone(),
             merger: merger.clone(),
-        })],
-        Some(Arc::new(SmppAuthHandler { accounts })),
-        Some(msg_source as Arc<dyn MessageSource>),
-        Some(Arc::new(SimpleAccountConfigProvider)),
-        Some(Arc::new(SmppServerEventHandler)),
-        Some(AccountPoolConfig::new()),
-    )
-    .await?;
+        })])
+        .auth_handler(Arc::new(SmppAuthHandler { accounts }))
+        .message_source(msg_source as Arc<dyn MessageSource>)
+        .account_config_provider(Arc::new(SimpleAccountConfigProvider))
+        .event_handler(Arc::new(SmppServerEventHandler))
+        .account_pool_config(AccountPoolConfig::new())
+        .serve()
+        .await?;
 
     tracing::info!("监听地址: {}", server.local_addr);
     server.run().await

@@ -72,7 +72,7 @@ impl Decodable for ActiveTestResp {
         if !buf.has_remaining() {
             return Err(CodecError::Incomplete);
         }
-        let reserved = buf.get_u8();
+        let reserved = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         Ok(ActiveTestResp { reserved })
     }
 

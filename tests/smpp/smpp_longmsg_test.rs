@@ -6,10 +6,10 @@ use rsms_codec_smpp::{
 };
 use rsms_connector::client::{ClientConfig, ClientContext, ClientHandler, ClientConnection};
 use rsms_connector::{
-    connect, serve, AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler, AuthResult,
+    ClientBuilder, ServerBuilder, AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler, AuthResult,
     SmppDecoder,
 };
-use rsms_core::{ConnectionInfo, EndpointConfig, Frame, RawPdu, Result};
+use rsms_core::{ConnectionInfo, EndpointConfig, Protocol, Frame, RawPdu, Result};
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
 use std::collections::HashMap;
@@ -297,20 +297,16 @@ async fn start_server(
 )> {
     let cfg = Arc::new(
         EndpointConfig::new("smpp-longmsg-server", "127.0.0.1", 0, 8, 30)
-            .with_protocol("smpp"),
+            .with_protocol(Protocol::Smpp),
     );
     let auth = Arc::new(PasswordAuthHandler::new().add_account(TEST_SYSTEM_ID, TEST_PASSWORD));
-    let server = serve(
-        cfg,
-        vec![biz_handler],
-        Some(auth),
-        None,
-        Some(Arc::new(MockAccountConfigProvider) as Arc<dyn AccountConfigProvider>),
-        None,
-        None,
-    )
-    .await
-    .expect("bind");
+    let server = ServerBuilder::new(cfg)
+        .handlers(vec![biz_handler])
+        .auth_handler(auth)
+        .account_config_provider(Arc::new(MockAccountConfigProvider) as Arc<dyn AccountConfigProvider>)
+        .serve()
+        .await
+        .expect("bind");
     let port = server.local_addr.port();
     let pool = server.pool();
     let handle = tokio::spawn(async move {
@@ -326,18 +322,13 @@ async fn connect_client(
 ) -> Result<(Arc<LongMsgClientHandler>, Arc<ClientConnection>)> {
     let endpoint = Arc::new(
         EndpointConfig::new("smpp-longmsg-client", "127.0.0.1", port, 8, 30)
-            .with_protocol("smpp"),
+            .with_protocol(Protocol::Smpp),
     );
     let handler = Arc::new(LongMsgClientHandler::new(smpp_version));
-    let conn = connect(
-        endpoint,
-        handler.clone(),
-        SmppDecoder,
-        Some(ClientConfig::new()),
-        None,
-        None,
-    )
-    .await?;
+    let conn = ClientBuilder::new(endpoint, handler.clone(), SmppDecoder)
+        .client_config(ClientConfig::new())
+        .connect()
+        .await?;
 
     let bind_pdu = handler.build_bind_pdu();
     conn.write_frame(bind_pdu.as_slice()).await?;

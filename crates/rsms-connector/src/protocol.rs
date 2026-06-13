@@ -183,13 +183,30 @@ pub trait AccountConfigProvider: Send + Sync {
     async fn get_config(&self, account: &str) -> Result<AccountConfig>;
 }
 
+/// 待发送消息的单元，由 `MessageSource::fetch` 返回。
 pub enum MessageItem {
+    /// 单条普通短信，已序列化为完整 PDU 字节（含协议头）。
     Single(Arc<dyn EncodedPdu>),
+    /// 长短信分组：`items` 中的各段 PDU 必须按分段顺序排列。
+    ///
+    /// 框架保证同一 `Group` 的所有帧在**同一连接**上按顺序连续发出，
+    /// 确保对端能正确重组长短信。
     Group { items: Vec<Arc<dyn EncodedPdu>> },
 }
 
+/// 出站消息来源，由用户实现并注册到客户端连接池。
+///
+/// 框架通过 `run_outbound_fetcher` 周期性调用 `fetch` 批量拉取待发消息，
+/// 每批最多 16 条，直接通过 `write_frame` 写入连接（不经过滑动窗口）。
+///
+/// **关键约定**：`account` 参数的值等于 `EndpointConfig.id`（即端点 ID），
+/// 而非原始账号字符串。`fetch` 的 key 必须与此一致，否则消息无法被拉取。
 #[async_trait]
 pub trait MessageSource: Send + Sync {
+    /// 为指定账号（端点 ID）拉取一批待发消息，最多 `batch_size` 条。
+    ///
+    /// 若当前无待发消息，返回空 `Vec`；框架会在下一个周期重试。
+    /// 返回 `Err` 时框架记录错误并跳过本批次，连接不受影响。
     async fn fetch(&self, account: &str, batch_size: usize) -> Result<Vec<MessageItem>>;
 }
 

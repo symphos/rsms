@@ -61,13 +61,14 @@ impl Tlv {
         if buf.remaining() < 4 {
             return Err(CodecError::Incomplete);
         }
-        let tag = buf.get_u16();
-        let length = buf.get_u16();
+        let tag = buf.try_get_u16().map_err(|_| CodecError::Incomplete)?;
+        let length = buf.try_get_u16().map_err(|_| CodecError::Incomplete)?;
         if buf.remaining() < length as usize {
             return Err(CodecError::Incomplete);
         }
         let mut value_bytes = vec![0u8; length as usize];
-        buf.copy_to_slice(&mut value_bytes);
+        buf.try_copy_to_slice(&mut value_bytes)
+            .map_err(|_| CodecError::Incomplete)?;
         let value = Bytes::from(value_bytes);
         Ok(Self { tag, length, value })
     }

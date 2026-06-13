@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use rsms_connector::{
     AuthCredentials, AuthHandler, AuthResult,
-    AccountConfig, AccountConfigProvider, CmppDecoder, connect,
+    AccountConfig, AccountConfigProvider, CmppDecoder, ClientBuilder, ServerBuilder,
     AccountPool,
 };
 use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler, ClientConnection};
@@ -146,15 +146,12 @@ async fn start_server(
         60,
     ));
     let auth = Arc::new(PasswordAuthHandler::new().add_account(TEST_ACCOUNT, TEST_PASSWORD));
-    let server = rsms_connector::serve(
-        cfg,
-        vec![],
-        Some(auth),
-        None,
-        Some(config_provider as Arc<dyn AccountConfigProvider>),
-        None,
-        None,
-    ).await?;
+    let server = ServerBuilder::new(cfg)
+        .handlers(vec![])
+        .auth_handler(auth)
+        .account_config_provider(config_provider as Arc<dyn AccountConfigProvider>)
+        .serve()
+        .await?;
     let port = server.local_addr.port();
     let account_pool = server.account_pool();
     let handle = tokio::spawn(async move { let _ = server.run().await; });
@@ -176,14 +173,11 @@ async fn create_connections(port: u16, count: usize) -> Vec<Arc<ClientConnection
         let client_handler = Arc::new(TestClientHandler::new());
         let client_config = ClientConfig::default();
 
-        let conn = connect(
-            endpoint,
-            client_handler,
-            CmppDecoder,
-            Some(client_config),
-            None,
-            None,
-        ).await.expect("connect failed");
+        let conn = ClientBuilder::new(endpoint, client_handler, CmppDecoder)
+            .client_config(client_config)
+            .connect()
+            .await
+            .expect("connect failed");
 
         let connect_pdu = build_connect_pdu(TEST_ACCOUNT, TEST_PASSWORD, CMPP_VERSION);
         conn.write_frame(connect_pdu.as_bytes()).await.expect("send connect failed");
@@ -373,6 +367,48 @@ async fn test_dynamic_connection_multi_step_adjust() {
     let count_step5 = account_pool.connection_count(TEST_ACCOUNT).await;
     println!("Step 5 (1→3上限): 服务端连接数={}", count_step5);
     assert_eq!(count_step5, 1, "调高上限不会自动创建连接");
+
+    server_handle.abort();
+}
+
+/// 4A.1 回归：连接断开后应从 `AccountConnections` 注销，不泄漏。
+/// 此前断开仅清理 `ConnectionPool`，`AccountConnections.connections` 会永久残留 `Arc<Connection>`，
+/// `remove_connection` 的唯一调用点是缩容 `evict_excess_connections`，正常断开从不触发。
+#[tokio::test]
+async fn test_disconnected_connections_removed_from_account_pool() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+
+    // max_connections=0（不限制），排除缩容 eviction 干扰，单纯验证「断开即注销」。
+    let config = AccountConfig::new()
+        .with_max_connections(0)
+        .with_max_qps(1000)
+        .with_window_size(2048);
+    let provider = Arc::new(DynamicConfigProvider::new(config));
+    let (port, account_pool, server_handle) = start_server(provider).await.unwrap();
+
+    // 用裸 TcpStream 建 4 条连接并完成认证：drop 即可确定性关闭，不残留后台读任务。
+    let mut streams = Vec::new();
+    for _ in 0..4 {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let connect_pdu = build_connect_pdu(TEST_ACCOUNT, TEST_PASSWORD, CMPP_VERSION);
+        s.write_all(connect_pdu.as_bytes()).await.unwrap();
+        s.flush().await.unwrap();
+        streams.push(s);
+    }
+    // 等服务端完成认证 + 注册到 account pool。
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let count_before = account_pool.connection_count(TEST_ACCOUNT).await;
+    println!("断开前服务端连接数: {}", count_before);
+    assert_eq!(count_before, 4, "4 条连接应已注册到 account pool");
+
+    // 断开所有连接，服务端 read 返回 0 → run_connection 收尾注销。
+    drop(streams);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let count_after = account_pool.connection_count(TEST_ACCOUNT).await;
+    println!("断开后服务端连接数: {}", count_after);
+    assert_eq!(count_after, 0, "断开后应从 AccountConnections 注销，不泄漏");
 
     server_handle.abort();
 }

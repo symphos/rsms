@@ -14,7 +14,7 @@
 //
 // SMPP 与 CMPP 的关键差异：
 //   - 认证是明文：BindTransmitter::new(system_id, password, system_type, interface_version)
-//   - EndpointConfig 必须加 .with_protocol("smpp")（sequence_id 在 bytes 12-15）
+//   - EndpointConfig 必须加 .with_protocol(Protocol::Smpp)（sequence_id 在 bytes 12-15）
 //   - Report 通过 DeliverSm(esm_class & 0x04) 判断
 //   - MsgId 是 String 类型
 //   - EnquireLink 替代 ActiveTest
@@ -26,8 +26,8 @@ use rsms_codec_smpp::{
     decode_message, BindTransmitter, CommandId, DeliverSmResp, Pdu, SmppMessage, SubmitSm,
 };
 use rsms_connector::client::{ClientContext, ClientHandler};
-use rsms_connector::{connect, MessageItem, MessageSource, SmppDecoder};
-use rsms_core::{EncodedPdu, EndpointConfig, Frame, Result};
+use rsms_connector::{ClientBuilder, MessageItem, MessageSource, SmppDecoder};
+use rsms_core::{EncodedPdu, EndpointConfig, Protocol, Frame, Result};
 use rsms_longmsg::{
     LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser,
     split::SmsAlphabet,
@@ -349,22 +349,17 @@ async fn main() -> Result<()> {
 
     let endpoint = Arc::new(
         EndpointConfig::new(ACCOUNT, host, port, 100, 60)
-            .with_protocol("smpp")
+            .with_protocol(Protocol::Smpp)
             .with_window_size(2048)
             .with_log_level(tracing::Level::INFO),
     );
 
     tracing::info!("正在连接 SMPP 服务端 {}...", SERVER_ADDR);
 
-    let conn = connect(
-        endpoint,
-        handler,
-        SmppDecoder,
-        None,
-        Some(msg_source as Arc<dyn MessageSource>),
-        None,
-    )
-    .await?;
+    let conn = ClientBuilder::new(endpoint, handler, SmppDecoder)
+        .message_source(msg_source as Arc<dyn MessageSource>)
+        .connect()
+        .await?;
 
     tracing::info!("TCP 连接已建立 (conn_id={})", conn.id);
 

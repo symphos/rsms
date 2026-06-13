@@ -4,7 +4,7 @@ use rsms_codec_cmpp::CommandId as CmppCommandId;
 use rsms_codec_sgip::CommandId as SgipCommandId;
 use rsms_codec_smgp::CommandId as SmgpCommandId;
 use rsms_codec_smpp::CommandId as SmppCommandId;
-use rsms_core::{ConnectionInfo, RawPdu, Frame, Result, SessionState};
+use rsms_core::{ConnectionInfo, Protocol, RawPdu, Frame, Result, SessionState};
 use rsms_session::ConnectionContext;
 use rsms_window::{Window, WindowConfig};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -103,7 +103,7 @@ impl Connection {
         self.ctx.lock().await.session_state()
     }
 
-    pub async fn mark_pipeline_ready(&self) {
+    pub async fn mark_ready(&self) {
         self.ready.store(true, Ordering::Release);
     }
 
@@ -119,7 +119,7 @@ impl Connection {
             let ctx = self.ctx.lock().await;
             ctx.mark_disconnected();
         }
-        if let Some(close_pkt) = encode_close_packet(&self.config.protocol) {
+        if let Some(close_pkt) = encode_close_packet(self.config.protocol) {
             let _ = self.write_frame(&close_pkt).await;
         }
         {
@@ -144,7 +144,24 @@ impl Connection {
         self.touch().await;
         Ok(())
     }
-    
+
+    /// 批量写入多帧，仅在末尾 flush 一次，减少每帧 flush 的 syscall 开销。
+    /// 帧按入参顺序写出，长短信分组在调用方保持连续即可保证同序。
+    pub async fn write_frames(&self, frames: &[&[u8]]) -> Result<()> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut write = self.write.lock().await;
+            for f in frames {
+                write.write_all(f).await?;
+            }
+            write.flush().await?;
+        }
+        self.touch().await;
+        Ok(())
+    }
+
     pub async fn writable(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
@@ -254,7 +271,7 @@ impl ProtocolConnection for Connection {
     }
 
     fn should_log(&self, level: tracing::Level) -> bool {
-        self.config.log_level.map_or(true, |max| level >= max)
+        self.config.log_level.is_none_or(|max| level >= max)
     }
 }
 
@@ -294,6 +311,7 @@ impl RateLimiter for SubmitLimiterAdapter {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_connection(
     read: OwnedReadHalf,
     conn: Arc<Connection>,
@@ -301,7 +319,7 @@ pub async fn run_connection(
     account_pool: Option<Arc<AccountPool>>,
     account_config_provider: Option<Arc<dyn AccountConfigProvider>>,
     auth_handler: Option<Arc<dyn crate::protocol::AuthHandler>>,
-    protocol: &str,
+    protocol: Protocol,
     event_handler: Option<Arc<dyn ServerEventHandler>>,
 ) {
     let mut read = read;
@@ -350,18 +368,14 @@ pub async fn run_connection(
             let conn_arc = conn.clone();
             
             let handle_result = match protocol {
-                "cmpp" => cmpp_handler.handle_frame(&frame, conn_arc.clone()).await,
-                "smgp" => smgp_handler.handle_frame(&frame, conn_arc.clone()).await,
-                "sgip" => sgip_handler.handle_frame(&frame, conn_arc.clone()).await,
-                "smpp" => smpp_handler.handle_frame(&frame, conn_arc.clone()).await,
-                _ => {
-                    tracing::warn!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), protocol, "unknown protocol");
-                    Ok(HandleResult::Stop)
-                }
+                Protocol::Cmpp => cmpp_handler.handle_frame(&frame, conn_arc.clone()).await,
+                Protocol::Smgp => smgp_handler.handle_frame(&frame, conn_arc.clone()).await,
+                Protocol::Sgip => sgip_handler.handle_frame(&frame, conn_arc.clone()).await,
+                Protocol::Smpp => smpp_handler.handle_frame(&frame, conn_arc.clone()).await,
             };
             
             if let Err(e) = handle_result {
-                error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), protocol, "handler error: {}", e);
+                error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), protocol = %protocol, "handler error: {}", e);
                 continue;
             }
             
@@ -406,33 +420,45 @@ pub async fn run_connection(
     
     let conn_id = conn.id;
     let account = conn.authenticated_account().await;
+
+    // 注销：从 account pool 移除本连接，避免断开后 Arc<Connection> 永久残留在
+    // AccountConnections.connections 造成内存泄漏（此前断开仅清理 ConnectionPool，
+    // remove_connection 的唯一调用点是缩容 evict_excess_connections）。
+    if let Some(acc) = conn.account_connections().await {
+        acc.remove_connection(conn_id).await;
+    }
+
     conn.mark_disconnected().await;
-    
+
     if let Some(ref handler) = event_handler {
         handler.on_disconnected(conn_id, account.as_deref()).await;
     }
 }
 
-fn decode_frames_drain(buf: &mut Vec<u8>, protocol: &str) -> Result<Vec<Frame>> {
+fn decode_frames_drain(buf: &mut Vec<u8>, protocol: Protocol) -> Result<Vec<Frame>> {
     let mut frames = Vec::new();
+
+    let seq_offset = protocol.seq_offset();
     
-    let seq_offset = match protocol {
-        "smpp" | "sgip" => 12,
-        _ => 8,
-    };
-    
-    while buf.len() >= 4 {
-        let total = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    // 用读游标 off 解析，循环结束后一次性 drain 已消费部分，
+    // 避免每帧 drain(..total) 触发的 O(N·buflen) 缓冲区搬移。
+    let mut off = 0usize;
+    while buf.len() - off >= 4 {
+        let total =
+            u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
         if !(4..=100_000).contains(&total) {
-            buf.drain(..1);
+            // 坏长度：前移 1 字节重同步（仅推进 offset，不做 O(n) drain）
+            off += 1;
             continue;
         }
-        
-        if total > buf.len() {
+
+        if total > buf.len() - off {
             break;
         }
-        
-        let data: Vec<u8> = buf.drain(..total).collect();
+
+        let data = buf[off..off + total].to_vec();
+        off += total;
+
         let command_id = if data.len() >= 8 {
             u32::from_be_bytes([data[4], data[5], data[6], data[7]])
         } else {
@@ -443,53 +469,56 @@ fn decode_frames_drain(buf: &mut Vec<u8>, protocol: &str) -> Result<Vec<Frame>> 
         } else {
             0
         };
-        
+
         frames.push(Frame::new(command_id, sequence_id, RawPdu::from_vec(data)));
     }
-    
+
+    if off > 0 {
+        buf.drain(..off);
+    }
+
     Ok(frames)
 }
 
-fn encode_close_packet(protocol: &str) -> Option<Vec<u8>> {
+fn encode_close_packet(protocol: Protocol) -> Option<Vec<u8>> {
     let command_id: u32;
     let header_len: usize;
     let body_len: usize;
     match protocol {
-        "cmpp" => {
+        Protocol::Cmpp => {
             command_id = CmppCommandId::Terminate as u32;
             header_len = 12;
             body_len = 0;
         }
-        "smgp" => {
+        Protocol::Smgp => {
             command_id = SmgpCommandId::Exit as u32;
             header_len = 12;
             body_len = 1;
         }
-        "sgip" => {
+        Protocol::Sgip => {
             command_id = SgipCommandId::Unbind as u32;
             header_len = 20;
             body_len = 0;
         }
-        "smpp" => {
+        Protocol::Smpp => {
             command_id = SmppCommandId::UNBIND as u32;
             header_len = 16;
             body_len = 0;
         }
-        _ => return None,
     };
 
     let total_len = header_len + body_len;
     let mut pdu = Vec::with_capacity(total_len);
     pdu.extend_from_slice(&(total_len as u32).to_be_bytes());
     pdu.extend_from_slice(&command_id.to_be_bytes());
-    if protocol == "smpp" {
+    if protocol == Protocol::Smpp {
         pdu.extend_from_slice(&[0u8; 4]);
     }
     pdu.extend_from_slice(&[0u8; 4]);
-    if protocol == "sgip" {
+    if protocol == Protocol::Sgip {
         pdu.extend_from_slice(&[0u8; 8]);
     }
-    if protocol == "smgp" {
+    if protocol == Protocol::Smgp {
         pdu.extend_from_slice(&[0u8; 1]);
     }
     Some(pdu)

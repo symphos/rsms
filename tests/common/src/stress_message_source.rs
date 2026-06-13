@@ -20,7 +20,7 @@ impl StressMockMessageSource {
         let mut queue = self
             .queues
             .entry(account.to_string())
-            .or_insert_with(VecDeque::new);
+            .or_default();
         queue.push_back(
             MessageItem::Single(Arc::new(RawPdu::from_vec(bytes)) as Arc<dyn EncodedPdu>)
         );
@@ -31,7 +31,7 @@ impl StressMockMessageSource {
         let mut queue = self
             .queues
             .entry(account.to_string())
-            .or_insert_with(VecDeque::new);
+            .or_default();
         queue.push_back(
             MessageItem::Single(Arc::new(RawPdu::from_vec(bytes)) as Arc<dyn EncodedPdu>)
         );
@@ -41,7 +41,7 @@ impl StressMockMessageSource {
         let mut queue = self
             .queues
             .entry(account.to_string())
-            .or_insert_with(VecDeque::new);
+            .or_default();
         queue.push_back(MessageItem::Group {
             items: items
                 .into_iter()

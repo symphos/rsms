@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use dashmap::DashMap;
 use tokio::sync::RwLock;
 use tokio::time;
 use tracing::warn;
@@ -103,8 +103,10 @@ pub struct TransactionManager {
 }
 
 struct Inner {
-    transactions: RwLock<HashMap<String, TransactionEntry>>,
-    seq_to_msg_id: RwLock<HashMap<u32, String>>,
+    // 用 DashMap 替代全局写锁的 RwLock<HashMap>：每条 submit/resp/report 不再串行化到单把锁。
+    // 主表的键在 resp 前为 sequence_id 字符串、resp 后改为 msg_id。
+    transactions: DashMap<String, TransactionEntry>,
+    seq_to_msg_id: DashMap<u32, String>,
     check_interval: Duration,
     resp_timeout: Duration,
     running: Arc<RwLock<bool>>,
@@ -121,8 +123,8 @@ impl TransactionManager {
     pub fn new(resp_timeout_secs: u64) -> Self {
         Self {
             inner: Arc::new(Inner {
-                transactions: RwLock::new(HashMap::new()),
-                seq_to_msg_id: RwLock::new(HashMap::new()),
+                transactions: DashMap::new(),
+                seq_to_msg_id: DashMap::new(),
                 check_interval: Duration::from_secs(1),
                 resp_timeout: Duration::from_secs(resp_timeout_secs),
                 running: Arc::new(RwLock::new(false)),
@@ -141,37 +143,30 @@ impl TransactionManager {
             info,
             status: TransactionStatus::Pending,
         };
-        
-        let mut transactions = self.inner.transactions.write().await;
-        transactions.insert(key, entry);
+        self.inner.transactions.insert(key, entry);
     }
 
     pub async fn on_submit_resp(&self, sequence_id: u32, msg_id: Option<String>, result: u32) {
-        let entry = {
-            let mut transactions = self.inner.transactions.write().await;
-            let key = sequence_id.to_string();
-            
-            if let Some(tx) = transactions.remove(&key) {
-                if let Some(ref mid) = msg_id {
-                    // 更新 seq_to_msg_id 映射
-                    let mut seq_to_msg = self.inner.seq_to_msg_id.write().await;
-                    seq_to_msg.insert(sequence_id, mid.clone());
-                    
-                    let mut new_entry = tx;
-                    new_entry.info.msg_id = Some(mid.clone());
-                    new_entry.status = TransactionStatus::RespReceived;
-                    transactions.insert(mid.clone(), new_entry);
-                    transactions.get(mid).cloned().unwrap()
-                } else {
-                    // 没有 msg_id，保持用 sequence_id 作为 key
-                    let mut new_entry = tx;
-                    new_entry.status = TransactionStatus::RespReceived;
-                    transactions.insert(key.clone(), new_entry.clone());
-                    new_entry
-                }
-            } else {
+        let key = sequence_id.to_string();
+        let entry = if let Some(mid) = msg_id {
+            // 取出当前 entry 的克隆并释放分片锁，然后**先按 msg_id 落键、再删 seq 键**，
+            // 保证不存在“两键瞬时都不在”的窗口，避免并发 on_report 漏匹配。
+            let Some(mut tx) = self.inner.transactions.get(&key).map(|r| r.clone()) else {
                 return;
-            }
+            };
+            tx.info.msg_id = Some(mid.clone());
+            tx.status = TransactionStatus::RespReceived;
+            self.inner.seq_to_msg_id.insert(sequence_id, mid.clone());
+            self.inner.transactions.insert(mid, tx.clone());
+            self.inner.transactions.remove(&key);
+            tx
+        } else {
+            // 没有 msg_id：原地更新状态，仍以 sequence_id 为键
+            let Some(mut r) = self.inner.transactions.get_mut(&key) else {
+                return;
+            };
+            r.status = TransactionStatus::RespReceived;
+            r.clone()
         };
 
         let callback = self.inner.callback.read().await;
@@ -185,13 +180,8 @@ impl TransactionManager {
     }
 
     pub async fn on_send_failed(&self, sequence_id: u32, error: &str) {
-        let entry = {
-            let mut transactions = self.inner.transactions.write().await;
-            if let Some(tx) = transactions.remove(&sequence_id.to_string()) {
-                tx
-            } else {
-                return;
-            }
+        let Some((_, entry)) = self.inner.transactions.remove(&sequence_id.to_string()) else {
+            return;
         };
 
         let callback = self.inner.callback.read().await;
@@ -201,27 +191,28 @@ impl TransactionManager {
     }
 
     pub async fn on_report(&self, report: ReportInfo) {
-        let entry = {
-            let transactions = self.inner.transactions.read().await;
-
-            if let Some(tx) = transactions.get(&report.msg_id) {
-                Some(tx.clone())
-            } else {
-                let seq_to_msg = self.inner.seq_to_msg_id.read().await;
-                let mut found = None;
-                for (_, msg_id) in seq_to_msg.iter() {
-                    if let Some(tx) = transactions.get(msg_id) {
-                        if tx.info.msg_id.as_deref() == Some(&report.msg_id) {
-                            found = Some(tx.clone());
-                            break;
-                        }
+        let entry = if let Some(tx) = self.inner.transactions.get(&report.msg_id) {
+            Some(tx.clone())
+        } else {
+            // 兜底：扫描 seq_to_msg_id 找到 msg_id 对应的事务
+            let mut found = None;
+            for kv in self.inner.seq_to_msg_id.iter() {
+                if let Some(tx) = self.inner.transactions.get(kv.value())
+                    && tx.info.msg_id.as_deref() == Some(report.msg_id.as_str()) {
+                        found = Some(tx.clone());
+                        break;
                     }
-                }
-                found
             }
+            found
         };
 
         if let Some(entry) = entry {
+            // 匹配成功后清理两表，避免长生命周期客户端无界增长（msg_id 键条目 + seq 映射）
+            if let Some(mid) = entry.info.msg_id.as_deref() {
+                self.inner.transactions.remove(mid);
+            }
+            self.inner.seq_to_msg_id.remove(&entry.info.sequence_id);
+
             let callback = self.inner.callback.read().await;
             if let Some(ref cb) = *callback {
                 cb.on_report(&report, &entry.info).await;
@@ -260,20 +251,20 @@ impl TransactionManager {
         let now = Instant::now();
         let mut timed_out = Vec::new();
 
-        {
-            let mut transactions = inner.transactions.write().await;
-            let keys_to_remove: Vec<String> = transactions.iter()
-                .filter(|(_, tx)| {
-                    tx.status == TransactionStatus::Pending 
-                        && now.duration_since(tx.info.submit_time) > inner.resp_timeout
-                })
-                .map(|(k, _)| k.clone())
-                .collect();
-            
-            for key in keys_to_remove {
-                if let Some(tx) = transactions.remove(&key) {
-                    timed_out.push(tx.info);
-                }
+        // 先收集过期键（克隆），释放分片迭代锁后再逐个 remove，避免迭代期写冲突
+        let keys_to_remove: Vec<String> = inner
+            .transactions
+            .iter()
+            .filter(|e| {
+                e.status == TransactionStatus::Pending
+                    && now.duration_since(e.info.submit_time) > inner.resp_timeout
+            })
+            .map(|e| e.key().clone())
+            .collect();
+
+        for key in keys_to_remove {
+            if let Some((_, tx)) = inner.transactions.remove(&key) {
+                timed_out.push(tx.info);
             }
         }
 
@@ -287,13 +278,97 @@ impl TransactionManager {
     }
 
     pub async fn transaction_count(&self) -> usize {
-        self.inner.transactions.read().await.len()
+        self.inner.transactions.len()
     }
 
     pub async fn pending_count(&self) -> usize {
-        let transactions = self.inner.transactions.read().await;
-        transactions.values()
-            .filter(|tx| tx.status == TransactionStatus::Pending)
+        self.inner
+            .transactions
+            .iter()
+            .filter(|e| e.status == TransactionStatus::Pending)
             .count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct CountingCallback {
+        resp_ok: AtomicUsize,
+        reports: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl MessageCallback for CountingCallback {
+        async fn on_submit_resp_ok(&self, _: &SubmitInfo) {
+            self.resp_ok.fetch_add(1, Ordering::Relaxed);
+        }
+        async fn on_submit_resp_error(&self, _: &SubmitInfo, _: u32) {}
+        async fn on_submit_resp_timeout(&self, _: &SubmitInfo) {}
+        async fn on_send_failed(&self, _: u32, _: &str) {}
+        async fn on_report(&self, _: &ReportInfo, _: &SubmitInfo) {
+            self.reports.fetch_add(1, Ordering::Relaxed);
+        }
+        async fn on_mo(&self, _: &MoInfo) {}
+    }
+
+    fn submit_info(seq: u32) -> SubmitInfo {
+        SubmitInfo::new(seq, "dest".to_string(), "src".to_string(), vec![], "cmpp")
+    }
+
+    fn report(msg_id: &str) -> ReportInfo {
+        ReportInfo {
+            msg_id: msg_id.to_string(),
+            src_terminal_id: "x".to_string(),
+            stat: "DELIVRD".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn resp_rekeys_to_msg_id_and_report_matches() {
+        let tm = TransactionManager::new(10);
+        let cb = Arc::new(CountingCallback::default());
+        tm.set_callback(Some(cb.clone() as Arc<dyn MessageCallback>)).await;
+
+        tm.add_submit_transaction(submit_info(1)).await;
+        tm.on_submit_resp(1, Some("MSGID-1".to_string()), 0).await;
+        tm.on_report(report("MSGID-1")).await;
+
+        assert_eq!(cb.resp_ok.load(Ordering::Relaxed), 1);
+        assert_eq!(cb.reports.load(Ordering::Relaxed), 1, "报告应按 msg_id 匹配成功");
+        // 报告匹配后应清理该条目（修复内存泄漏），事务表清空
+        assert_eq!(tm.transaction_count().await, 0, "报告匹配后应清理事务条目");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_add_resp_report_no_loss() {
+        let tm = TransactionManager::new(30);
+        let cb = Arc::new(CountingCallback::default());
+        tm.set_callback(Some(cb.clone() as Arc<dyn MessageCallback>)).await;
+
+        let n = 1000u32;
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let tm = tm.clone();
+            handles.push(tokio::spawn(async move {
+                tm.add_submit_transaction(submit_info(i)).await;
+                tm.on_submit_resp(i, Some(format!("M-{i}")), 0).await;
+                tm.on_report(report(&format!("M-{i}"))).await;
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // 并发下 DashMap 不得死锁/丢匹配：所有 resp 与 report 都应被回调
+        assert_eq!(cb.resp_ok.load(Ordering::Relaxed), n as usize);
+        assert_eq!(
+            cb.reports.load(Ordering::Relaxed),
+            n as usize,
+            "并发下所有报告都应匹配成功（零漏匹配）"
+        );
     }
 }

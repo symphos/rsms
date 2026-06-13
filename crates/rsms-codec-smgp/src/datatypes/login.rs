@@ -54,13 +54,15 @@ impl Decodable for Login {
             return Err(CodecError::Incomplete);
         }
         let mut client_id_buf = [0u8; 8];
-        buf.copy_to_slice(&mut client_id_buf);
+        buf.try_copy_to_slice(&mut client_id_buf)
+            .map_err(|_| CodecError::Incomplete)?;
         let client_id = String::from_utf8_lossy(&client_id_buf).trim().to_string();
         let mut authenticator = [0u8; 16];
-        buf.copy_to_slice(&mut authenticator);
-        let login_mode = buf.get_u8();
-        let timestamp = buf.get_u32();
-        let version = buf.get_u8();
+        buf.try_copy_to_slice(&mut authenticator)
+            .map_err(|_| CodecError::Incomplete)?;
+        let login_mode = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let timestamp = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
+        let version = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         Ok(Login {
             client_id,
             authenticator,
@@ -111,10 +113,11 @@ impl Decodable for LoginResp {
         if buf.remaining() < Self::BODY_SIZE {
             return Err(CodecError::Incomplete);
         }
-        let status = buf.get_u32();
+        let status = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
         let mut authenticator = [0u8; 16];
-        buf.copy_to_slice(&mut authenticator);
-        let version = buf.get_u8();
+        buf.try_copy_to_slice(&mut authenticator)
+            .map_err(|_| CodecError::Incomplete)?;
+        let version = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
         Ok(LoginResp {
             status,
             authenticator,

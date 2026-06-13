@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use rsms_connector::{
     AuthCredentials, AuthHandler, AuthResult,
-    AccountConfigProvider, CmppDecoder, connect,
+    AccountConfigProvider, CmppDecoder, ClientBuilder,
     protocol::MessageSource,
 };
 use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler};
@@ -294,7 +294,7 @@ impl AuthHandler for PasswordAuthHandler {
     }
 }
 
-use rsms_connector::serve;
+use rsms_connector::ServerBuilder;
 
 async fn start_test_server(
     biz_handler: Arc<dyn rsms_business::BusinessHandler>,
@@ -303,15 +303,13 @@ async fn start_test_server(
         "stress-test-server", "127.0.0.1", 0, 500, 60,
     ).with_log_level(tracing::Level::WARN));
     let auth = Arc::new(PasswordAuthHandler::new().add_account(STRESS_TEST_ACCOUNT, STRESS_TEST_PASSWORD));
-    let server = serve(
-        cfg,
-        vec![biz_handler],
-        Some(auth),
-        None,
-        Some(Arc::new(MockAccountConfigProvider::with_limits(5000, 2048)) as Arc<dyn AccountConfigProvider>),
-        None,
-        None,
-    ).await.expect("bind");
+    let server = ServerBuilder::new(cfg)
+        .handlers(vec![biz_handler])
+        .auth_handler(auth)
+        .account_config_provider(Arc::new(MockAccountConfigProvider::with_limits(5000, 2048)) as Arc<dyn AccountConfigProvider>)
+        .serve()
+        .await
+        .expect("bind");
     let port = server.local_addr.port();
     let account_pool = server.account_pool();
     let handle = tokio::spawn(async move { let _ = server.run().await; });
@@ -531,12 +529,12 @@ async fn run_stress_test(version: u8) {
             "stress-client", "127.0.0.1", port, 1024, 30,
         ).with_window_size(2048).with_log_level(tracing::Level::WARN));
 
-        let conn = connect(
-            endpoint, client_state.clone(), CmppDecoder,
-            Some(ClientConfig::new()),
-            Some(msg_source.clone() as Arc<dyn MessageSource>),
-            None,
-        ).await.expect("connect");
+        let conn = ClientBuilder::new(endpoint, client_state.clone(), CmppDecoder)
+            .client_config(ClientConfig::new())
+            .message_source(msg_source.clone() as Arc<dyn MessageSource>)
+            .connect()
+            .await
+            .expect("connect");
 
         let connect_pdu = client_state.build_connect_pdu();
         conn.send_request(connect_pdu).await.expect("send connect");
@@ -656,12 +654,11 @@ async fn run_stress_test_with_connections(version: u8, num_connections: usize) {
 
         let mut conn = None;
         for retry in 0..50 {
-            match connect(
-                endpoint.clone(), client_state.clone(), CmppDecoder,
-                Some(ClientConfig::new()),
-                Some(msg_source.clone() as Arc<dyn MessageSource>),
-                None,
-            ).await {
+            match ClientBuilder::new(endpoint.clone(), client_state.clone(), CmppDecoder)
+                .client_config(ClientConfig::new())
+                .message_source(msg_source.clone() as Arc<dyn MessageSource>)
+                .connect()
+                .await {
                 Ok(c) => { conn = Some(c); break; }
                 Err(_) => { tokio::time::sleep(Duration::from_millis(500)).await; }
             }

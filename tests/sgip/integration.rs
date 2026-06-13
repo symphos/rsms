@@ -1,10 +1,10 @@
-use rsms_connector::{serve, SgipDecoder};
+use rsms_connector::{ServerBuilder, SgipDecoder};
 use rsms_connector::client::ClientHandler;
 use rsms_connector::{AuthHandler, AuthCredentials, AuthResult, ServerEventHandler, AccountConfigProvider};
 use rsms_test_common::{TestEventHandler, TestClientEventHandler, MockAccountConfigProvider};
 use rsms_business::BusinessHandler;
 use rsms_business::InboundContext;
-use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Frame, Result};
+use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Frame, Result};
 use rsms_codec_sgip::Encodable;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -382,18 +382,15 @@ pub async fn start_test_server(
         0,
         8,
         idle_timeout_secs as u16,
-    ).with_protocol("sgip"));
-    let server = serve(
-        cfg,
-        vec![biz_handler],
-        Some(auth_handler),
-        None,
-        Some(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>),
-        Some(event_handler),
-        None,
-    )
-    .await
-    .expect("bind");
+    ).with_protocol(Protocol::Sgip));
+    let server = ServerBuilder::new(cfg)
+        .handlers(vec![biz_handler])
+        .auth_handler(auth_handler)
+        .account_config_provider(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>)
+        .event_handler(event_handler)
+        .serve()
+        .await
+        .expect("bind");
     let port = server.local_addr.port();
     let handle = tokio::spawn(async move {
         let _ = server.run().await;
@@ -414,18 +411,15 @@ pub async fn start_test_server_with_pool(
         0,
         8,
         idle_timeout_secs as u16,
-    ).with_protocol("sgip"));
-    let server = serve(
-        cfg,
-        vec![biz_handler],
-        Some(auth_handler),
-        None,
-        Some(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>),
-        Some(event_handler),
-        None,
-    )
-    .await
-    .expect("bind");
+    ).with_protocol(Protocol::Sgip));
+    let server = ServerBuilder::new(cfg)
+        .handlers(vec![biz_handler])
+        .auth_handler(auth_handler)
+        .account_config_provider(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>)
+        .event_handler(event_handler)
+        .serve()
+        .await
+        .expect("bind");
     let port = server.local_addr.port();
     let pool = server.pool();
     let pool_clone = pool.clone();
@@ -506,7 +500,7 @@ async fn get_conn_from_pool(pool: &Arc<rsms_connector::ConnectionPool>) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rsms_connector::connect;
+    use rsms_connector::ClientBuilder;
     use rsms_connector::client::ClientConfig;
     use std::sync::atomic::Ordering;
 
@@ -526,16 +520,11 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = connect(
-            endpoint,
-            client_handler.clone(),
-            SgipDecoder,
-            Some(ClientConfig::new()),
-            None,
-            None,
-        )
-        .await
-        .expect("connect");
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
+            .client_config(ClientConfig::new())
+            .connect()
+            .await
+            .expect("connect");
 
         let bind_pdu = client_handler.build_bind_pdu(account, password);
         conn.write_frame(bind_pdu.as_bytes()).await.expect("send bind");
@@ -570,16 +559,11 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = connect(
-            endpoint,
-            client_handler.clone(),
-            SgipDecoder,
-            Some(ClientConfig::new()),
-            None,
-            None,
-        )
-        .await
-        .expect("connect");
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
+            .client_config(ClientConfig::new())
+            .connect()
+            .await
+            .expect("connect");
 
         let bind_pdu = client_handler.build_bind_pdu(account, "wrongpassword");
         conn.write_frame(bind_pdu.as_bytes()).await.expect("send bind");
@@ -612,16 +596,11 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = connect(
-            endpoint,
-            client_handler.clone(),
-            SgipDecoder,
-            Some(ClientConfig::new()),
-            None,
-            None,
-        )
-        .await
-        .expect("connect");
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
+            .client_config(ClientConfig::new())
+            .connect()
+            .await
+            .expect("connect");
 
         let bind_pdu = client_handler.build_bind_pdu("unknown", "password");
         conn.write_frame(bind_pdu.as_bytes()).await.expect("send bind");
@@ -655,16 +634,11 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = connect(
-            endpoint,
-            client_handler.clone(),
-            SgipDecoder,
-            Some(ClientConfig::new()),
-            None,
-            None,
-        )
-        .await
-        .expect("connect");
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
+            .client_config(ClientConfig::new())
+            .connect()
+            .await
+            .expect("connect");
 
         let bind_pdu = client_handler.build_bind_pdu(account, password);
         conn.write_frame(bind_pdu.as_bytes()).await.expect("send bind");
@@ -699,16 +673,11 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = connect(
-            endpoint,
-            client_handler.clone(),
-            SgipDecoder,
-            Some(ClientConfig::new()),
-            None,
-            None,
-        )
-        .await
-        .expect("connect");
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
+            .client_config(ClientConfig::new())
+            .connect()
+            .await
+            .expect("connect");
 
         let bind_pdu = client_handler.build_bind_pdu(account, password);
         conn.write_frame(bind_pdu.as_bytes()).await.expect("send bind");
@@ -742,16 +711,12 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = connect(
-            endpoint,
-            client_handler.clone(),
-            SgipDecoder,
-            Some(ClientConfig::new()),
-            None,
-            Some(client_evt.clone()),
-        )
-        .await
-        .expect("connect");
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
+            .client_config(ClientConfig::new())
+            .event_handler(client_evt.clone())
+            .connect()
+            .await
+            .expect("connect");
 
         let bind_pdu = client_handler.build_bind_pdu(account, password);
         conn.write_frame(bind_pdu.as_bytes()).await.expect("send bind");
@@ -783,16 +748,11 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = connect(
-            endpoint,
-            client_handler.clone(),
-            SgipDecoder,
-            Some(ClientConfig::new()),
-            None,
-            None,
-        )
-        .await
-        .expect("connect");
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
+            .client_config(ClientConfig::new())
+            .connect()
+            .await
+            .expect("connect");
 
         let bind_pdu = client_handler.build_bind_pdu(account, password);
         conn.write_frame(bind_pdu.as_bytes()).await.expect("send bind");
@@ -832,16 +792,11 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = connect(
-            endpoint,
-            client_handler.clone(),
-            SgipDecoder,
-            Some(ClientConfig::new()),
-            None,
-            None,
-        )
-        .await
-        .expect("connect");
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
+            .client_config(ClientConfig::new())
+            .connect()
+            .await
+            .expect("connect");
 
         let bind_pdu = client_handler.build_bind_pdu(account, password);
         conn.write_frame(bind_pdu.as_bytes()).await.expect("send bind");

@@ -31,9 +31,9 @@ rsms-codec-cmpp = { path = "crates/rsms-codec-cmpp" }
 ### 服务端示例
 
 ```rust
-use rsms_connector::{serve, AuthHandler, AuthCredentials, AuthResult};
+use rsms_connector::{ServerBuilder, AuthHandler, AuthCredentials, AuthResult};
 use rsms_business::BusinessHandler;
-use rsms_core::{EndpointConfig, Frame, Result};
+use rsms_core::{EndpointConfig, Frame, Protocol, Result};
 
 struct MyAuth;
 #[async_trait]
@@ -59,15 +59,14 @@ impl BusinessHandler for MyBiz {
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Arc::new(EndpointConfig::new("gateway", "0.0.0.0", 7890, 500, 60)
-        .with_protocol("cmpp")
+        .with_protocol(Protocol::Cmpp)
         .with_log_level(tracing::Level::WARN));
 
-    let server = serve(
-        config,
-        vec![Arc::new(MyBiz)],
-        Some(Arc::new(MyAuth)),
-        None, None, None, None,
-    ).await?;
+    let server = ServerBuilder::new(config)
+        .handler(Arc::new(MyBiz))
+        .auth_handler(Arc::new(MyAuth))
+        .serve()
+        .await?;
 
     server.run().await
 }
@@ -76,7 +75,7 @@ async fn main() -> Result<()> {
 ### 客户端示例
 
 ```rust
-use rsms_connector::{connect, CmppDecoder, ClientHandler};
+use rsms_connector::{ClientBuilder, CmppDecoder, ClientHandler};
 use rsms_core::{EndpointConfig, Frame, Result};
 
 struct MyClient;
@@ -93,12 +92,9 @@ impl ClientHandler for MyClient {
 async fn main() -> Result<()> {
     let endpoint = Arc::new(EndpointConfig::new("client", "127.0.0.1", 7890, 500, 60));
 
-    let conn = connect(
-        endpoint,
-        Arc::new(MyClient),
-        CmppDecoder,
-        None, None, None,
-    ).await?;
+    let conn = ClientBuilder::new(endpoint, Arc::new(MyClient), CmppDecoder)
+        .connect()
+        .await?;
 
     conn.write_frame(&pdu_bytes).await?;
     Ok(())
@@ -110,8 +106,8 @@ async fn main() -> Result<()> {
 只需改 3 处：
 
 ```rust
-// 1. protocol
-.with_protocol("smpp")    // "cmpp" | "smgp" | "smpp" | "sgip"
+// 1. protocol（需 use rsms_core::Protocol; 或 use rsms_connector::Protocol;）
+.with_protocol(Protocol::Smpp)    // Protocol::Cmpp | Smgp | Smpp | Sgip
 
 // 2. Decoder
 SmppDecoder                // CmppDecoder | SmgpDecoder | SmppDecoder | SgipDecoder
@@ -213,21 +209,21 @@ use rsms_codec_smpp::{BindTransmitter, SubmitSm, ...};
 # 单元测试
 cargo test -p rsms-core -p rsms-connector -p rsms-longmsg
 
-# 集成测试（四协议）
-cargo test -p cmpp-endpoint-example --test cmpp-integration-tests
-cargo test -p smgp-endpoint-example --test smgp-integration-tests
-cargo test -p smpp-endpoint-example --test smpp-integration-tests
-cargo test -p sgip-endpoint-example --test sgip-integration-tests
+# 集成测试（四协议，均在 rsms-tests 包中）
+cargo test -p rsms-tests --test cmpp-integration
+cargo test -p rsms-tests --test smgp-integration
+cargo test -p rsms-tests --test smpp-integration
+cargo test -p rsms-tests --test sgip-integration
 
 # 压测（EndpointConfig 已配置 log_level=WARN）
-cargo test -p cmpp-endpoint-example --test cmpp-stress-test -- --nocapture
-cargo test -p cmpp-endpoint-example --test multi-account-stress-test -- --nocapture
+cargo test -p rsms-tests --test cmpp-stress-test -- --nocapture
+cargo test -p rsms-tests --test cmpp-multi-account-stress-test -- --nocapture
 
 # 长短信测试
-cargo test -p cmpp-endpoint-example --test cmpp-longmsg-test -- --nocapture
+cargo test -p rsms-tests --test cmpp-longmsg-test -- --nocapture
 
 # 动态连接调整测试
-cargo test -p cmpp-endpoint-example --test dynamic-connection-test -- --nocapture
+cargo test -p rsms-tests --test cmpp-dynamic-connection-test -- --nocapture
 ```
 
 ## License

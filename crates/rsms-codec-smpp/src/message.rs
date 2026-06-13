@@ -35,10 +35,19 @@ pub enum SmppMessage {
     Unknown { command_id: u32, body: Vec<u8> },
 }
 
+/// 解码一条 SMPP PDU 字节序列为 `SmppMessage`，版本默认为 V3.4。
+///
+/// 等价于 `decode_message_with_version(buf, None)`。
 pub fn decode_message(buf: &[u8]) -> Result<SmppMessage, RsmsError> {
     decode_message_with_version(buf, None)
 }
 
+/// 解码一条 SMPP PDU 字节序列为 `SmppMessage`，并指定协议版本。
+///
+/// SMPP 头部为 16 字节（比 CMPP/SMGP 多 4 字节的 `command_status`）。
+/// `version` 影响 `SubmitSm`/`DeliverSm` 中部分可选字段的最大长度限制（V5.0 放宽）；
+/// 传入 `None` 时默认按 V3.4 解码。
+/// 未知命令字映射为 `SmppMessage::Unknown`，不返回错误。
 pub fn decode_message_with_version(
     buf: &[u8],
     version: Option<SmppVersion>,
@@ -50,10 +59,18 @@ pub fn decode_message_with_version(
     }
 
     let mut cursor = Cursor::new(buf);
-    let command_length = cursor.get_u32();
-    let command_id_raw = cursor.get_u32();
-    let _command_status = cursor.get_u32();
-    let _sequence_number = cursor.get_u32();
+    let command_length = cursor
+        .try_get_u32()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+    let command_id_raw = cursor
+        .try_get_u32()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+    let _command_status = cursor
+        .try_get_u32()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+    let _sequence_number = cursor
+        .try_get_u32()
+        .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
 
     if !(16..=100_000).contains(&command_length) {
         return Err(RsmsError::Codec(format!(
@@ -63,7 +80,9 @@ pub fn decode_message_with_version(
     }
 
     let body = if buf.len() > 16 {
-        buf[16..command_length as usize].to_vec()
+        // command_length 来自对端，可能大于实际收到的字节数；钳制到 buf.len() 防止切片越界 panic
+        let body_end = (command_length as usize).min(buf.len());
+        buf[16..body_end].to_vec()
     } else {
         vec![]
     };
@@ -84,9 +103,15 @@ pub fn decode_message_with_version(
             let system_id = decode_cstring(&mut cursor, 16, "system_id")?;
             let password = decode_cstring(&mut cursor, 9, "password")?;
             let system_type = decode_cstring(&mut cursor, 13, "system_type")?;
-            let interface_version = cursor.get_u8();
-            let addr_ton = cursor.get_u8();
-            let addr_npi = cursor.get_u8();
+            let interface_version = cursor
+                .try_get_u8()
+                .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+            let addr_ton = cursor
+                .try_get_u8()
+                .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+            let addr_npi = cursor
+                .try_get_u8()
+                .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
             let address_range = decode_cstring(&mut cursor, 16, "address_range")?;
             SmppMessage::BindTransmitter(BindTransmitter {
                 system_id,
@@ -102,7 +127,9 @@ pub fn decode_message_with_version(
             let mut cursor = Cursor::new(body.as_slice());
             let system_id = decode_cstring(&mut cursor, 16, "system_id")?;
             let sc_interface_version = if cursor.remaining() > 0 {
-                cursor.get_u8()
+                cursor
+                    .try_get_u8()
+                    .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?
             } else {
                 0x34
             };
@@ -116,9 +143,15 @@ pub fn decode_message_with_version(
             let system_id = decode_cstring(&mut cursor, 16, "system_id")?;
             let password = decode_cstring(&mut cursor, 9, "password")?;
             let system_type = decode_cstring(&mut cursor, 13, "system_type")?;
-            let interface_version = cursor.get_u8();
-            let addr_ton = cursor.get_u8();
-            let addr_npi = cursor.get_u8();
+            let interface_version = cursor
+                .try_get_u8()
+                .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+            let addr_ton = cursor
+                .try_get_u8()
+                .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+            let addr_npi = cursor
+                .try_get_u8()
+                .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
             let address_range = decode_cstring(&mut cursor, 16, "address_range")?;
             SmppMessage::BindReceiver(BindReceiver {
                 system_id,
@@ -134,7 +167,9 @@ pub fn decode_message_with_version(
             let mut cursor = Cursor::new(body.as_slice());
             let system_id = decode_cstring(&mut cursor, 16, "system_id")?;
             let sc_interface_version = if cursor.remaining() > 0 {
-                cursor.get_u8()
+                cursor
+                    .try_get_u8()
+                    .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?
             } else {
                 0x34
             };
@@ -148,9 +183,15 @@ pub fn decode_message_with_version(
             let system_id = decode_cstring(&mut cursor, 16, "system_id")?;
             let password = decode_cstring(&mut cursor, 9, "password")?;
             let system_type = decode_cstring(&mut cursor, 13, "system_type")?;
-            let interface_version = cursor.get_u8();
-            let addr_ton = cursor.get_u8();
-            let addr_npi = cursor.get_u8();
+            let interface_version = cursor
+                .try_get_u8()
+                .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+            let addr_ton = cursor
+                .try_get_u8()
+                .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+            let addr_npi = cursor
+                .try_get_u8()
+                .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
             let address_range = decode_cstring(&mut cursor, 16, "address_range")?;
             SmppMessage::BindTransceiver(BindTransceiver {
                 system_id,
@@ -166,7 +207,9 @@ pub fn decode_message_with_version(
             let mut cursor = Cursor::new(body.as_slice());
             let system_id = decode_cstring(&mut cursor, 16, "system_id")?;
             let sc_interface_version = if cursor.remaining() > 0 {
-                cursor.get_u8()
+                cursor
+                    .try_get_u8()
+                    .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?
             } else {
                 0x34
             };
@@ -203,8 +246,12 @@ pub fn decode_message_with_version(
                 return Err(RsmsError::Codec("QuerySm body too short".to_string()));
             }
             let message_id = decode_cstring(&mut cursor, 65, "message_id")?;
-            let source_addr_ton = cursor.get_u8();
-            let source_addr_npi = cursor.get_u8();
+            let source_addr_ton = cursor
+                .try_get_u8()
+                .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+            let source_addr_npi = cursor
+                .try_get_u8()
+                .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
             let source_addr = decode_cstring(&mut cursor, 21, "source_addr")?;
             SmppMessage::QuerySm(QuerySm {
                 message_id,
@@ -219,7 +266,9 @@ pub fn decode_message_with_version(
                 return Err(RsmsError::Codec("QuerySmResp body too short".to_string()));
             }
             let message_id = decode_cstring(&mut cursor, 65, "message_id")?;
-            let message_state = cursor.get_u8();
+            let message_state = cursor
+                .try_get_u8()
+                .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
             let message_state_text = if cursor.remaining() > 0 {
                 Some(decode_cstring(&mut cursor, 20, "message_state_text")?)
             } else {
@@ -238,11 +287,19 @@ pub fn decode_message_with_version(
             }
             let service_type = decode_cstring(&mut cursor, 6, "service_type")?;
             let message_id = decode_cstring(&mut cursor, 65, "message_id")?;
-            let source_addr_ton = cursor.get_u8();
-            let source_addr_npi = cursor.get_u8();
+            let source_addr_ton = cursor
+                .try_get_u8()
+                .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+            let source_addr_npi = cursor
+                .try_get_u8()
+                .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
             let source_addr = decode_cstring(&mut cursor, 21, "source_addr")?;
-            let dest_addr_ton = cursor.get_u8();
-            let dest_addr_npi = cursor.get_u8();
+            let dest_addr_ton = cursor
+                .try_get_u8()
+                .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
+            let dest_addr_npi = cursor
+                .try_get_u8()
+                .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
             let destination_addr = decode_cstring(&mut cursor, 21, "destination_addr")?;
             SmppMessage::CancelSm(CancelSm {
                 service_type,
@@ -264,4 +321,51 @@ pub fn decode_message_with_version(
     };
 
     Ok(msg)
+}
+
+#[cfg(test)]
+mod fuzz_tests {
+    use super::*;
+
+    /// A truncated/short body on any body-carrying PDU must never panic the
+    /// decoder. We build a valid 16-byte SMPP header followed by N zero body
+    /// bytes (for N in 0..48), set command_length = 16 + N and the command_id,
+    /// then ensure `decode_message_with_version` returns (Ok or Err) without
+    /// panicking, for both SMPP v3.4 and v5.0.
+    #[test]
+    fn decode_message_short_body_never_panics() {
+        // Command ids that carry a body and run a real decode path.
+        let command_ids: &[u32] = &[
+            CommandId::BIND_TRANSMITTER as u32,
+            CommandId::BIND_TRANSMITTER_RESP as u32,
+            CommandId::BIND_RECEIVER as u32,
+            CommandId::BIND_RECEIVER_RESP as u32,
+            CommandId::BIND_TRANSCEIVER as u32,
+            CommandId::BIND_TRANSCEIVER_RESP as u32,
+            CommandId::SUBMIT_SM as u32,
+            CommandId::SUBMIT_SM_RESP as u32,
+            CommandId::DELIVER_SM as u32,
+            CommandId::DELIVER_SM_RESP as u32,
+            CommandId::DATA_SM as u32,
+        ];
+
+        for &cmd_id in command_ids {
+            for n in 0u32..48 {
+                let total_len = 16 + n;
+                let mut pdu = vec![0u8; total_len as usize];
+                // SMPP header is big-endian: length, id, status, sequence.
+                pdu[0..4].copy_from_slice(&total_len.to_be_bytes());
+                pdu[4..8].copy_from_slice(&cmd_id.to_be_bytes());
+                // command_status = 0 (already zero)
+                // sequence_number must be non-zero / non-0xFFFFFFFF for some
+                // paths; the live message decoder ignores it, but set a sane
+                // value anyway.
+                pdu[12..16].copy_from_slice(&1u32.to_be_bytes());
+
+                // Must not panic for either version. Result may be Ok or Err.
+                let _ = decode_message_with_version(&pdu, Some(SmppVersion::V34));
+                let _ = decode_message_with_version(&pdu, Some(SmppVersion::V50));
+            }
+        }
+    }
 }

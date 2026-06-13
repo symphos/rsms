@@ -413,11 +413,14 @@ impl AccountPool {
 ///
 /// When a connection fails to respond to heartbeats within the timeout,
 /// HealthChecker marks it as unhealthy and triggers reconnection via the callback.
+/// 连接不健康时的回调：(conn_id, 原因)
+type UnhealthyCallback = Arc<dyn Fn(u64, &str) + Send + Sync>;
+
 pub struct HealthChecker {
     account_pool: Arc<AccountPool>,
     check_interval: Duration,
     heartbeat_timeout: Duration,
-    on_unhealthy: Arc<dyn Fn(u64, &str) + Send + Sync>,
+    on_unhealthy: UnhealthyCallback,
 }
 
 impl HealthChecker {
@@ -425,7 +428,7 @@ impl HealthChecker {
         account_pool: Arc<AccountPool>,
         check_interval: Duration,
         heartbeat_timeout: Duration,
-        on_unhealthy: Arc<dyn Fn(u64, &str) + Send + Sync>,
+        on_unhealthy: UnhealthyCallback,
     ) -> Arc<Self> {
         Arc::new(Self {
             account_pool,
@@ -481,7 +484,7 @@ impl HealthChecker {
     async fn check_connections(
         account_pool: &Arc<AccountPool>,
         heartbeat_timeout: Duration,
-        on_unhealthy: &Arc<dyn Fn(u64, &str) + Send + Sync>,
+        on_unhealthy: &UnhealthyCallback,
     ) {
         let accounts = account_pool.all_accounts().await;
 
