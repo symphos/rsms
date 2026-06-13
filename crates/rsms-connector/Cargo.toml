@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "TCP endpoint connector, connection pool, fetch"
 
+[features]
+unified-shadow = []
+
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
@@ -14,6 +17,7 @@ rsms-codec-sgip = { path = "../rsms-codec-sgip" }
 rsms-codec-smgp = { path = "../rsms-codec-smgp" }
 rsms-codec-smpp = { path = "../rsms-codec-smpp" }
 rsms-core = { path = "../rsms-core" }
+rsms-model = { path = "../rsms-model" }
 rsms-ratelimit = { path = "../rsms-ratelimit" }
 rsms-session = { path = "../rsms-session" }
 rsms-window = { path = "../rsms-window" }

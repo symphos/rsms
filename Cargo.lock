@@ -371,6 +371,7 @@ dependencies = [
  "async-trait",
  "rsms-codec-cmpp",
  "rsms-core",
+ "rsms-model",
  "tracing",
 ]
 
@@ -403,6 +404,7 @@ dependencies = [
  "md-5",
  "num_enum",
  "rsms-core",
+ "rsms-model",
  "thiserror",
 ]
 
@@ -429,6 +431,7 @@ dependencies = [
  "rsms-codec-smgp",
  "rsms-codec-smpp",
  "rsms-core",
+ "rsms-model",
  "rsms-ratelimit",
  "rsms-session",
  "rsms-window",
@@ -455,6 +458,13 @@ dependencies = [
  "rsms-core",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "rsms-model"
+version = "0.0.1"
+dependencies = [
+ "rsms-core",
 ]
 
 [[package]]
@@ -505,6 +515,7 @@ dependencies = [
  "rsms-connector",
  "rsms-core",
  "rsms-longmsg",
+ "rsms-model",
  "rsms-session",
  "rsms-test-common",
  "tokio",

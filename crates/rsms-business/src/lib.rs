@@ -40,6 +40,24 @@ pub trait BusinessHandler: Send + Sync {
     /// 返回 `Ok(())` 表示处理成功，框架继续下一个处理器；
     /// 返回 `Err` 时框架中断处理链并记录错误（连接不会被强制断开）。
     async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()>;
+
+    /// 统一模型入站回调（窄腰试点）。默认空实现，旧实现者无需改动。
+    ///
+    /// 业务可选择覆盖此方法，以对协议无关的 [`rsms_model::UnifiedMessage`] 编程，
+    /// 而无需直接解析原始帧。与 [`on_inbound`](Self::on_inbound) 并存——框架不自动
+    /// 调用此方法，需由适配层或业务自行在 `on_inbound` 中触发。
+    ///
+    /// # 参数
+    /// - `ctx`：当前连接的上下文（与 `on_inbound` 相同）。
+    /// - `msg`：已解码的协议无关统一消息。
+    #[allow(unused_variables)]
+    async fn on_message(
+        &self,
+        ctx: &InboundContext,
+        msg: &rsms_model::UnifiedMessage,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub struct NoopBusiness;

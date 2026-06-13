@@ -9,4 +9,5 @@ description = "Business handler trait and chain"
 async-trait.workspace = true
 rsms-codec-cmpp = { path = "../rsms-codec-cmpp" }
 rsms-core = { path = "../rsms-core" }
+rsms-model = { path = "../rsms-model" }
 tracing.workspace = true

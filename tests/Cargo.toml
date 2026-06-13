@@ -54,6 +54,10 @@ path = "cmpp/network_fault_test.rs"
 
 # SMGP
 [[test]]
+name = "smgp-unified-pilot-test"
+path = "smgp/unified_pilot_test.rs"
+
+[[test]]
 name = "smgp-integration"
 path = "smgp/integration.rs"
 
@@ -124,6 +128,7 @@ bytes.workspace = true
 dashmap.workspace = true
 
 rsms-core = { path = "../crates/rsms-core" }
+rsms-model = { path = "../crates/rsms-model" }
 rsms-connector = { path = "../crates/rsms-connector" }
 rsms-business = { path = "../crates/rsms-business" }
 rsms-session = { path = "../crates/rsms-session" }

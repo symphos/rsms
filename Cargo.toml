@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/rsms-core",
+    "crates/rsms-model",
     "crates/rsms-codec-cmpp",
     "crates/rsms-session",
     "crates/rsms-business",
