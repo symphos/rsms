@@ -25,7 +25,9 @@ impl Encodable for Login {
                 reason: "exceeds 8 bytes".to_string(),
             });
         }
-        let mut id_buf = [b' '; 8];
+        // SMGP ClientID 为 8 字节定长，**以 0x00 右补齐**（非空格）——参考实现（cmos）
+        // 解码时按 0x00 右截断，用空格补齐会导致登录名匹配失败（2026-06-13 联调验证）。
+        let mut id_buf = [0u8; 8];
         let bytes = self.client_id.as_bytes();
         id_buf[..bytes.len()].copy_from_slice(bytes);
         buf.put_slice(&id_buf);
@@ -56,7 +58,9 @@ impl Decodable for Login {
         let mut client_id_buf = [0u8; 8];
         buf.try_copy_to_slice(&mut client_id_buf)
             .map_err(|_| CodecError::Incomplete)?;
-        let client_id = String::from_utf8_lossy(&client_id_buf).trim().to_string();
+        let client_id = String::from_utf8_lossy(&client_id_buf)
+            .trim_end_matches(['\0', ' '])
+            .to_string();
         let mut authenticator = [0u8; 16];
         buf.try_copy_to_slice(&mut authenticator)
             .map_err(|_| CodecError::Incomplete)?;
