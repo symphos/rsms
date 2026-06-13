@@ -4,7 +4,7 @@ use rsms_codec_cmpp::CommandId as CmppCommandId;
 use rsms_codec_sgip::CommandId as SgipCommandId;
 use rsms_codec_smgp::CommandId as SmgpCommandId;
 use rsms_codec_smpp::CommandId as SmppCommandId;
-use rsms_core::{ConnectionInfo, RawPdu, Frame, Result, SessionState};
+use rsms_core::{ConnectionInfo, Protocol, RawPdu, Frame, Result, SessionState};
 use rsms_session::ConnectionContext;
 use rsms_window::{Window, WindowConfig};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -119,7 +119,7 @@ impl Connection {
             let ctx = self.ctx.lock().await;
             ctx.mark_disconnected();
         }
-        if let Some(close_pkt) = encode_close_packet(&self.config.protocol) {
+        if let Some(close_pkt) = encode_close_packet(self.config.protocol) {
             let _ = self.write_frame(&close_pkt).await;
         }
         {
@@ -319,7 +319,7 @@ pub async fn run_connection(
     account_pool: Option<Arc<AccountPool>>,
     account_config_provider: Option<Arc<dyn AccountConfigProvider>>,
     auth_handler: Option<Arc<dyn crate::protocol::AuthHandler>>,
-    protocol: &str,
+    protocol: Protocol,
     event_handler: Option<Arc<dyn ServerEventHandler>>,
 ) {
     let mut read = read;
@@ -368,18 +368,14 @@ pub async fn run_connection(
             let conn_arc = conn.clone();
             
             let handle_result = match protocol {
-                "cmpp" => cmpp_handler.handle_frame(&frame, conn_arc.clone()).await,
-                "smgp" => smgp_handler.handle_frame(&frame, conn_arc.clone()).await,
-                "sgip" => sgip_handler.handle_frame(&frame, conn_arc.clone()).await,
-                "smpp" => smpp_handler.handle_frame(&frame, conn_arc.clone()).await,
-                _ => {
-                    tracing::warn!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), protocol, "unknown protocol");
-                    Ok(HandleResult::Stop)
-                }
+                Protocol::Cmpp => cmpp_handler.handle_frame(&frame, conn_arc.clone()).await,
+                Protocol::Smgp => smgp_handler.handle_frame(&frame, conn_arc.clone()).await,
+                Protocol::Sgip => sgip_handler.handle_frame(&frame, conn_arc.clone()).await,
+                Protocol::Smpp => smpp_handler.handle_frame(&frame, conn_arc.clone()).await,
             };
             
             if let Err(e) = handle_result {
-                error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), protocol, "handler error: {}", e);
+                error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), protocol = %protocol, "handler error: {}", e);
                 continue;
             }
             
@@ -439,13 +435,10 @@ pub async fn run_connection(
     }
 }
 
-fn decode_frames_drain(buf: &mut Vec<u8>, protocol: &str) -> Result<Vec<Frame>> {
+fn decode_frames_drain(buf: &mut Vec<u8>, protocol: Protocol) -> Result<Vec<Frame>> {
     let mut frames = Vec::new();
-    
-    let seq_offset = match protocol {
-        "smpp" | "sgip" => 12,
-        _ => 8,
-    };
+
+    let seq_offset = protocol.seq_offset();
     
     // 用读游标 off 解析，循环结束后一次性 drain 已消费部分，
     // 避免每帧 drain(..total) 触发的 O(N·buflen) 缓冲区搬移。
@@ -487,46 +480,45 @@ fn decode_frames_drain(buf: &mut Vec<u8>, protocol: &str) -> Result<Vec<Frame>> 
     Ok(frames)
 }
 
-fn encode_close_packet(protocol: &str) -> Option<Vec<u8>> {
+fn encode_close_packet(protocol: Protocol) -> Option<Vec<u8>> {
     let command_id: u32;
     let header_len: usize;
     let body_len: usize;
     match protocol {
-        "cmpp" => {
+        Protocol::Cmpp => {
             command_id = CmppCommandId::Terminate as u32;
             header_len = 12;
             body_len = 0;
         }
-        "smgp" => {
+        Protocol::Smgp => {
             command_id = SmgpCommandId::Exit as u32;
             header_len = 12;
             body_len = 1;
         }
-        "sgip" => {
+        Protocol::Sgip => {
             command_id = SgipCommandId::Unbind as u32;
             header_len = 20;
             body_len = 0;
         }
-        "smpp" => {
+        Protocol::Smpp => {
             command_id = SmppCommandId::UNBIND as u32;
             header_len = 16;
             body_len = 0;
         }
-        _ => return None,
     };
 
     let total_len = header_len + body_len;
     let mut pdu = Vec::with_capacity(total_len);
     pdu.extend_from_slice(&(total_len as u32).to_be_bytes());
     pdu.extend_from_slice(&command_id.to_be_bytes());
-    if protocol == "smpp" {
+    if protocol == Protocol::Smpp {
         pdu.extend_from_slice(&[0u8; 4]);
     }
     pdu.extend_from_slice(&[0u8; 4]);
-    if protocol == "sgip" {
+    if protocol == Protocol::Sgip {
         pdu.extend_from_slice(&[0u8; 8]);
     }
-    if protocol == "smgp" {
+    if protocol == Protocol::Smgp {
         pdu.extend_from_slice(&[0u8; 1]);
     }
     Some(pdu)

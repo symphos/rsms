@@ -80,14 +80,14 @@ Header lengths differ, which directly affects where `sequence_id` is parsed:
 | Heartbeat | ActiveTest | ActiveTest | EnquireLink | none |
 | MsgId | 8B binary `[u8;8]` | 10B custom | C-string (`String`) | SgipSequence |
 
-- **`sequence_id` offset:** CMPP/SMGP at bytes 8–11; SMPP/SGIP at bytes 12–15. Both `send_request` (client) and `decode_frames_drain` (server) select the offset by `endpoint.protocol` (`"smpp"`/`"sgip"` → 12, else → 8). **SMPP clients MUST set `.with_protocol("smpp")`** on `EndpointConfig`, or the offset (and protocol) defaults to `"cmpp"` and sequence extraction breaks.
+- **`sequence_id` offset:** CMPP/SMGP at bytes 8–11; SMPP/SGIP at bytes 12–15. Both `send_request` (client) and `decode_frames_drain` (server) derive the offset from `endpoint.protocol.seq_offset()` (`Protocol::Smpp`/`Protocol::Sgip` → 12, else → 8). **SMPP clients MUST set `.with_protocol(Protocol::Smpp)`** on `EndpointConfig`, or the protocol defaults to `Protocol::Cmpp` and sequence extraction breaks. (`protocol` is now the enum `rsms_core::Protocol`, not a string, so typos/omissions fail at compile time instead of silently degrading.)
 - **Partial PDUs across reads:** the server accumulates into a `Vec<u8>` buffer and consumes via the drain pattern (`decode_frames_drain`); a single read may not contain a whole PDU.
 - **Handlers must return `Continue`** for ActiveTest/EnquireLink (returning `Stop` drops the connection).
 - SMPP version differences (V3.4 vs V5.0) are only field-length limits, not different PDU structs.
 
 ### Switching protocol in user code (3 changes)
 
-`.with_protocol("cmpp"|"smgp"|"smpp"|"sgip")`, swap the `Decoder` (`CmppDecoder` / `SmgpDecoder` / `SmppDecoder` / `SgipDecoder`), and import codec types from the matching `rsms-codec-*` crate.
+`.with_protocol(Protocol::Cmpp | Protocol::Smgp | Protocol::Smpp | Protocol::Sgip)` (with `use rsms_core::Protocol;` or `use rsms_connector::Protocol;`), swap the `Decoder` (`CmppDecoder` / `SmgpDecoder` / `SmppDecoder` / `SgipDecoder`), and import codec types from the matching `rsms-codec-*` crate.
 
 ## Graceful shutdown for zero message loss
 

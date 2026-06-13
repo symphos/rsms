@@ -55,11 +55,12 @@ let bind = BindTransmitter::new(system_id, password, system_type, interface_vers
 
 ### EndpointConfig 必须设置 protocol
 
-客户端的 `EndpointConfig` 必须加 `.with_protocol("smpp")`，否则框架会用 CMPP 的偏移量（bytes 8-11）提取 sequence_id，导致请求/响应匹配失败：
+客户端的 `EndpointConfig` 必须加 `.with_protocol(Protocol::Smpp)`，否则框架会用 CMPP 的偏移量（bytes 8-11）提取 sequence_id，导致请求/响应匹配失败：
 
 ```rust
+use rsms_core::Protocol;
 EndpointConfig::new(ACCOUNT, host, port, 100, 60)
-    .with_protocol("smpp")  // 必须设置！sequence_id 在 bytes 12-15
+    .with_protocol(Protocol::Smpp)  // 必须设置！sequence_id 在 bytes 12-15
 ```
 
 ### Report 判断方式

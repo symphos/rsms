@@ -30,6 +30,7 @@ pub use handlers::smpp::SmppHandler;
 pub use pool::{ConnectionPool, AccountPool, AccountConnections};
 pub use id_generator::SimpleIdGenerator;
 pub use rsms_core::IdGenerator;
+pub use rsms_core::Protocol;
 pub use protocol::{
     ProtocolHandler, ProtocolConnection, AuthHandler, AuthCredentials, AuthResult,
     AccountConfig, AccountPoolConfig, AccountConfigProvider,

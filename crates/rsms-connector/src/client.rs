@@ -10,7 +10,7 @@ use rsms_codec_cmpp::CommandId as CmppCommandId;
 use rsms_codec_sgip::CommandId as SgipCommandId;
 use rsms_codec_smgp::CommandId as SmgpCommandId;
 use rsms_codec_smpp::CommandId as SmppCommandId;
-use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Frame, Result, RsmsError, SessionState};
+use rsms_core::{ConnectionInfo, Protocol, RawPdu, EndpointConfig, Frame, Result, RsmsError, SessionState};
 use rsms_session::ConnectionContext;
 use rsms_window::{Window, WindowConfig};
 use std::collections::{HashMap, VecDeque};
@@ -396,10 +396,7 @@ impl ClientConnection {
         
         let window = self.window.as_ref().ok_or_else(|| RsmsError::Codec("Window not initialized".to_string()))?;
         
-        let seq_offset = match self.endpoint.protocol.as_str() {
-            "smpp" | "sgip" => 12,
-            _ => 8,
-        };
+        let seq_offset = self.endpoint.protocol.seq_offset();
         let sequence_id = if pdu_slice.len() >= seq_offset + 4 {
             u32::from_be_bytes([pdu_slice[seq_offset], pdu_slice[seq_offset + 1], pdu_slice[seq_offset + 2], pdu_slice[seq_offset + 3]])
         } else {
@@ -591,7 +588,7 @@ impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
     });
 
     // 启动 keepalive 任务
-    let protocol = endpoint.protocol.clone();
+    let protocol = endpoint.protocol;
     let idle_timeout = endpoint.idle_time_sec as u32;
     start_keepalive_task(Arc::clone(&conn), protocol, idle_timeout);
 
@@ -609,13 +606,12 @@ impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
     }
 }
 
-fn create_decoder(protocol: &str) -> Box<dyn FrameDecoder + Send + Sync> {
+fn create_decoder(protocol: Protocol) -> Box<dyn FrameDecoder + Send + Sync> {
     match protocol {
-        "cmpp" => Box::new(CmppDecoder),
-        "sgip" => Box::new(SgipDecoder),
-        "smgp" => Box::new(SmgpDecoder),
-        "smpp" => Box::new(SmppDecoder),
-        _ => Box::new(CmppDecoder),
+        Protocol::Cmpp => Box::new(CmppDecoder),
+        Protocol::Sgip => Box::new(SgipDecoder),
+        Protocol::Smgp => Box::new(SmgpDecoder),
+        Protocol::Smpp => Box::new(SmppDecoder),
     }
 }
 
@@ -629,7 +625,7 @@ pub(crate) async fn connect_with_pool(
     event_handler: Option<Arc<dyn ClientEventHandler>>,
     event_tx: mpsc::Sender<ConnectionEvent>,
 ) -> Result<Arc<ClientConnection>> {
-    let decoder: Arc<tokio::sync::Mutex<Box<dyn FrameDecoder>>> = Arc::new(tokio::sync::Mutex::new(create_decoder(&endpoint.protocol)));
+    let decoder: Arc<tokio::sync::Mutex<Box<dyn FrameDecoder>>> = Arc::new(tokio::sync::Mutex::new(create_decoder(endpoint.protocol)));
     let decoder_for_conn = Arc::clone(&decoder);
     let config = client_config.unwrap_or_default();
     let conn = ClientConnection::new(stream, endpoint.clone(), config, decoder_for_conn).await;
@@ -652,7 +648,7 @@ pub(crate) async fn connect_with_pool(
     });
 
     // 启动 keepalive 任务
-    let protocol = endpoint.protocol.clone();
+    let protocol = endpoint.protocol;
     let idle_timeout = endpoint.idle_time_sec as u32;
     start_keepalive_task(Arc::clone(&conn), protocol, idle_timeout);
 
@@ -741,10 +737,7 @@ async fn run_client_read_loop(
                 tokio::spawn(async move {
                     while let Some(pending_pdu) = conn_clone.pop_pending().await {
                         let pdu_slice = pending_pdu.as_bytes_ref();
-                        let seq_off = match conn_clone.endpoint.protocol.as_str() {
-                            "smpp" | "sgip" => 12,
-                            _ => 8,
-                        };
+                        let seq_off = conn_clone.endpoint.protocol.seq_offset();
                         if pdu_slice.len() >= seq_off + 4 {
                             let seq_id = u32::from_be_bytes([pdu_slice[seq_off], pdu_slice[seq_off + 1], pdu_slice[seq_off + 2], pdu_slice[seq_off + 3]]);
                             if let Some(window) = conn_clone.window.as_ref()
@@ -859,7 +852,7 @@ async fn run_outbound_fetcher(
 }
 
 /// 启动客户端 keepalive 任务
-fn start_keepalive_task(conn: Arc<ClientConnection>, protocol: String, idle_timeout: u32) {
+fn start_keepalive_task(conn: Arc<ClientConnection>, protocol: Protocol, idle_timeout: u32) {
     let keepalive_interval = Duration::from_secs(idle_timeout as u64 / 2);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(keepalive_interval);
@@ -873,7 +866,7 @@ fn start_keepalive_task(conn: Arc<ClientConnection>, protocol: String, idle_time
             
             let elapsed = conn.last_sent_elapsed();
             if elapsed >= keepalive_interval {
-                if let Err(e) = send_keepalive_packet(&conn, &protocol).await {
+                if let Err(e) = send_keepalive_packet(&conn, protocol).await {
                     error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), protocol = %protocol, "keepalive failed: {}", e);
                 } else {
                     tracing::debug!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), protocol = %protocol, "keepalive sent");
@@ -886,13 +879,12 @@ fn start_keepalive_task(conn: Arc<ClientConnection>, protocol: String, idle_time
 }
 
 /// 发送保活报文
-async fn send_keepalive_packet(conn: &Arc<ClientConnection>, protocol: &str) -> Result<()> {
+async fn send_keepalive_packet(conn: &Arc<ClientConnection>, protocol: Protocol) -> Result<()> {
     let pdu = match protocol {
-        "sgip" => build_sgip_keepalive_pdu(),
-        "smgp" => build_smgp_active_test_pdu(),
-        "smpp" => build_smpp_enquire_link_pdu(),
-        "cmpp" => build_cmpp_active_test_pdu(),
-        _ => return Err(RsmsError::Other(format!("unsupported protocol: {}", protocol))),
+        Protocol::Sgip => build_sgip_keepalive_pdu(),
+        Protocol::Smgp => build_smgp_active_test_pdu(),
+        Protocol::Smpp => build_smpp_enquire_link_pdu(),
+        Protocol::Cmpp => build_cmpp_active_test_pdu(),
     };
     
     conn.write_frame(&pdu).await?;

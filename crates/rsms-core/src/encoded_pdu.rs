@@ -60,6 +60,11 @@ impl EncodedPdu for RawPdu {
         &self.data
     }
 
+    /// 返回 sequence_id，**假定 12 字节头协议（CMPP/SMGP，偏移 8–11）**。
+    ///
+    /// ⚠️ SMPP（16B 头）/SGIP（20B 头）的 sequence_id 在偏移 12–15，本方法对它们返回错误值。
+    /// 连接层并不依赖此方法——帧解析按 [`crate::Protocol::seq_offset`] 计算偏移。请仅在确知
+    /// 为 CMPP/SMGP 的 `RawPdu` 上使用；其它协议应自行按 `Protocol::seq_offset()` 提取。
     fn sequence_id(&self) -> Option<u32> {
         if self.data.len() >= 12 {
             Some(u32::from_be_bytes([

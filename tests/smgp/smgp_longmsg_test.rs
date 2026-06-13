@@ -10,7 +10,7 @@ use rsms_connector::{
     AuthResult, SmgpDecoder,
 };
 use rsms_connector::client::{ClientConfig, ClientConnection, ClientContext, ClientHandler};
-use rsms_core::{ConnectionInfo, Frame, RawPdu, EndpointConfig, Result};
+use rsms_core::{ConnectionInfo, Frame, RawPdu, EndpointConfig, Protocol, Result};
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
 use rsms_longmsg::split::SmsAlphabet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -208,7 +208,7 @@ impl ClientHandler for LongMsgClientHandler {
 async fn start_server(
     biz_handler: Arc<dyn BusinessHandler>,
 ) -> Result<(u16, Arc<rsms_connector::ConnectionPool>, tokio::task::JoinHandle<()>)> {
-    let cfg = Arc::new(EndpointConfig::new("test-server", "127.0.0.1", 0, 8, 30).with_protocol("smgp"));
+    let cfg = Arc::new(EndpointConfig::new("test-server", "127.0.0.1", 0, 8, 30).with_protocol(Protocol::Smgp));
     let server = ServerBuilder::new(cfg)
         .handlers(vec![biz_handler])
         .auth_handler(Arc::new(PasswordAuthHandler))

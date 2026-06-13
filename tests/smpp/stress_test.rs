@@ -6,7 +6,7 @@ use rsms_connector::{
     protocol::MessageSource,
 };
 use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler};
-use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Frame, Result};
+use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Protocol, Frame, Result};
 use rsms_codec_smpp::{
     decode_message, SmppMessage, Pdu,
     CommandId, SubmitSm, SubmitSmResp, DeliverSm, DeliverSmResp,
@@ -351,7 +351,7 @@ async fn start_test_server(
         0,
         500,
         60,
-    ).with_protocol("smpp").with_log_level(tracing::Level::WARN));
+    ).with_protocol(Protocol::Smpp).with_log_level(tracing::Level::WARN));
     let auth = Arc::new(PasswordAuthHandler::new().add_account(STRESS_TEST_SYSTEM_ID, STRESS_TEST_PASSWORD));
     let server = ServerBuilder::new(cfg)
         .handlers(vec![biz_handler])
@@ -624,7 +624,7 @@ async fn run_stress_test(version: u8, num_connections: usize) {
             port,
             if num_connections == 1 { 1024 } else { 2048 },
             30,
-        ).with_window_size(2048).with_protocol("smpp").with_log_level(tracing::Level::WARN));
+        ).with_window_size(2048).with_protocol(Protocol::Smpp).with_log_level(tracing::Level::WARN));
 
         let mut conn = None;
         for retry in 0..50 {

@@ -142,8 +142,9 @@ Exit 包有 1 字节 `reserve` body（总长 21 字节，比其他协议多 1 �
 参考：`examples/smgp-endpoint/src/server.rs`
 
 ```rust
+use rsms_core::Protocol;
 let config = Arc::new(EndpointConfig::new("smgp-gateway", "0.0.0.0", 7892, 500, 60)
-    .with_protocol("smgp"));
+    .with_protocol(Protocol::Smgp));
 
 let server = ServerBuilder::new(config)
     .handler(Arc::new(MyBizHandler))
@@ -157,7 +158,7 @@ let server = ServerBuilder::new(config)
 
 ```rust
 let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 500, 60)
-    .with_protocol("smgp"));
+    .with_protocol(Protocol::Smgp));
 
 let conn = ClientBuilder::new(endpoint, Arc::new(MyClientHandler), SmgpDecoder)
     .client_config(ClientConfig::default())

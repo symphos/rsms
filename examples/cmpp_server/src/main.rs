@@ -26,7 +26,7 @@ use rsms_connector::{
     ServerEventHandler, ProtocolConnection,
     SimpleIdGenerator,
 };
-use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Frame, IdGenerator, RawPdu, Result};
+use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Protocol, Frame, IdGenerator, RawPdu, Result};
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
 use std::collections::{HashMap, VecDeque};
@@ -513,7 +513,7 @@ async fn main() -> Result<()> {
 
     let config = Arc::new(
         EndpointConfig::new("cmpp-gateway", "0.0.0.0", 7890, 500, 60)
-            .with_protocol("cmpp")
+            .with_protocol(Protocol::Cmpp)
             .with_log_level(tracing::Level::INFO),
     );
 

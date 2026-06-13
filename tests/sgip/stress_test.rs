@@ -6,7 +6,7 @@ use rsms_connector::{
     protocol::MessageSource,
 };
 use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler};
-use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Frame, Result};
+use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Frame, Result};
 use rsms_codec_sgip::{
     decode_message, SgipMessage,
     CommandId, Submit, SubmitResp, Deliver, DeliverResp, Report, ReportResp,
@@ -369,7 +369,7 @@ async fn start_test_server(
         0,
         500,
         60,
-    ).with_protocol("sgip").with_log_level(tracing::Level::WARN));
+    ).with_protocol(Protocol::Sgip).with_log_level(tracing::Level::WARN));
     let auth = Arc::new(PasswordAuthHandler::new().add_account(STRESS_TEST_ACCOUNT, STRESS_TEST_PASSWORD));
     let server = ServerBuilder::new(cfg)
         .handlers(vec![biz_handler])
@@ -641,7 +641,7 @@ async fn run_stress_test(num_connections: usize) {
             port,
             if num_connections == 1 { 1024 } else { 2048 },
             30,
-        ).with_window_size(2048).with_protocol("sgip").with_log_level(tracing::Level::WARN));
+        ).with_window_size(2048).with_protocol(Protocol::Sgip).with_log_level(tracing::Level::WARN));
 
         let mut conn = None;
         for retry in 0..50 {

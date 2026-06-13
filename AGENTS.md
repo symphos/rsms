@@ -35,7 +35,7 @@
 - SGIP 压测参数：同 CMPP，SGIP 有独立的 Report 命令（非 Deliver 承载）
 - **压测 MT 发送使用 MessageSource.fetch() 框架机制**：mt_producer_task 按 rate push PDU 到队列 → connect() 传入 MessageSource → 框架 `run_outbound_fetcher` 自动 fetch + write_frame
 - `run_outbound_fetcher` 已改为 `write_frame`（不走 window），批量 fetch 16 条
-- **SMPP 客户端 EndpointConfig 必须加 `.with_protocol("smpp")`**，否则 sequence_id 提取位置错误
+- **SMPP 客户端 EndpointConfig 必须加 `.with_protocol(Protocol::Smpp)`**，否则 sequence_id 提取位置错误
 - **MessageSource push/fetch 的 key 必须和 endpoint ID 一致**（`run_outbound_fetcher` 用 `conn.authenticated_account()` 返回的是 endpoint.id）
 - **长短信支持**：`MessageSource` 支持 `push_group` 推送分段组，框架保证同组帧走同一连接顺序发出
 - `MessageItem::Single(Vec<u8>)` 用于普通短消息，`MessageItem::Group { items: Vec<Vec<u8>> }` 用于长短信分段
@@ -78,9 +78,9 @@
 
 ### 9. ~~SMPP 多账号压测 MT TPS 骤降问题~~ **已解决**
 - **根因 1**：`send_request` 中 sequence_id 提取偏移量硬编码为 bytes 8-11（CMPP 格式），SMPP 应为 bytes 12-15
-  - 修复：根据 `endpoint.protocol` 动态选择偏移量（"smpp"/"sgip" → 12，其他 → 8）
+  - 修复：根据 `endpoint.protocol.seq_offset()` 动态选择偏移量（`Protocol::Smpp`/`Protocol::Sgip` → 12，其他 → 8）
   - 影响：所有 SMPP/SGIP 客户端的 `send_request` 和 read loop 中的 pending queue 处理
-- **根因 2**：SMPP 客户端 `EndpointConfig` 缺少 `.with_protocol("smpp")`，导致 protocol 默认为 "cmpp"
+- **根因 2**：SMPP 客户端 `EndpointConfig` 缺少 `.with_protocol(Protocol::Smpp)`，导致 protocol 默认为 `Protocol::Cmpp`
   - 即使 `send_request` 修复了偏移量，如果不设 protocol，仍然会用错误的偏移量
 - **根因 3**：`send_request` 的 window 机制在高并发+高 DeliverSm 负载下成为瓶颈
   - read loop 处理大量 DeliverSm（Report+MO）时，SubmitSmResp 的 window.complete 被延迟

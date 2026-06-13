@@ -173,12 +173,12 @@ impl BoundServer {
             let auth_handler_clone = self.auth_handler.clone();
             let event_handler_clone = self.event_handler.clone();
             let id = conn.id;
-            let protocol = self.config.protocol.clone();
+            let protocol = self.config.protocol;
 
             tokio::spawn(async move {
                 conn.mark_ready().await;
                 pool2.add(Arc::clone(&conn)).await;
-                run_connection(read, Arc::clone(&conn), h, Some(account_pool2), account_config_provider, auth_handler_clone, &protocol, event_handler_clone).await;
+                run_connection(read, Arc::clone(&conn), h, Some(account_pool2), account_config_provider, auth_handler_clone, protocol, event_handler_clone).await;
                 pool2.remove(id).await;
             });
         }

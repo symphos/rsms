@@ -5,7 +5,7 @@ use rsms_connector::{
     AccountPool,
 };
 use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler, ClientConnection};
-use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Frame, Result};
+use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Frame, Result};
 use rsms_codec_smgp::{
     decode_message, SmgpMessage, Pdu, CommandId, Login,
     compute_login_auth,
@@ -135,7 +135,7 @@ async fn start_server(
         0,
         500,
         60,
-    ).with_protocol("smgp"));
+    ).with_protocol(Protocol::Smgp));
     let auth = Arc::new(PasswordAuthHandler::new().add_account(TEST_ACCOUNT, TEST_PASSWORD));
     let server = rsms_connector::ServerBuilder::new(cfg)
         .handlers(vec![])
@@ -159,7 +159,7 @@ async fn create_connections(port: u16, count: usize) -> Vec<Arc<ClientConnection
             port,
             500,
             60,
-        ).with_protocol("smgp"));
+        ).with_protocol(Protocol::Smgp));
 
         let client_handler = Arc::new(TestClientHandler::new());
         let conn = ClientBuilder::new(endpoint, client_handler, SmgpDecoder)

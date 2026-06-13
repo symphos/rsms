@@ -22,7 +22,7 @@ Offset  Length  Field
 12      4       Sequence_Number
 ```
 
-> **关键差异**：SMPP Header 多了 4 字节 `Command_Status`，因此 sequence_id 在 bytes 12-15（而非 CMPP/SMGP 的 bytes 8-11）。客户端 `EndpointConfig` 必须加 `.with_protocol("smpp")`，否则 sequence_id 提取位置错误。
+> **关键差异**：SMPP Header 多了 4 字节 `Command_Status`，因此 sequence_id 在 bytes 12-15（而非 CMPP/SMGP 的 bytes 8-11）。客户端 `EndpointConfig` 必须加 `.with_protocol(Protocol::Smpp)`，否则 sequence_id 提取位置错误。
 
 ## 认证方式
 
@@ -156,8 +156,9 @@ let message = decode_message_with_version(pdu, Some(version))?;
 参考：`examples/smpp-endpoint/src/server.rs`
 
 ```rust
+use rsms_core::Protocol;
 let config = Arc::new(EndpointConfig::new("smpp-gateway", "0.0.0.0", 7893, 500, 60)
-    .with_protocol("smpp"));   // 必须设置！
+    .with_protocol(Protocol::Smpp));   // 必须设置！
 
 let server = ServerBuilder::new(config)
     .handler(Arc::new(MyBizHandler))
@@ -171,7 +172,7 @@ let server = ServerBuilder::new(config)
 
 ```rust
 let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 500, 60)
-    .with_protocol("smpp"));   // 必须设置！
+    .with_protocol(Protocol::Smpp));   // 必须设置！
 
 let conn = ClientBuilder::new(endpoint, Arc::new(MyClientHandler), SmppDecoder)
     .client_config(ClientConfig::default())

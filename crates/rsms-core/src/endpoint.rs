@@ -1,3 +1,5 @@
+use crate::Protocol;
+
 /// 端点配置，对齐 SMSGate `EndpointEntity` 的核心字段子集（监听地址、连接上限、空闲时间等）。
 #[derive(Debug, Clone)]
 pub struct EndpointConfig {
@@ -14,8 +16,8 @@ pub struct EndpointConfig {
     pub reconnect_interval_sec: u16,
     /// 滑窗大小，控制单个连接的并发请求数
     pub window_size: u16,
-    /// 协议类型: "cmpp", "smgp", "sgip", "smpp"
-    pub protocol: String,
+    /// 协议类型，决定 PDU 头长与 sequence_id 偏移
+    pub protocol: Protocol,
     /// 请求超时时间（秒），用于滑窗内未匹配响应的超时检测
     pub timeout: std::time::Duration,
     /// 框架日志级别，`None` 表示使用全局默认，`Some(Level)` 表示框架只输出该级别及以上的日志
@@ -38,7 +40,7 @@ impl EndpointConfig {
             idle_time_sec,
             reconnect_interval_sec: 5,
             window_size: 16,
-            protocol: "cmpp".to_string(),
+            protocol: Protocol::Cmpp,
             timeout: std::time::Duration::from_secs(5),
             log_level: None,
         }
@@ -49,8 +51,8 @@ impl EndpointConfig {
         self
     }
 
-    pub fn with_protocol(mut self, protocol: impl Into<String>) -> Self {
-        self.protocol = protocol.into();
+    pub fn with_protocol(mut self, protocol: Protocol) -> Self {
+        self.protocol = protocol;
         self
     }
 

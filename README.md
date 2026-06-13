@@ -33,7 +33,7 @@ rsms-codec-cmpp = { path = "crates/rsms-codec-cmpp" }
 ```rust
 use rsms_connector::{ServerBuilder, AuthHandler, AuthCredentials, AuthResult};
 use rsms_business::BusinessHandler;
-use rsms_core::{EndpointConfig, Frame, Result};
+use rsms_core::{EndpointConfig, Frame, Protocol, Result};
 
 struct MyAuth;
 #[async_trait]
@@ -59,7 +59,7 @@ impl BusinessHandler for MyBiz {
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Arc::new(EndpointConfig::new("gateway", "0.0.0.0", 7890, 500, 60)
-        .with_protocol("cmpp")
+        .with_protocol(Protocol::Cmpp)
         .with_log_level(tracing::Level::WARN));
 
     let server = ServerBuilder::new(config)
@@ -106,8 +106,8 @@ async fn main() -> Result<()> {
 只需改 3 处：
 
 ```rust
-// 1. protocol
-.with_protocol("smpp")    // "cmpp" | "smgp" | "smpp" | "sgip"
+// 1. protocol（需 use rsms_core::Protocol; 或 use rsms_connector::Protocol;）
+.with_protocol(Protocol::Smpp)    // Protocol::Cmpp | Smgp | Smpp | Sgip
 
 // 2. Decoder
 SmppDecoder                // CmppDecoder | SmgpDecoder | SmppDecoder | SgipDecoder

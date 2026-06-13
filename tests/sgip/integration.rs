@@ -4,7 +4,7 @@ use rsms_connector::{AuthHandler, AuthCredentials, AuthResult, ServerEventHandle
 use rsms_test_common::{TestEventHandler, TestClientEventHandler, MockAccountConfigProvider};
 use rsms_business::BusinessHandler;
 use rsms_business::InboundContext;
-use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Frame, Result};
+use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Frame, Result};
 use rsms_codec_sgip::Encodable;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -382,7 +382,7 @@ pub async fn start_test_server(
         0,
         8,
         idle_timeout_secs as u16,
-    ).with_protocol("sgip"));
+    ).with_protocol(Protocol::Sgip));
     let server = ServerBuilder::new(cfg)
         .handlers(vec![biz_handler])
         .auth_handler(auth_handler)
@@ -411,7 +411,7 @@ pub async fn start_test_server_with_pool(
         0,
         8,
         idle_timeout_secs as u16,
-    ).with_protocol("sgip"));
+    ).with_protocol(Protocol::Sgip));
     let server = ServerBuilder::new(cfg)
         .handlers(vec![biz_handler])
         .auth_handler(auth_handler)

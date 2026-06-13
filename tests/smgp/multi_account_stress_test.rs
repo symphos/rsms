@@ -6,7 +6,7 @@ use rsms_connector::{
     protocol::MessageSource,
 };
 use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler};
-use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Frame, Result};
+use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Protocol, Frame, Result};
 use rsms_codec_smgp::{
     decode_message, SmgpMessage, Pdu,
     CommandId, Login, SmgpMsgId, Submit, SubmitResp, Deliver, DeliverResp,
@@ -294,7 +294,7 @@ async fn start_test_server(
         0,
         500,
         60,
-    ).with_protocol("smgp").with_log_level(tracing::Level::WARN));
+    ).with_protocol(Protocol::Smgp).with_log_level(tracing::Level::WARN));
     let mut auth = PasswordAuthHandler::new();
     for cred in &ACCOUNTS {
         auth = auth.add_account(cred.client_id, cred.password);

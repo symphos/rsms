@@ -10,7 +10,7 @@ use rsms_connector::{
     ServerBuilder, AccountConfig, AccountConfigProvider, AccountPoolConfig, AuthCredentials,
     AuthHandler, AuthResult, MessageItem, MessageSource, ProtocolConnection, ServerEventHandler,
 };
-use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Frame, RawPdu, Result};
+use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Protocol, Frame, RawPdu, Result};
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
 use std::collections::{HashMap, VecDeque};
@@ -480,7 +480,7 @@ async fn main() -> Result<()> {
 
     let config = Arc::new(
         EndpointConfig::new("smgp-gateway", "0.0.0.0", 8890, 500, 60)
-            .with_protocol("smgp")
+            .with_protocol(Protocol::Smgp)
             .with_log_level(tracing::Level::INFO),
     );
 

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use rsms_connector::client::{ClientContext, ClientHandler};
 use rsms_connector::transaction::{MessageCallback, SubmitInfo, ReportInfo, MoInfo};
 use rsms_connector::{ClientBuilder, CmppDecoder, AccountConnections, AccountConfig};
-use rsms_core::{ConnectionInfo, EndpointConfig, Frame, Result};
+use rsms_core::{ConnectionInfo, EndpointConfig, Protocol, Frame, Result};
 use rsms_codec_cmpp::{Pdu, Connect, CommandId};
 use rsms_codec_cmpp::auth::compute_connect_auth;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -215,7 +215,7 @@ fn get_test_port() -> u16 {
 
 async fn start_test_server(port: u16) -> tokio::task::JoinHandle<()> {
     let config = Arc::new(
-        EndpointConfig::new("cmpp-test", "127.0.0.1", port, 100, 60).with_protocol("cmpp"),
+        EndpointConfig::new("cmpp-test", "127.0.0.1", port, 100, 60).with_protocol(Protocol::Cmpp),
     );
 
     let auth_handler: Arc<dyn AuthHandler> = Arc::new(TestAuthHandler::new());

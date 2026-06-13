@@ -6,7 +6,7 @@ use rsms_connector::{
     protocol::MessageSource,
 };
 use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler};
-use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Frame, Result};
+use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Protocol, Frame, Result};
 use rsms_codec_smpp::{
     decode_message, SmppMessage, Pdu,
     CommandId, SubmitSm, SubmitSmResp, DeliverSm, DeliverSmResp,
@@ -345,7 +345,7 @@ async fn start_test_server(
         0,
         500,
         60,
-    ).with_protocol("smpp").with_log_level(tracing::Level::WARN));
+    ).with_protocol(Protocol::Smpp).with_log_level(tracing::Level::WARN));
     let mut auth = PasswordAuthHandler::new();
     for cred in &ACCOUNTS {
         auth = auth.add_account(cred.system_id, cred.password);
@@ -598,7 +598,7 @@ async fn stress_test_smpp_5accounts_5connections() {
                 port,
                 1024,
                 30,
-            ).with_window_size(WINDOW_SIZE as u16).with_protocol("smpp").with_log_level(tracing::Level::WARN));
+            ).with_window_size(WINDOW_SIZE as u16).with_protocol(Protocol::Smpp).with_log_level(tracing::Level::WARN));
 
             let conn = ClientBuilder::new(endpoint, client_state.clone(), SmppDecoder)
                 .client_config(ClientConfig::new())

@@ -103,7 +103,7 @@ sgip_client/
 
 ### 关键注意事项
 
-- EndpointConfig 必须设置 `.with_protocol("sgip")`，否则框架无法正确识别协议类型
+- EndpointConfig 必须设置 `.with_protocol(Protocol::Sgip)`（需 `use rsms_core::Protocol;`），否则框架无法正确识别协议类型
 - MessageSource 中 fetch 的 key 必须和 EndpointConfig.id 一致
 - 所有 PDU 响应都通过 `write_frame()` 发送，不使用 window 机制
 

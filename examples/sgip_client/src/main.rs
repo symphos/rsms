@@ -30,7 +30,7 @@ use rsms_codec_sgip::{
 };
 use rsms_connector::client::{ClientContext, ClientHandler};
 use rsms_connector::{ClientBuilder, MessageItem, MessageSource, SgipDecoder};
-use rsms_core::{EncodedPdu, EndpointConfig, Frame, RawPdu, Result};
+use rsms_core::{EncodedPdu, EndpointConfig, Protocol, Frame, RawPdu, Result};
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
 use std::collections::VecDeque;
@@ -379,7 +379,7 @@ async fn main() -> Result<()> {
 
     let endpoint = Arc::new(
         EndpointConfig::new(SP_NUMBER, host, port, 100, 60)
-            .with_protocol("sgip")
+            .with_protocol(Protocol::Sgip)
             .with_window_size(2048)
             .with_log_level(tracing::Level::INFO),
     );

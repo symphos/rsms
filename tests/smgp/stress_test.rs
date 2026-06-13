@@ -5,7 +5,7 @@ use rsms_connector::{
     AccountConfigProvider,
 };
 use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler};
-use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Frame, Result};
+use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Protocol, Frame, Result};
 use rsms_codec_smgp::{
     decode_message, SmgpMessage, Pdu,
     CommandId, Login, SmgpMsgId, Submit, SubmitResp, Deliver, DeliverResp,
@@ -337,7 +337,7 @@ async fn start_test_server(
         0,
         500,
         60,
-    ).with_protocol("smgp").with_log_level(tracing::Level::WARN));
+    ).with_protocol(Protocol::Smgp).with_log_level(tracing::Level::WARN));
     let auth = Arc::new(PasswordAuthHandler::new().add_account(STRESS_TEST_CLIENT_ID, STRESS_TEST_PASSWORD));
     let server = ServerBuilder::new(cfg)
         .handlers(vec![biz_handler])

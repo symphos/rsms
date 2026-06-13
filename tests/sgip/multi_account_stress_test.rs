@@ -6,7 +6,7 @@ use rsms_connector::{
     protocol::MessageSource,
 };
 use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler};
-use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Frame, Result};
+use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Frame, Result};
 use rsms_codec_sgip::{
     decode_message, SgipMessage,
     CommandId, Submit, SubmitResp, Deliver, DeliverResp, Report, ReportResp,
@@ -375,7 +375,7 @@ async fn start_test_server(
         0,
         500,
         60,
-    ).with_protocol("sgip").with_log_level(tracing::Level::WARN));
+    ).with_protocol(Protocol::Sgip).with_log_level(tracing::Level::WARN));
     let mut auth = PasswordAuthHandler::new();
     for (account, password) in ACCOUNTS {
         auth = auth.add_account(account, password);
@@ -648,7 +648,7 @@ async fn stress_test_sgip_5accounts_5connections() {
                 port,
                 2048,
                 30,
-            ).with_window_size(WINDOW_SIZE as u16).with_protocol("sgip").with_log_level(tracing::Level::WARN));
+            ).with_window_size(WINDOW_SIZE as u16).with_protocol(Protocol::Sgip).with_log_level(tracing::Level::WARN));
 
             let mut conn = None;
             for retry in 0..50 {

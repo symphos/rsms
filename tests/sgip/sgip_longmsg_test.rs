@@ -9,7 +9,7 @@ use rsms_connector::{
     ClientBuilder, ServerBuilder, AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler, AuthResult,
     SgipDecoder,
 };
-use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Frame, RawPdu, Result};
+use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Protocol, Frame, RawPdu, Result};
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
 use std::collections::HashMap;
@@ -267,7 +267,7 @@ async fn start_server(
 ) -> Result<(u16, Arc<rsms_connector::ConnectionPool>, tokio::task::JoinHandle<()>)> {
     let cfg = Arc::new(
         EndpointConfig::new("sgip-longmsg-server", "127.0.0.1", 0, 8, 30)
-            .with_protocol("sgip"),
+            .with_protocol(Protocol::Sgip),
     );
     let server = ServerBuilder::new(cfg)
         .handlers(vec![biz_handler])
@@ -291,7 +291,7 @@ async fn connect_client(
 ) -> Result<(Arc<LongMsgClientHandler>, Arc<rsms_connector::client::ClientConnection>)> {
     let endpoint = Arc::new(
         EndpointConfig::new("sgip-longmsg-client", "127.0.0.1", port, 8, 30)
-            .with_protocol("sgip"),
+            .with_protocol(Protocol::Sgip),
     );
     let handler = Arc::new(LongMsgClientHandler::new());
     let conn = ClientBuilder::new(endpoint, handler.clone(), SgipDecoder)

@@ -32,7 +32,7 @@ use rsms_connector::{
     ServerBuilder, AccountConfig, AccountConfigProvider, AccountPoolConfig, AuthCredentials,
     AuthHandler, AuthResult, MessageItem, MessageSource, ProtocolConnection, ServerEventHandler,
 };
-use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Frame, RawPdu, Result};
+use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Protocol, Frame, RawPdu, Result};
 use rsms_longmsg::{
     LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser,
     split::SmsAlphabet,
@@ -536,7 +536,7 @@ async fn main() -> Result<()> {
 
     let config = Arc::new(
         EndpointConfig::new("smpp-gateway", "0.0.0.0", 7893, 500, 60)
-            .with_protocol("smpp")
+            .with_protocol(Protocol::Smpp)
             .with_log_level(tracing::Level::INFO),
     );
 

@@ -3,7 +3,7 @@ use rsms_connector::client::ClientHandler;
 use rsms_connector::{AuthHandler, AuthCredentials, AuthResult, ServerEventHandler, AccountConfigProvider};
 use rsms_business::BusinessHandler;
 use rsms_business::InboundContext;
-use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Frame, Result};
+use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Protocol, Frame, Result};
 use rsms_codec_smpp::Encodable;
 use rsms_test_common::{TestEventHandler, TestClientEventHandler, MockAccountConfigProvider};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -300,7 +300,7 @@ pub async fn start_test_server(
         0,
         8,
         idle_timeout_secs as u16,
-    ).with_protocol("smpp"));
+    ).with_protocol(Protocol::Smpp));
     let server = ServerBuilder::new(cfg)
         .handlers(vec![biz_handler])
         .auth_handler(auth_handler)
@@ -329,7 +329,7 @@ pub async fn start_test_server_with_pool(
         0,
         8,
         idle_timeout_secs as u16,
-    ).with_protocol("smpp"));
+    ).with_protocol(Protocol::Smpp));
     let server = ServerBuilder::new(cfg)
         .handlers(vec![biz_handler])
         .auth_handler(auth_handler)

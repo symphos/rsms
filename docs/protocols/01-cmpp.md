@@ -172,8 +172,9 @@ let message = decode_message_with_version(pdu, Some(version))?;
 参考：`examples/cmpp-endpoint/src/server.rs`
 
 ```rust
+use rsms_core::Protocol;
 let config = Arc::new(EndpointConfig::new("cmpp-gateway", "0.0.0.0", 7890, 500, 60)
-    .with_protocol("cmpp"));
+    .with_protocol(Protocol::Cmpp));
 
 let server = ServerBuilder::new(config)
     .handler(Arc::new(MyBizHandler))

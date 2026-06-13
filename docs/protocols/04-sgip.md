@@ -167,8 +167,9 @@ let pdu_bytes = bind.to_pdu_bytes(node_id, timestamp, seq_number);
 参考：`examples/sgip-endpoint/src/server.rs`
 
 ```rust
+use rsms_core::Protocol;
 let config = Arc::new(EndpointConfig::new("sgip-gateway", "0.0.0.0", 7891, 500, 60)
-    .with_protocol("sgip"));
+    .with_protocol(Protocol::Sgip));
 
 let server = ServerBuilder::new(config)
     .handler(Arc::new(MyBizHandler))
@@ -182,7 +183,7 @@ let server = ServerBuilder::new(config)
 
 ```rust
 let endpoint = Arc::new(EndpointConfig::new("sgip-client", "127.0.0.1", port, 500, 60)
-    .with_protocol("sgip"));
+    .with_protocol(Protocol::Sgip));
 
 let conn = ClientBuilder::new(endpoint, Arc::new(MyClientHandler), SgipDecoder)
     .client_config(ClientConfig::default())
