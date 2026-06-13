@@ -9,4 +9,5 @@ description = "SMPP v3.4 protocol codec with TLV support"
 bytes.workspace = true
 num_enum.workspace = true
 rsms-core = { path = "../rsms-core" }
+rsms-model = { path = "../rsms-model" }
 thiserror.workspace = true

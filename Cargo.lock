@@ -415,6 +415,7 @@ dependencies = [
  "bytes",
  "num_enum",
  "rsms-core",
+ "rsms-model",
  "thiserror",
 ]
 
