@@ -881,10 +881,10 @@ fn start_keepalive_task(conn: Arc<ClientConnection>, protocol: Protocol, idle_ti
 /// 发送保活报文
 async fn send_keepalive_packet(conn: &Arc<ClientConnection>, protocol: Protocol) -> Result<()> {
     use rsms_model::ProtocolAdapter as _;
-    // CMPP/SMPP 心跳经 adapter 统一编码（已门控字节相等，sequence_id=1 与旧实现一致）；
-    // adapter 意外失败兜底回旧构造器。SMGP 旧心跳 13B（多 1 字节保留位）是已知 latent bug——
-    // adapter 的 12B 才符合 SMGP 3.0.3（ActiveTest body 空，codec BODY_SIZE=0、解码器拒收≠12B）；
-    // 保留旧实现仅为不改变上线字节。SGIP 无专用心跳（用 Trace）、adapter 无 Ping，亦保留旧实现。
+    // CMPP/SMPP/SMGP 心跳经 adapter 统一编码（sequence_id=1，与旧实现一致）；adapter 意外失败兜底回旧构造器。
+    // SMGP 此前旧心跳 13B（多 1 字节保留位）是 latent bug，现经 adapter 产出合规 12B
+    // （SMGP 3.0.3 ActiveTest body 空，codec BODY_SIZE=0、解码器拒收≠12B）——此为修复。
+    // SGIP 无专用心跳（用 Trace）、adapter 无 Ping，保留旧实现。
     let pdu = match protocol {
         Protocol::Cmpp => crate::adapter_registry::adapter_for(protocol)
             .encode(&rsms_model::UnifiedMessage::Ping, 1)
@@ -892,7 +892,9 @@ async fn send_keepalive_packet(conn: &Arc<ClientConnection>, protocol: Protocol)
         Protocol::Smpp => crate::adapter_registry::adapter_for(protocol)
             .encode(&rsms_model::UnifiedMessage::Ping, 1)
             .unwrap_or_else(|_| build_smpp_enquire_link_pdu()),
-        Protocol::Smgp => build_smgp_active_test_pdu(),
+        Protocol::Smgp => crate::adapter_registry::adapter_for(protocol)
+            .encode(&rsms_model::UnifiedMessage::Ping, 1)
+            .unwrap_or_else(|_| build_smgp_active_test_pdu()),
         Protocol::Sgip => build_sgip_keepalive_pdu(),
     };
 
@@ -961,30 +963,27 @@ mod converge_keepalive_gating {
     use rsms_core::Protocol;
     use rsms_model::{ProtocolAdapter as _, UnifiedMessage};
 
-    /// 锁定收敛：CMPP/SMPP 的 adapter Ping(seq=1) 编码须与旧 keepalive 构造器字节一致。
+    /// 锁定收敛：CMPP/SMPP 的 adapter Ping(seq=1) 仍与旧构造器字节一致。
     #[test]
     fn converged_keepalive_arms_byte_identical() {
         assert_eq!(
             adapter_for(Protocol::Cmpp).encode(&UnifiedMessage::Ping, 1).ok(),
             Some(build_cmpp_active_test_pdu()),
-            "CMPP keepalive：adapter 应与旧构造器字节一致（已收敛）"
+            "CMPP keepalive 字节一致"
         );
         assert_eq!(
             adapter_for(Protocol::Smpp).encode(&UnifiedMessage::Ping, 1).ok(),
             Some(build_smpp_enquire_link_pdu()),
-            "SMPP keepalive：adapter 应与旧构造器字节一致（已收敛）"
+            "SMPP keepalive 字节一致"
         );
     }
 
-    /// 锁定已知差异：SMGP 旧心跳 13B（多 1 字节保留位）是已知 latent bug，adapter 12B 才合规
-    /// （SMGP 3.0.3 ActiveTest body 空）；SGIP 无 Ping（adapter 报错）。两者保留旧实现（SMGP 为不改上线字节）。
+    /// 记录修复：SMGP 心跳现为合规 12B（adapter，ActiveTest body 空），不再是旧构造器的 13B；SGIP 无 Ping。
     #[test]
-    fn smgp_and_sgip_keepalive_known_divergence() {
-        assert_ne!(
-            adapter_for(Protocol::Smgp).encode(&UnifiedMessage::Ping, 1).ok(),
-            Some(build_smgp_active_test_pdu()),
-            "SMGP keepalive 预期字节不一致（旧 13B vs adapter 12B）"
-        );
+    fn smgp_keepalive_fixed_sgip_no_ping() {
+        let smgp = adapter_for(Protocol::Smgp).encode(&UnifiedMessage::Ping, 1).expect("smgp ping");
+        assert_eq!(smgp.len(), 12, "SMGP 心跳应为合规 12B");
+        assert_ne!(smgp, build_smgp_active_test_pdu(), "应脱离旧 13B 构造器");
         assert!(
             adapter_for(Protocol::Sgip).encode(&UnifiedMessage::Ping, 1).is_err(),
             "SGIP 无心跳，adapter Ping 应报错"

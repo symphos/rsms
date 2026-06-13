@@ -539,20 +539,15 @@ fn encode_close_packet(protocol: Protocol) -> Option<Vec<u8>> {
     Some(pdu)
 }
 
-/// 关闭包编码（部分收敛）：CMPP/SGIP/SMPP 经 adapter 统一编码（已门控字节相等）；
-/// SMGP：adapter 的 12B 才符合 SMGP 3.0.3（Exit body 为空，见 codec `Exit::BODY_SIZE = 0`，
-/// 其解码器拒收 total_length≠12）；旧实现的 13B（多 1 字节保留位）是已知 latent bug，此处仅为
-/// 「不改变现有上线字节」而保留旧路径——对 SMGP 而言收敛是修复、非回归。
-/// 非 SMGP 协议若 adapter 编码意外失败，兜底回旧实现。
+/// 关闭包编码（全协议收敛经 adapter）：四协议均经 adapter 统一编码；adapter 意外失败兜底回旧实现。
+/// SMGP 此前旧实现发 13B（多 1 字节保留位）是 latent bug，现经 adapter 产出合规 12B
+/// （SMGP 3.0.3 Exit body 为空，见 codec `Exit::BODY_SIZE = 0`、解码器拒收 total_length≠12）——此为修复。
 fn close_packet(protocol: Protocol) -> Option<Vec<u8>> {
     use rsms_model::ProtocolAdapter as _;
-    match protocol {
-        Protocol::Smgp => encode_close_packet(protocol),
-        _ => crate::adapter_registry::adapter_for(protocol)
-            .encode(&rsms_model::UnifiedMessage::Unbind, 0)
-            .ok()
-            .or_else(|| encode_close_packet(protocol)),
-    }
+    crate::adapter_registry::adapter_for(protocol)
+        .encode(&rsms_model::UnifiedMessage::Unbind, 0)
+        .ok()
+        .or_else(|| encode_close_packet(protocol))
 }
 
 #[cfg(test)]
@@ -561,22 +556,24 @@ mod converge_close_gating {
     use crate::adapter_registry::adapter_for;
     use rsms_model::{ProtocolAdapter as _, UnifiedMessage};
 
-    /// 锁定收敛：CMPP/SGIP/SMPP 的 adapter Unbind 编码须与旧 encode_close_packet 字节一致。
+    /// 锁定全协议收敛：close_packet 对四协议均产出 adapter 字节。
     #[test]
-    fn converged_close_arms_byte_identical() {
-        for p in [Protocol::Cmpp, Protocol::Sgip, Protocol::Smpp] {
-            let legacy = encode_close_packet(p);
+    fn close_packet_uses_adapter_for_all_protocols() {
+        for p in [Protocol::Cmpp, Protocol::Smgp, Protocol::Sgip, Protocol::Smpp] {
             let via = adapter_for(p).encode(&UnifiedMessage::Unbind, 0).ok();
-            assert_eq!(via, legacy, "{p:?} close：adapter 应与旧实现字节一致（已收敛）");
+            assert_eq!(close_packet(p), via, "{p:?} close 应走 adapter 字节");
         }
     }
 
-    /// 锁定已知差异：SMGP 旧关闭包 13B（多 1 字节保留位）是已知 latent bug；adapter 的 12B 才符合
-    /// SMGP 3.0.3（Exit body 空）。保留旧路径仅为不改变上线字节；若此断言失败说明已对齐，可收敛 SMGP（属修复）。
+    /// 记录修复：SMGP 关闭包现为合规 12B（adapter，Exit body 空），不再是旧 encode_close_packet 的 13B。
     #[test]
-    fn smgp_close_known_divergence() {
-        let legacy = encode_close_packet(Protocol::Smgp);
-        let via = adapter_for(Protocol::Smgp).encode(&UnifiedMessage::Unbind, 0).ok();
-        assert_ne!(via, legacy, "SMGP close 预期字节不一致（旧 13B vs adapter 12B）");
+    fn smgp_close_fixed_to_12b() {
+        let fixed = close_packet(Protocol::Smgp).expect("smgp close");
+        assert_eq!(fixed.len(), 12, "SMGP 关闭包应为合规 12B");
+        assert_ne!(
+            fixed,
+            encode_close_packet(Protocol::Smgp).expect("legacy"),
+            "应已脱离旧 13B 实现（旧实现保留作兜底/回归对照）"
+        );
     }
 }
