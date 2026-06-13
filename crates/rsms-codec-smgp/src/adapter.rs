@@ -30,6 +30,7 @@ fn encoding_from_fmt(fmt: u8) -> Encoding {
 /// 统一 Encoding → SMGP msg_fmt。
 fn fmt_from_encoding(enc: Encoding) -> u8 {
     match enc {
+        // SMGP 无 GSM7 专属 msg_fmt，按 ASCII(0) 落地（有损：回译为 Ascii）
         Encoding::Ascii | Encoding::Gsm7 => 0,
         Encoding::Binary => 4,
         Encoding::Ucs2 => 8,
@@ -88,6 +89,7 @@ fn deliver_to_unified(d: crate::datatypes::Deliver) -> UnifiedMessage {
 }
 
 fn login_to_unified(l: crate::datatypes::Login) -> UnifiedBind {
+    // login_mode 试点期不进统一模型，待后续补充（统一模型暂无对应字段）
     UnifiedBind {
         client_id: l.client_id,
         authenticator: l.authenticator.to_vec(),
@@ -107,6 +109,7 @@ fn smgp_to_unified(msg: SmgpMessage) -> UnifiedMessage {
         SmgpMessage::DeliverResp { .. } => UnifiedMessage::DeliverResp,
         SmgpMessage::Login { login, .. } => UnifiedMessage::Bind(login_to_unified(login)),
         SmgpMessage::LoginResp { resp, .. } => {
+            // authenticator/version 试点期不进统一模型，待后续补充（统一模型暂无对应字段）
             UnifiedMessage::BindResp(UnifiedBindResp { status: resp.status })
         }
         SmgpMessage::ActiveTest { .. } => UnifiedMessage::Ping,
@@ -156,6 +159,8 @@ fn unified_to_smgp(msg: &UnifiedMessage, seq: u32) -> Result<SmgpMessage> {
             }
         }
         UnifiedMessage::SubmitResp(r) => {
+            // 试pilot期 SMGP msg_id 固定为 10 字节；跨协议场景下超过 10 字节的 msg_id
+            // 会被静默截断——这是已知有损行为，待统一模型支持可变长 id 后再消除。
             let bytes10 = match &r.msg_id {
                 MessageId::Binary(b) => {
                     let mut arr = [0u8; 10];
@@ -227,7 +232,7 @@ mod tests {
     use super::*;
     use crate::codec::Pdu;
     use crate::datatypes::Submit;
-    use rsms_core::{RawPdu};
+    use rsms_core::RawPdu;
 
     /// 用完整 PDU 字节构造 Frame（command_id/sequence_id 由 Frame::from 自动提取）。
     fn frame_of(bytes: Vec<u8>) -> Frame {
@@ -270,5 +275,60 @@ mod tests {
         let unified = SmgpAdapter.decode(&frame_of(original.clone())).unwrap();
         let reencoded = SmgpAdapter.encode(&unified, 42).unwrap();
         assert_eq!(reencoded, original, "经统一模型往返后字节应无损一致");
+    }
+
+    #[test]
+    fn submit_byte_roundtrip_full_fields() {
+        // 填满字段的往返测试：验证所有 SmgpExtra 字段、非默认编码、want_report
+        // 都能在 decode → UnifiedMessage → encode 中无损保持。
+        let mut submit = Submit::new();
+        submit.src_term_id = "1065900000".to_string();
+        submit.dest_term_ids.push("13800138000".to_string());
+        submit.dest_term_id_count = 1;
+        submit.msg_content = b"\x4e\x2d\x65\x87".to_vec(); // UCS-2 "中文"
+        submit.need_report = 1;
+        submit.msg_fmt = 8; // Ucs2
+        submit.service_id = "SVCTEST".to_string();
+        submit.fee_type = "02".to_string();
+        submit.fee_code = "000100".to_string();
+        submit.fixed_fee = "000000".to_string();
+        submit.msg_type = 6;
+        submit.priority = 2;
+        submit.charge_term_id = "13900000001".to_string();
+        submit.valid_time = "20261231235959".to_string();
+        submit.at_time = "20260101000000".to_string();
+
+        let original = Pdu::from(submit).to_pdu_bytes(99).to_vec();
+        let unified = SmgpAdapter.decode(&frame_of(original.clone())).unwrap();
+
+        // 验证 decode 方向字段正确搬运
+        match &unified {
+            UnifiedMessage::Submit(s) => {
+                assert_eq!(s.want_report, true, "need_report=1 应翻译为 want_report=true");
+                assert!(
+                    matches!(s.encoding, rsms_model::Encoding::Ucs2),
+                    "msg_fmt=8 应翻译为 Ucs2"
+                );
+                match &s.extra {
+                    ProtocolExtra::Smgp(e) => {
+                        assert_eq!(e.service_id, "SVCTEST");
+                        assert_eq!(e.fee_type, "02");
+                        assert_eq!(e.fee_code, "000100");
+                        assert_eq!(e.fixed_fee, "000000");
+                        assert_eq!(e.msg_type, 6);
+                        assert_eq!(e.priority, 2);
+                        assert_eq!(e.charge_term_id, "13900000001");
+                        assert_eq!(e.valid_time, "20261231235959");
+                        assert_eq!(e.at_time, "20260101000000");
+                    }
+                    _ => panic!("extra 应为 ProtocolExtra::Smgp"),
+                }
+            }
+            _ => panic!("expected UnifiedMessage::Submit"),
+        }
+
+        // 验证 encode 方向字节无损
+        let reencoded = SmgpAdapter.encode(&unified, 99).unwrap();
+        assert_eq!(reencoded, original, "填满字段后经统一模型往返字节应无损一致");
     }
 }
