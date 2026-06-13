@@ -16,3 +16,5 @@ pub use datatypes::{
 };
 pub use frame::{decode_frames, FrameDecoder};
 pub use message::{decode_message, SmgpMessage};
+
+pub mod adapter;

@@ -403,6 +403,7 @@ dependencies = [
  "md-5",
  "num_enum",
  "rsms-core",
+ "rsms-model",
  "thiserror",
 ]
 
@@ -455,6 +456,13 @@ dependencies = [
  "rsms-core",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "rsms-model"
+version = "0.0.1"
+dependencies = [
+ "rsms-core",
 ]
 
 [[package]]
