@@ -290,3 +290,146 @@ pub fn spawn_stats_monitor(
         }
     })
 }
+
+// ==================== 资源采样（长稳测试用） ====================
+
+/// 单次进程资源采样点。
+#[derive(Debug, Clone, Copy)]
+pub struct ResourceSample {
+    /// 自采样开始的相对秒数。
+    pub elapsed_secs: f64,
+    /// 常驻内存 VmRSS（KB），`/proc` 不可用时为 0。
+    pub rss_kb: u64,
+    /// 打开的文件描述符数量，`/proc` 不可用时为 0。
+    pub fd_count: usize,
+}
+
+/// 读取当前进程的常驻内存 VmRSS（KB）。仅 Linux/WSL 可用，其它平台返回 `None`。
+pub fn read_rss_kb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|line| {
+        line.strip_prefix("VmRSS:").and_then(|rest| {
+            rest.trim().trim_end_matches("kB").trim().parse::<u64>().ok()
+        })
+    })
+}
+
+/// 读取当前进程打开的文件描述符数量。仅 Linux/WSL 可用，其它平台返回 `None`。
+pub fn read_fd_count() -> Option<usize> {
+    std::fs::read_dir("/proc/self/fd").ok().map(|d| d.count())
+}
+
+/// 周期采样进程资源直到 `duration_secs` 结束，返回采样序列（共享句柄）与任务句柄。
+///
+/// 用于长稳测试捕获内存/fd 的慢蠕变；配合 [`assert_resource_stable`] 做泄漏断言。
+pub fn spawn_resource_sampler(
+    interval_secs: u64,
+    duration_secs: u64,
+) -> (
+    Arc<tokio::sync::Mutex<Vec<ResourceSample>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let samples = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let out = Arc::clone(&samples);
+    let start = tokio::time::Instant::now();
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(interval_secs.max(1))).await;
+            let elapsed = start.elapsed().as_secs_f64();
+            out.lock().await.push(ResourceSample {
+                elapsed_secs: elapsed,
+                rss_kb: read_rss_kb().unwrap_or(0),
+                fd_count: read_fd_count().unwrap_or(0),
+            });
+            if elapsed >= duration_secs as f64 {
+                break;
+            }
+        }
+    });
+    (samples, handle)
+}
+
+/// 资源稳定性断言：后半程均值不得超过前半程均值的 `(1 + tolerance)` 倍，
+/// 用于捕获长时间运行下内存/fd 的单调增长（泄漏）。
+///
+/// 样本不足（<4）或 `/proc` 不可用（全 0）时跳过断言并打印提示（视为通过），保证跨平台可运行。
+pub fn assert_resource_stable(samples: &[ResourceSample], tolerance: f64) {
+    if samples.len() < 4 || samples.iter().all(|s| s.rss_kb == 0) {
+        eprintln!(
+            "[资源稳定性] 样本不足或 /proc 不可用，跳过断言（samples={}）",
+            samples.len()
+        );
+        return;
+    }
+    let mid = samples.len() / 2;
+    let avg = |slice: &[ResourceSample], f: fn(&ResourceSample) -> f64| {
+        slice.iter().map(f).sum::<f64>() / slice.len() as f64
+    };
+    let rss_first = avg(&samples[..mid], |s| s.rss_kb as f64);
+    let rss_second = avg(&samples[mid..], |s| s.rss_kb as f64);
+    let fd_first = avg(&samples[..mid], |s| s.fd_count as f64);
+    let fd_second = avg(&samples[mid..], |s| s.fd_count as f64);
+
+    println!(
+        "[资源稳定性] RSS 前半 {:.0}KB → 后半 {:.0}KB；fd 前半 {:.1} → 后半 {:.1}（容差 {:.0}%）",
+        rss_first,
+        rss_second,
+        fd_first,
+        fd_second,
+        tolerance * 100.0
+    );
+
+    assert!(
+        rss_second <= rss_first * (1.0 + tolerance),
+        "RSS 后半程均值 {:.0}KB 超过前半程 {:.0}KB × {:.2}，疑似内存泄漏",
+        rss_second,
+        rss_first,
+        1.0 + tolerance
+    );
+    // fd 额外 +2 容忍采样/调度引入的瞬时波动。
+    assert!(
+        fd_second <= fd_first * (1.0 + tolerance) + 2.0,
+        "fd 后半程均值 {:.1} 超过前半程 {:.1} × {:.2}，疑似 fd 泄漏",
+        fd_second,
+        fd_first,
+        1.0 + tolerance
+    );
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    fn samples_with_rss(rss: impl Fn(usize) -> u64) -> Vec<ResourceSample> {
+        (0..8)
+            .map(|i| ResourceSample {
+                elapsed_secs: i as f64,
+                rss_kb: rss(i),
+                fd_count: 20,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stable_rss_passes() {
+        // 前后半程基本持平（小幅抖动）→ 不应 panic。
+        let s = samples_with_rss(|i| 10_000 + (i % 2) as u64 * 100);
+        assert_resource_stable(&s, 0.1);
+    }
+
+    #[test]
+    #[should_panic(expected = "内存泄漏")]
+    fn growing_rss_panics() {
+        // 单调增长（后半远超前半）→ 应判定泄漏 panic。
+        let s = samples_with_rss(|i| 10_000 + i as u64 * 2_000);
+        assert_resource_stable(&s, 0.1);
+    }
+
+    #[test]
+    fn empty_or_unavailable_skips() {
+        // /proc 不可用（全 0）或样本不足 → 跳过，不 panic。
+        assert_resource_stable(&[], 0.1);
+        let zero = samples_with_rss(|_| 0);
+        assert_resource_stable(&zero, 0.1);
+    }
+}
