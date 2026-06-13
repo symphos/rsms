@@ -4,7 +4,7 @@
 //! 已知限制（本轮）：encode 不支持 Bind/Deliver/Report（仅 Submit/SubmitResp/心跳/解绑，
 //! 与其它 adapter 一致）；Deliver 报告路径 status 暂为 Unknown（精确状态解析待后续）。
 
-use crate::datatypes::{CmppVersion, Connect, Deliver, Submit, SubmitResp};
+use crate::datatypes::{CmppVersion, CommandId, Connect, Deliver, Submit, SubmitResp};
 use crate::message::{decode_message, encode_message, CmppMessage};
 use rsms_core::{Frame, Protocol, Result, RsmsError};
 use rsms_model::{
@@ -116,8 +116,26 @@ fn cmpp_to_unified(msg: CmppMessage) -> UnifiedMessage {
         CmppMessage::Unknown { command_id, body, .. } => {
             UnifiedMessage::Unknown { command_id, raw: body }
         }
-        // V2.0 Submit/Deliver、Query/Cancel 等本轮退化为 Unknown（仅 shadow 日志可见）
-        _ => UnifiedMessage::Unknown { command_id: 0, raw: vec![] },
+        // V2.0 Submit/Deliver、Query/Cancel 等本轮退化为 Unknown（仅 shadow 日志可见），保留真实
+        // command_id 便于诊断；match 改为穷尽，未来新增变体触发编译错误而非静默归零。
+        CmppMessage::SubmitV20 { .. } => {
+            UnifiedMessage::Unknown { command_id: CommandId::Submit as u32, raw: vec![] }
+        }
+        CmppMessage::DeliverV20 { .. } => {
+            UnifiedMessage::Unknown { command_id: CommandId::Deliver as u32, raw: vec![] }
+        }
+        CmppMessage::Query { .. } => {
+            UnifiedMessage::Unknown { command_id: CommandId::Query as u32, raw: vec![] }
+        }
+        CmppMessage::QueryResp { .. } => {
+            UnifiedMessage::Unknown { command_id: CommandId::QueryResp as u32, raw: vec![] }
+        }
+        CmppMessage::Cancel { .. } => {
+            UnifiedMessage::Unknown { command_id: CommandId::Cancel as u32, raw: vec![] }
+        }
+        CmppMessage::CancelResp { .. } => {
+            UnifiedMessage::Unknown { command_id: CommandId::CancelResp as u32, raw: vec![] }
+        }
     }
 }
 
