@@ -424,8 +424,16 @@ pub async fn run_connection(
     
     let conn_id = conn.id;
     let account = conn.authenticated_account().await;
+
+    // 注销：从 account pool 移除本连接，避免断开后 Arc<Connection> 永久残留在
+    // AccountConnections.connections 造成内存泄漏（此前断开仅清理 ConnectionPool，
+    // remove_connection 的唯一调用点是缩容 evict_excess_connections）。
+    if let Some(acc) = conn.account_connections().await {
+        acc.remove_connection(conn_id).await;
+    }
+
     conn.mark_disconnected().await;
-    
+
     if let Some(ref handler) = event_handler {
         handler.on_disconnected(conn_id, account.as_deref()).await;
     }
