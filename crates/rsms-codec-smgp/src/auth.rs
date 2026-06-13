@@ -2,25 +2,23 @@ use md5::{Digest, Md5};
 
 /// 计算 SMGP Login 请求的 ClientAuth
 ///
-/// ClientAuth = MD5(ClientId + 7个零字节 + Password + Timestamp)
+/// SMGP 3.0 规范：ClientAuth = MD5(ClientID + 7个二进制0 + Shared secret + Timestamp)
 ///
-/// - ClientId: 8字节 SP 企业代码
-/// - Password: 明文密码
-/// - Timestamp: 4字节大端 MMDDHHMMSS 格式
+/// - ClientID: 登录名**原始字符串**（不补齐到 8 字节）
+/// - Shared secret: 明文密码
+/// - Timestamp: **10 位十进制字符串** `MMDDHHMMSS`（左补 0），非 4 字节整数
+///
+/// 与 cmos/SMSGate 等参考实现一致（2026-06-13 经 lihuanghe 模拟器联调验证）。
 pub fn compute_login_auth(client_id: &str, password: &str, timestamp: u32) -> [u8; 16] {
     let mut hasher = Md5::new();
 
-    let mut id_buf = [b' '; 8];
-    let id_bytes = client_id.as_bytes();
-    let copy_len = id_bytes.len().min(8);
-    id_buf[..copy_len].copy_from_slice(&id_bytes[..copy_len]);
-    hasher.update(id_buf);
+    hasher.update(client_id.as_bytes());
 
     hasher.update([0u8; 7]);
 
     hasher.update(password.as_bytes());
 
-    hasher.update(timestamp.to_be_bytes());
+    hasher.update(format!("{timestamp:010}").as_bytes());
 
     hasher.finalize().into()
 }
