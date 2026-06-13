@@ -5,7 +5,7 @@ use rsms_codec_smgp::{
 };
 use rsms_connector::client::{ClientContext, ClientHandler};
 use rsms_connector::{ClientBuilder, MessageItem, MessageSource, SmgpDecoder};
-use rsms_core::{EncodedPdu, EndpointConfig, Frame, Result};
+use rsms_core::{EncodedPdu, EndpointConfig, Frame, Protocol, Result};
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
 use std::collections::VecDeque;
@@ -199,10 +199,12 @@ impl ClientHandler for SmgpClientHandler {
                     if deliver.is_report == 1 {
                         if let Some(report) = SmgpReport::parse(&deliver.msg_content) {
                             let count = self.report_count.fetch_add(1, Ordering::Relaxed) + 1;
+                            let msg_id_hex: String =
+                                report.msg_id.iter().map(|b| format!("{b:02x}")).collect();
                             tracing::info!(
                                 "[{}] 状态报告: msg_id={}, stat={}, src={}",
                                 count,
-                                report.msg_id,
+                                msg_id_hex,
                                 report.stat,
                                 deliver.src_term_id
                             );
@@ -250,7 +252,10 @@ impl ClientHandler for SmgpClientHandler {
                         );
                     }
 
-                    let resp = DeliverResp { status: 0 };
+                    let resp = DeliverResp {
+                        msg_id: deliver.msg_id.clone(),
+                        status: 0,
+                    };
                     let resp_pdu: Pdu = resp.into();
                     ctx.conn
                         .write_frame(resp_pdu.to_pdu_bytes(seq_id).as_bytes_ref())
@@ -298,6 +303,7 @@ async fn main() -> Result<()> {
 
     let endpoint = Arc::new(
         EndpointConfig::new(ACCOUNT, host, port, 100, 60)
+            .with_protocol(Protocol::Smgp)
             .with_window_size(2048)
             .with_log_level(tracing::Level::INFO),
     );
@@ -316,7 +322,8 @@ async fn main() -> Result<()> {
     let login_pdu = Login {
         client_id: ACCOUNT.to_string(),
         authenticator,
-        login_mode: 0,
+        // 收发模式（submit + 接收 MO/报告）
+        login_mode: 2,
         timestamp,
         version: 0x30,
     };

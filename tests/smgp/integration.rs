@@ -294,7 +294,7 @@ impl ClientHandler for TestClientHandler {
                         }
                     }
                 }
-                let resp = rsms_codec_smgp::DeliverResp { status: 0 };
+                let resp = rsms_codec_smgp::DeliverResp { msg_id: rsms_codec_smgp::SmgpMsgId::default(), status: 0 };
                 let resp_pdu: rsms_codec_smgp::Pdu = resp.into();
                 ctx.conn.write_frame(resp_pdu.to_pdu_bytes(header.sequence_id).as_slice()).await?;
             }

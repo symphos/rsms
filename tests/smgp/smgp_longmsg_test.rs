@@ -193,7 +193,7 @@ impl ClientHandler for LongMsgClientHandler {
                         if d.is_report == 0 {
                             self.deliver_segments.lock().unwrap().push(d.msg_content.clone());
                         }
-                        let resp = DeliverResp { status: 0 };
+                        let resp = DeliverResp { msg_id: d.msg_id.clone(), status: 0 };
                         let resp_pdu: Pdu = resp.into();
                         ctx.conn.write_frame(resp_pdu.to_pdu_bytes(frame.sequence_id).as_slice()).await?;
                     }

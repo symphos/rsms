@@ -340,11 +340,10 @@ impl SmgpBusinessHandler {
 }
 
 fn build_deliver_report(account: &str, msg_id: &SmgpMsgId, phone: &str) -> RawPdu {
-    let msg_id_str = format!("{}", msg_id);
     let now = chrono_now_str();
 
     let report = SmgpReport {
-        msg_id: msg_id_str,
+        msg_id: msg_id.bytes, // 10 字节二进制 MsgId（SMGP 报告 id 字段为二进制，非文本）
         sub: "001".to_string(),
         dlvrd: "001".to_string(),
         submit_time: now.clone(),
