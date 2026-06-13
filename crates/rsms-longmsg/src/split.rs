@@ -4,36 +4,56 @@ use crate::frame::{LongMessageFrame, UDH_HEADER_16BIT_LEN, UDH_HEADER_8BIT_LEN};
 use crate::reference_id::ReferenceIdGenerator;
 use std::sync::Arc;
 
+/// GSM 7-bit 编码单条短信最大字符数（160 字符）。
 pub const GSM_7BIT_SINGLE_MAX: usize = 160;
+/// GSM 7-bit 编码长短信每段最大字符数（含 UDH 头后剩余 153 字符）。
 pub const GSM_7BIT_MULTI_MAX: usize = 153;
+/// UCS-2 编码单条短信最大字符数（70 个 Unicode 字符）。
 pub const UCS2_SINGLE_MAX: usize = 70;
+/// UCS-2 编码长短信每段最大字符数（含 UDH 头后剩余 67 个 Unicode 字符）。
 pub const UCS2_MULTI_MAX: usize = 67;
 
+/// TP-UDHI 标志位掩码，用于 TP-UD 首字节中标识用户数据头的存在。
 pub const TP_UDHI_MASK: u8 = 0x40;
 
+/// 短信编码字母表，决定分段时的字节上限。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SmsAlphabet {
+    /// GSM 7-bit 默认字母表。
     GSM7,
+    /// ASCII（与 GSM 7-bit 使用相同分段限制）。
     ASCII,
+    /// UCS-2（UTF-16BE），每个汉字/Emoji 占 2 字节。
     UCS2,
+    /// 二进制内容，每段最多 134 字节。
     Binary,
 }
 
+/// 长短信分割器，将超长内容按协议规范切割为带 UDH 头的多段帧。
+///
+/// 每个实例持有一个引用 ID 生成器；引用 ID 超过 255 时自动切换到 16-bit UDH，
+/// 低于等于 255 时使用 8-bit UDH，分段 payload 长度相应调整以满足 GSM 03.40。
 pub struct LongMessageSplitter {
     generator: Arc<ReferenceIdGenerator>,
 }
 
 impl LongMessageSplitter {
+    /// 创建一个使用默认引用 ID 生成器（随机初始值）的分割器。
     pub fn new() -> Self {
         Self {
             generator: Arc::new(ReferenceIdGenerator::new()),
         }
     }
 
+    /// 使用指定的引用 ID 生成器创建分割器，常用于测试中固定引用 ID。
     pub fn with_generator(generator: Arc<ReferenceIdGenerator>) -> Self {
         Self { generator }
     }
 
+    /// 将 `content` 按 `alphabet` 对应的字节上限切割为 `LongMessageFrame` 序列。
+    ///
+    /// 若内容未超出单段上限，返回包含单个无 UDH 帧的 `Vec`。
+    /// 否则自动生成引用 ID 并构造带 UDH 的多段帧，各段长度严格不超过协议上限。
     pub fn split(&mut self, content: &[u8], alphabet: SmsAlphabet) -> Vec<LongMessageFrame> {
         let max_per_segment = match alphabet {
             SmsAlphabet::GSM7 | SmsAlphabet::ASCII => GSM_7BIT_MULTI_MAX,
@@ -132,6 +152,9 @@ impl LongMessageSplitter {
         (udh, frame_content)
     }
 
+    /// 与 `split` 相同，但直接返回各段的原始字节（含 UDH 头），不含 `LongMessageFrame` 元数据。
+    ///
+    /// 适合直接将字节写入 PDU `msg_content` 字段的场景。
     pub fn split_into_pdu(&mut self, content: &[u8], alphabet: SmsAlphabet) -> Vec<Vec<u8>> {
         self.split(content, alphabet)
             .into_iter()

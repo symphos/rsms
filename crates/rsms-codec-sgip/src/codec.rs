@@ -10,10 +10,17 @@ use crate::datatypes::{
 
 pub const MAX_PDU_SIZE: u32 = 65536;
 
+/// SGIP PDU 公共头（20 字节）：总长度 + 命令字 + 12 字节 SgipSequence。
+///
+/// `SgipSequence` 由节点编号（4B）、时间戳（4B）和流水号（4B）组成，
+/// 占用字节 8–19，`sequence_id` 提取偏移为 12（与 SMPP 一致）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PduHeader {
+    /// PDU 总字节数（含头部 20 字节）。
     pub total_length: u32,
+    /// 命令字，标识 PDU 类型（Bind、Submit、Deliver、Report 等）。
     pub command_id: CommandId,
+    /// SGIP 序列号结构，含节点编号、时间戳和流水号三个字段。
     pub sequence: SgipSequence,
 }
 
@@ -60,9 +67,15 @@ impl PduHeader {
     }
 }
 
+/// PDU body 编解码能力，由各具体 PDU 类型实现（SGIP 的 `Encodable` 同时要求实现 `Decodable`）。
 pub trait Encodable: Decodable {
+    /// 将 body 字段写入 `buf`，不含协议头。
     fn encode(&self, buf: &mut BytesMut) -> Result<(), CodecError>;
+    /// 返回 body 编码后的字节数（不含头部），用于预分配缓冲区。
     fn encoded_size(&self) -> usize;
+    /// 将 PDU 序列化为带完整 SGIP 协议头的字节序列。
+    ///
+    /// `node_id`、`timestamp`、`number` 组成 `SgipSequence`，调用方负责提供正确的值。
     fn to_pdu_bytes(&self, node_id: u32, timestamp: u32, number: u32) -> Bytes {
         let mut buf = BytesMut::with_capacity(PduHeader::SIZE + self.encoded_size());
         let sequence = SgipSequence::new(node_id, timestamp, number);
@@ -82,8 +95,11 @@ pub trait Encodable: Decodable {
     }
 }
 
+/// PDU body 解码能力，由各具体 PDU 类型实现。
 pub trait Decodable: Sized {
+    /// 从 `buf` 中解码 body（头部已由调用方解析为 `header`）。
     fn decode(header: PduHeader, buf: &mut Cursor<&[u8]>) -> Result<Self, CodecError>;
+    /// 返回该 PDU 类型对应的命令字。
     fn command_id() -> CommandId;
 }
 
@@ -123,6 +139,7 @@ impl CodecError {
     }
 }
 
+/// SGIP 协议所有 PDU 类型的统一枚举，用于编解码层的统一分发。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pdu {
     Bind(Bind),

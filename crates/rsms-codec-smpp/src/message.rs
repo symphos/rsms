@@ -35,10 +35,19 @@ pub enum SmppMessage {
     Unknown { command_id: u32, body: Vec<u8> },
 }
 
+/// 解码一条 SMPP PDU 字节序列为 `SmppMessage`，版本默认为 V3.4。
+///
+/// 等价于 `decode_message_with_version(buf, None)`。
 pub fn decode_message(buf: &[u8]) -> Result<SmppMessage, RsmsError> {
     decode_message_with_version(buf, None)
 }
 
+/// 解码一条 SMPP PDU 字节序列为 `SmppMessage`，并指定协议版本。
+///
+/// SMPP 头部为 16 字节（比 CMPP/SMGP 多 4 字节的 `command_status`）。
+/// `version` 影响 `SubmitSm`/`DeliverSm` 中部分可选字段的最大长度限制（V5.0 放宽）；
+/// 传入 `None` 时默认按 V3.4 解码。
+/// 未知命令字映射为 `SmppMessage::Unknown`，不返回错误。
 pub fn decode_message_with_version(
     buf: &[u8],
     version: Option<SmppVersion>,

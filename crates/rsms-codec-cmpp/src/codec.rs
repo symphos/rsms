@@ -11,10 +11,14 @@ use crate::datatypes::{
 
 pub const MAX_PDU_SIZE: u32 = 65536;
 
+/// CMPP PDU 公共头（12 字节）：总长度 + 命令字 + 序列号。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PduHeader {
+    /// PDU 总字节数（含头部 12 字节）。
     pub total_length: u32,
+    /// 命令字，标识 PDU 类型（Submit、Deliver 等）。
     pub command_id: CommandId,
+    /// 请求/响应匹配用的序列号，由发送方递增分配。
     pub sequence_id: u32,
 }
 
@@ -61,13 +65,19 @@ impl PduHeader {
     }
 }
 
+/// PDU body 编码能力，由各具体 PDU 类型实现。
 pub trait Encodable {
+    /// 将 body 字段写入 `buf`，不含协议头。
     fn encode(&self, buf: &mut BytesMut) -> Result<(), CodecError>;
+    /// 返回 body 编码后的字节数（不含头部），用于预分配缓冲区。
     fn encoded_size(&self) -> usize;
 }
 
+/// PDU body 解码能力，由各具体 PDU 类型实现。
 pub trait Decodable: Sized {
+    /// 从 `buf` 中解码 body（头部已由调用方解析为 `header`）。
     fn decode(header: PduHeader, buf: &mut Cursor<&[u8]>) -> Result<Self, CodecError>;
+    /// 返回该 PDU 类型对应的命令字。
     fn command_id() -> CommandId;
 }
 
@@ -131,6 +141,7 @@ pub fn encode_cstring(buf: &mut BytesMut, value: &str, max_len: usize) -> Result
     rsms_core::encode_cstring(buf, value, max_len).map_err(Into::into)
 }
 
+/// CMPP 协议所有 PDU 类型的统一枚举，用于编解码层的统一分发。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pdu {
     Connect(Connect),
@@ -173,6 +184,9 @@ impl Pdu {
         }
     }
 
+    /// 将 PDU 序列化为带完整协议头的字节序列，封装为 `RawPdu`。
+    ///
+    /// `sequence_number` 写入头部序列号字段，调用方负责保证其唯一性和单调递增。
     pub fn to_pdu_bytes(&self, sequence_number: u32) -> RawPdu {
         // 预留 头(12) + body 容量，消除编码热路径的反复 realloc（对齐 SGIP 写法，
         // 同时让各 PDU 的 encoded_size() 真正发挥作用，不再是死代码）。

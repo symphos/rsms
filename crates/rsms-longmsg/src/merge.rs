@@ -39,6 +39,10 @@ impl PendingEntry {
     }
 }
 
+/// 长短信合并器，收集多段帧并在收齐所有分段后还原原始内容。
+///
+/// 使用惰性 TTL 清理策略：每次 `add_frame` 时若距上次清理已超过 TTL，
+/// 自动回收超时的未完成分组，防止内存无界增长。
 pub struct LongMessageMerger {
     pending_frames: HashMap<String, PendingEntry>,
     ttl: Duration,
@@ -46,6 +50,7 @@ pub struct LongMessageMerger {
 }
 
 impl LongMessageMerger {
+    /// 创建使用默认 TTL（60 秒）的合并器。
     pub fn new() -> Self {
         Self {
             pending_frames: HashMap::new(),
@@ -54,6 +59,7 @@ impl LongMessageMerger {
         }
     }
 
+    /// 创建使用指定 TTL 的合并器。常用于测试中设置较短超时。
     pub fn with_ttl(ttl: Duration) -> Self {
         Self {
             pending_frames: HashMap::new(),
@@ -62,12 +68,24 @@ impl LongMessageMerger {
         }
     }
 
+    /// 立即清理所有已超过 TTL 的未完成分组，释放内存。
+    ///
+    /// 通常无需手动调用，`add_frame` 会在超时后惰性触发；
+    /// 可在连接断开时主动调用以提前释放资源。
     pub fn cleanup_expired(&mut self) {
         self.pending_frames
             .retain(|_, entry| !entry.is_expired(self.ttl));
         self.last_cleanup = Instant::now();
     }
 
+    /// 向合并器提交一个长短信分段帧。
+    ///
+    /// - 若该帧是单段消息（`total_segments == 1` 且无 UDH），直接返回 `Ok(Some(content))`。
+    /// - 若该帧是重复帧（已收到过相同分段编号），返回 `Ok(None)`。
+    /// - 若该帧补齐了最后一段，去除各段的 UDH 头并按分段顺序拼接，返回 `Ok(Some(完整内容))`。
+    /// - 否则缓存该帧，返回 `Ok(None)`，等待后续分段到达。
+    ///
+    /// 每次调用会检查并惰性触发超时分组的清理（间隔 >= TTL 时触发）。
     pub fn add_frame(&mut self, frame: LongMessageFrame) -> Result<Option<Vec<u8>>, RsmsError> {
         // 惰性清理：距上次清理超过 ttl 即回收过期未完成分片，避免永不收齐的分片无界堆积导致 OOM。
         // 与框架「不缓存 MsgId 避免 OOM」的设计哲学一致——merger 同样必须有界。
@@ -109,6 +127,7 @@ impl LongMessageMerger {
         }
     }
 
+    /// 返回当前尚未收齐所有分段的长短信分组数量，可用于监控内存占用。
     pub fn pending_count(&self) -> usize {
         self.pending_frames.len()
     }

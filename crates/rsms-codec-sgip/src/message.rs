@@ -48,6 +48,11 @@ mod ice_truncation_tests {
     }
 }
 
+/// 解码一条 SGIP PDU 字节序列为 `SgipMessage`。
+///
+/// SGIP 头部为 20 字节（4B 长度 + 4B 命令字 + 12B `SgipSequence`），
+/// `sequence_id` 偏移为 12（与 SMPP 一致，不同于 CMPP/SMGP 的偏移 8）。
+/// 未知命令字映射为 `SgipMessage::Unknown`，不返回错误。
 pub fn decode_message(buf: &[u8]) -> Result<SgipMessage, RsmsError> {
     if buf.len() < 20 {
         return Err(RsmsError::Codec(

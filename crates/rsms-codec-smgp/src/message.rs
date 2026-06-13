@@ -71,6 +71,10 @@ impl SmgpMessage {
     }
 }
 
+/// 解码一条 SMGP PDU 字节序列为 `SmgpMessage`。
+///
+/// SMGP 协议无版本协商，直接按固定格式解码。
+/// 返回 `Err` 若头部不完整或命令字非法；未知命令字映射为 `SmgpMessage::Unknown`。
 pub fn decode_message(pdu: &[u8]) -> Result<SmgpMessage, RsmsError> {
     let mut cursor = Cursor::new(pdu);
     let header = PduHeader::decode(&mut cursor).map_err(|e| RsmsError::Codec(e.to_string()))?;
@@ -144,6 +148,9 @@ pub fn decode_message(pdu: &[u8]) -> Result<SmgpMessage, RsmsError> {
     }
 }
 
+/// 将 `SmgpMessage` 编码为完整的 PDU 字节序列（含协议头）。
+///
+/// `Unknown` 变体会将原始 body 原样写回，不做任何校验。
 pub fn encode_message(msg: &SmgpMessage) -> Result<Vec<u8>, RsmsError> {
     let seq = msg.sequence_id();
     let pdu = match msg {

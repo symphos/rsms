@@ -92,12 +92,6 @@ pub fn encoded_size_v20(submit: &SubmitV20) -> usize {
         + 8
 }
 
-fn encode_pstring_fixed(value: &str, max_len: usize) -> Vec<u8> {
-    let mut buf = BytesMut::new();
-    encode_pstring(&mut buf, value, max_len, "test").unwrap();
-    buf.to_vec()
-}
-
 pub fn encode_pdu_submit_v20(buf: &mut BytesMut, submit: &SubmitV20) -> Result<(), CodecError> {
     buf.put_slice(&submit.msg_id);
     buf.put_u8(submit.pk_total);
@@ -136,39 +130,6 @@ pub fn encode_pdu_submit_v20(buf: &mut BytesMut, submit: &SubmitV20) -> Result<(
     buf.put_slice(&submit.msg_content);
     buf.put_slice(&submit.reserve);
     Ok(())
-}
-
-pub fn build_submit_v20_pdu(seq_id: u32, submit: &SubmitV20) -> Vec<u8> {
-    let total_len = PduHeader::SIZE + encoded_size_v20(submit);
-    let mut pdu = Vec::with_capacity(total_len);
-    pdu.extend_from_slice(&(total_len as u32).to_be_bytes());
-    pdu.extend_from_slice(&(CommandId::Submit as u32).to_be_bytes());
-    pdu.extend_from_slice(&seq_id.to_be_bytes());
-    pdu.extend_from_slice(&submit.msg_id);
-    pdu.push(submit.pk_total);
-    pdu.push(submit.pk_number);
-    pdu.push(submit.registered_delivery);
-    pdu.push(submit.msg_level);
-    pdu.extend_from_slice(&encode_pstring_fixed(&submit.service_id, 10));
-    pdu.push(submit.fee_user_type);
-    pdu.extend_from_slice(&encode_pstring_fixed(&submit.fee_terminal_id, 21));
-    pdu.push(submit.tppid);
-    pdu.push(submit.tpudhi);
-    pdu.push(submit.msg_fmt);
-    pdu.extend_from_slice(&encode_pstring_fixed(&submit.msg_src, 6));
-    pdu.extend_from_slice(&encode_pstring_fixed(&submit.fee_type, 2));
-    pdu.extend_from_slice(&encode_pstring_fixed(&submit.fee_code, 6));
-    pdu.extend_from_slice(&encode_pstring_fixed(&submit.valid_time, 17));
-    pdu.extend_from_slice(&encode_pstring_fixed(&submit.at_time, 17));
-    pdu.extend_from_slice(&encode_pstring_fixed(&submit.src_id, 21));
-    pdu.push(submit.dest_usr_tl);
-    for dest in &submit.dest_terminal_ids {
-        pdu.extend_from_slice(&encode_pstring_fixed(dest, 21));
-    }
-    pdu.push(submit.msg_content.len() as u8);
-    pdu.extend_from_slice(&submit.msg_content);
-    pdu.extend_from_slice(&submit.reserve);
-    pdu
 }
 
 pub fn decode_submit_v20(
@@ -448,76 +409,6 @@ mod tests {
         pdu.push(deliver.msg_content.len() as u8);
         pdu.extend_from_slice(&deliver.msg_content);
         pdu
-    }
-
-    #[test]
-    fn test_decode_submit_v20_basic() {
-        let mut submit = SubmitV20::new();
-        submit.msg_id = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
-        submit.pk_total = 1;
-        submit.pk_number = 1;
-        submit.registered_delivery = 0;
-        submit.msg_level = 1;
-        submit.service_id = "SMS".to_string();
-        submit.fee_user_type = 0;
-        submit.fee_terminal_id = "13800138000".to_string();
-        submit.tppid = 0;
-        submit.tpudhi = 0;
-        submit.msg_fmt = 15;
-        submit.msg_src = "abc".to_string();
-        submit.fee_type = "01".to_string();
-        submit.fee_code = "000000".to_string();
-        submit.valid_time = "".to_string();
-        submit.at_time = "".to_string();
-        submit.src_id = "10655000000".to_string();
-        submit.dest_usr_tl = 1;
-        submit.dest_terminal_ids = vec!["13800138000".to_string()];
-        submit.msg_content = b"Hello CMPP2.0".to_vec();
-        submit.reserve = [0u8; 8];
-
-        let pdu_bytes = build_submit_v20_pdu(12345, &submit);
-        let mut cursor = std::io::Cursor::new(pdu_bytes.as_slice());
-        let header = PduHeader::decode(&mut cursor).unwrap();
-        let decoded = decode_submit_v20(header, &mut cursor).unwrap();
-
-        assert_eq!(decoded.pk_total, 1);
-        assert_eq!(decoded.pk_number, 1);
-        assert_eq!(decoded.registered_delivery, 0);
-        assert_eq!(decoded.msg_level, 1);
-        assert_eq!(decoded.service_id, "SMS");
-        assert_eq!(decoded.fee_user_type, 0);
-        assert_eq!(decoded.fee_terminal_id, "13800138000");
-        assert_eq!(decoded.tppid, 0);
-        assert_eq!(decoded.tpudhi, 0);
-        assert_eq!(decoded.msg_fmt, 15);
-        assert_eq!(decoded.msg_src, "abc");
-        assert_eq!(decoded.fee_type, "01");
-        assert_eq!(decoded.fee_code, "000000");
-        assert_eq!(decoded.src_id, "10655000000");
-        assert_eq!(decoded.dest_usr_tl, 1);
-        assert_eq!(decoded.dest_terminal_ids, vec!["13800138000"]);
-        assert_eq!(decoded.msg_content, b"Hello CMPP2.0");
-    }
-
-    #[test]
-    fn test_decode_submit_v20_multiple_dest() {
-        let mut submit = SubmitV20::new();
-        submit.dest_usr_tl = 3;
-        submit.dest_terminal_ids = vec![
-            "13800138001".to_string(),
-            "13800138002".to_string(),
-            "13800138003".to_string(),
-        ];
-        submit.msg_content = b"Test".to_vec();
-        submit.reserve = [0u8; 8];
-
-        let pdu_bytes = build_submit_v20_pdu(1, &submit);
-        let mut cursor = std::io::Cursor::new(pdu_bytes.as_slice());
-        let header = PduHeader::decode(&mut cursor).unwrap();
-        let decoded = decode_submit_v20(header, &mut cursor).unwrap();
-
-        assert_eq!(decoded.dest_usr_tl, 3);
-        assert_eq!(decoded.dest_terminal_ids.len(), 3);
     }
 
     #[test]

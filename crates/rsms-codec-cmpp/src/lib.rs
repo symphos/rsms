@@ -12,7 +12,7 @@ pub use codec::{
     decode_cstring, encode_cstring, CodecError, Decodable, Encodable, Pdu, PduHeader, MAX_PDU_SIZE,
 };
 pub use datatypes::{
-    build_submit_v20_pdu, decode_deliver_v20, decode_submit_v20, encoded_size_v20, ActiveTest,
+    decode_deliver_v20, decode_submit_v20, encoded_size_v20, ActiveTest,
     ActiveTestResp, Cancel, CancelResp, CmppReport, CmppVersion, CommandId, CommandStatus, Connect,
     ConnectResp, Deliver, DeliverResp, DeliverV20, Query, QueryResp, Submit, SubmitResp, SubmitV20,
     Terminate, TerminateResp,

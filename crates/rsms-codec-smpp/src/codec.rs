@@ -12,11 +12,18 @@ use crate::datatypes::{CommandId, CommandStatus};
 
 pub const MAX_PDU_SIZE: u32 = 65536;
 
+/// SMPP PDU 公共头（16 字节）：长度 + 命令字 + 状态码 + 序列号。
+///
+/// 注意 SMPP 头比 CMPP/SMGP 多 4 字节（`command_status`），`sequence_id` 偏移为 12。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PduHeader {
+    /// PDU 总字节数（含头部 16 字节）。
     pub command_length: u32,
+    /// 命令字，标识 PDU 类型（SubmitSm、DeliverSm 等）。
     pub command_id: CommandId,
+    /// 命令状态码，请求 PDU 须为 0（`ESME_ROK`），响应 PDU 携带操作结果。
     pub command_status: CommandStatus,
+    /// 请求/响应匹配用的序列号，0 和 0xFFFFFFFF 为保留值不可使用。
     pub sequence_number: u32,
 }
 
@@ -77,9 +84,13 @@ impl PduHeader {
     }
 }
 
+/// PDU body 编码能力，由各具体 PDU 类型实现。
 pub trait Encodable {
+    /// 将 body 字段写入 `buf`，不含协议头。
     fn encode(&self, buf: &mut BytesMut) -> Result<(), CodecError>;
+    /// 返回 body 编码后的字节数（不含头部），用于预分配缓冲区。
     fn encoded_size(&self) -> usize;
+    /// 将完整 PDU（含头部）序列化为 `Bytes`，适用于独立构造 PDU 的场景。
     fn to_bytes(&self) -> Bytes {
         let mut buf = BytesMut::new();
         self.encode(&mut buf).expect("encoding should not fail");
@@ -91,8 +102,11 @@ pub trait Encodable {
     }
 }
 
+/// PDU body 解码能力，由各具体 PDU 类型实现。
 pub trait Decodable: Sized {
+    /// 从 `buf` 中解码 body（头部已由调用方解析为 `header`）。
     fn decode(header: PduHeader, buf: &mut Cursor<&[u8]>) -> Result<Self, CodecError>;
+    /// 返回该 PDU 类型对应的命令字。
     fn command_id() -> CommandId;
 }
 

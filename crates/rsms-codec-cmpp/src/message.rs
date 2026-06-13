@@ -138,10 +138,18 @@ impl CmppMessage {
     }
 }
 
+/// 解码一条 CMPP PDU 字节序列为 `CmppMessage`，版本默认为 V3.0。
+///
+/// 等价于 `decode_message_with_version(pdu, None)`。
 pub fn decode_message(pdu: &[u8]) -> Result<CmppMessage, RsmsError> {
     decode_message_with_version(pdu, None)
 }
 
+/// 解码一条 CMPP PDU 字节序列为 `CmppMessage`，并指定协议版本。
+///
+/// `version` 为协议版本字节（如 `0x20` = V2.0，`0x30` = V3.0）；
+/// 传入 `None` 或无法识别的值时默认按 V3.0 解码。
+/// Submit 和 Deliver 的 V2.0/V3.0 结构不同，版本错误会导致解码失败或字段偏移错误。
 pub fn decode_message_with_version(
     pdu: &[u8],
     version: Option<u8>,
@@ -239,6 +247,9 @@ pub fn decode_message_with_version(
     Ok(msg)
 }
 
+/// 将 `CmppMessage` 编码为完整的 PDU 字节序列（含协议头）。
+///
+/// `Unknown` 变体会将原始 body 原样写回，不做任何校验。
 pub fn encode_message(msg: &CmppMessage) -> Result<Vec<u8>, RsmsError> {
     let seq = msg.sequence_id();
     let pdu = match msg {
