@@ -199,10 +199,12 @@ impl ClientHandler for SmgpClientHandler {
                     if deliver.is_report == 1 {
                         if let Some(report) = SmgpReport::parse(&deliver.msg_content) {
                             let count = self.report_count.fetch_add(1, Ordering::Relaxed) + 1;
+                            let msg_id_hex: String =
+                                report.msg_id.iter().map(|b| format!("{b:02x}")).collect();
                             tracing::info!(
                                 "[{}] 状态报告: msg_id={}, stat={}, src={}",
                                 count,
-                                report.msg_id,
+                                msg_id_hex,
                                 report.stat,
                                 deliver.src_term_id
                             );

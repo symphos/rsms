@@ -148,7 +148,7 @@ impl Decodable for Deliver {
 /// 格式: id:XXXXXXXXXX sub:000 dlvrd:000 submit date:YYYYMMDDHH done date:YYYYMMDDHH stat:XXXXXXX err:000 text:XXXXXXXXXXXXXXXXXXXX
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SmgpReport {
-    pub msg_id: String,      // 10 bytes
+    pub msg_id: [u8; 10],    // 10 字节二进制 MsgId（与 SubmitResp 一致，可能含非 ASCII 字节）
     pub sub: String,         // 3 bytes, 子短信数
     pub dlvrd: String,       // 3 bytes, 成功数
     pub submit_time: String, // 10 bytes, YYYYMMDDHH
@@ -168,31 +168,27 @@ impl SmgpReport {
         if data.len() < Self::LENGTH {
             return None;
         }
+        // SMGP 3.0.3 状态报告固定 122B，"id:" 后紧跟 10 字节二进制 MsgId（取值同 SubmitResp，
+        // 可能含非 UTF-8 字节）。旧实现对整段做 str::from_utf8，MsgId 含高位字节时即失败、
+        // 回执被静默丢弃；故须先按字节剥离 MsgId，其余字段才作 ASCII 文本解析。
+        if &data[..3] != b"id:" {
+            return None;
+        }
+        let mut msg_id = [0u8; 10];
+        msg_id.copy_from_slice(&data[3..13]);
 
-        let s = std::str::from_utf8(&data[..Self::LENGTH]).ok()?;
-
-        let msg_id = Self::extract_field(s, "id:")?;
-        let rest = s.split_once(&format!("id:{} ", msg_id))?.1;
+        // 从 MsgId 之后（" sub:..." 起）才是纯 ASCII 文本字段
+        let rest = std::str::from_utf8(&data[13..Self::LENGTH]).ok()?;
 
         let sub = Self::extract_field(rest, "sub:")?;
-        let rest = rest.split_once(&format!("sub:{} ", sub))?.1;
-
         let dlvrd = Self::extract_field(rest, "dlvrd:")?;
-        let rest = rest.split_once(&format!("dlvrd:{} ", dlvrd))?.1;
-
         let submit_time = Self::extract_field(rest, "submit date:")?;
-        let rest = rest.split_once(&format!("submit date:{} ", submit_time))?.1;
-
         let done_time = Self::extract_field(rest, "done date:")?;
-        let rest = rest.split_once(&format!("done date:{} ", done_time))?.1;
-
         let stat = Self::extract_field(rest, "stat:")?;
-        let rest = rest.split_once(&format!("stat:{} ", stat))?.1;
-
         let err = Self::extract_field(rest, "err:")?;
         let txt = rest
-            .split_once(&format!("err:{} text:", err))
-            .map(|(_, t)| t.trim_end().to_string())
+            .split_once("text:")
+            .map(|(_, t)| t.trim_end_matches('\0').trim_end().to_string())
             .unwrap_or_default();
 
         Some(SmgpReport {
@@ -220,9 +216,9 @@ impl SmgpReport {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(Self::LENGTH);
 
-        // id:
+        // id: + 10 字节二进制 MsgId
         bytes.extend_from_slice(b"id:");
-        bytes.extend_from_slice(self.msg_id.as_bytes());
+        bytes.extend_from_slice(&self.msg_id);
         bytes.push(b' ');
 
         //  sub:
@@ -545,7 +541,7 @@ mod tests {
     fn smgp_report_parse() {
         // Test with bytes produced by to_bytes()
         let report = SmgpReport {
-            msg_id: "0123456789".to_string(),
+            msg_id: *b"0123456789",
             sub: "001".to_string(),
             dlvrd: "001".to_string(),
             submit_time: "2026040512".to_string(),
@@ -558,7 +554,7 @@ mod tests {
         // Test round-trip
         let encoded = report.to_bytes();
         let parsed = SmgpReport::parse(&encoded).expect("parse should succeed");
-        assert_eq!(parsed.msg_id, "0123456789");
+        assert_eq!(&parsed.msg_id, b"0123456789");
         assert_eq!(parsed.sub, "001");
         assert_eq!(parsed.dlvrd, "001");
         assert_eq!(parsed.submit_time, "2026040512");
@@ -571,7 +567,7 @@ mod tests {
     #[test]
     fn smgp_report_to_bytes() {
         let report = SmgpReport {
-            msg_id: "0123456789".to_string(),
+            msg_id: *b"0123456789",
             sub: "001".to_string(),
             dlvrd: "001".to_string(),
             submit_time: "2026040512".to_string(),
@@ -584,8 +580,30 @@ mod tests {
         assert_eq!(bytes.len(), SmgpReport::LENGTH);
 
         let parsed = SmgpReport::parse(&bytes).unwrap();
-        assert_eq!(parsed.msg_id, "0123456789");
+        assert_eq!(&parsed.msg_id, b"0123456789");
         assert_eq!(parsed.stat, "DELIVRD");
+    }
+
+    #[test]
+    fn smgp_report_parse_binary_msgid() {
+        // 回归（2026-06 联调发现）：MsgId 含非 ASCII 高位字节时，旧 parse 对整段 str::from_utf8
+        // 失败、回执被静默丢弃。现按字节剥离 MsgId，含二进制字节的回执也应正确解析。
+        let msg_id = [0x68u8, 0x24, 0xEF, 0x06, 0x14, 0x00, 0x18, 0x71, 0x21, 0x80];
+        let report = SmgpReport {
+            msg_id,
+            sub: "001".to_string(),
+            dlvrd: "001".to_string(),
+            submit_time: "2606140018".to_string(),
+            done_time: "2606140018".to_string(),
+            stat: "DELIVRD".to_string(),
+            err: "000".to_string(),
+            txt: String::new(),
+        };
+        let encoded = report.to_bytes();
+        let parsed = SmgpReport::parse(&encoded).expect("含二进制 MsgId 的回执也应解析成功");
+        assert_eq!(parsed.msg_id, msg_id);
+        assert_eq!(parsed.stat, "DELIVRD");
+        assert_eq!(parsed.sub, "001");
     }
 
     #[test]
