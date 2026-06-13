@@ -374,14 +374,14 @@ pub async fn run_connection(
                 Protocol::Smpp => smpp_handler.handle_frame(&frame, conn_arc.clone()).await,
             };
 
-            // 影子比对：仅在 unified-shadow feature 开启时，对 SMGP 帧额外做统一模型解码。
+            // 影子比对：unified-shadow feature 开启时，对任意协议帧经 registry 做统一模型解码。
             // 只打日志，不接管实际处理，错误隔离不影响旧路径。
             #[cfg(feature = "unified-shadow")]
-            if protocol == Protocol::Smgp {
+            {
                 use rsms_model::ProtocolAdapter as _;
-                match rsms_codec_smgp::adapter::SmgpAdapter.decode(&frame) {
-                    Ok(unified) => tracing::debug!(conn_id = conn.id, ?unified, "shadow decode ok"),
-                    Err(e) => tracing::warn!(conn_id = conn.id, "shadow decode err: {e}"),
+                match crate::adapter_registry::adapter_for(protocol).decode(&frame) {
+                    Ok(unified) => tracing::debug!(conn_id = conn.id, proto = protocol.as_str(), ?unified, "shadow decode ok"),
+                    Err(e) => tracing::warn!(conn_id = conn.id, proto = protocol.as_str(), "shadow decode err: {e}"),
                 }
             }
 

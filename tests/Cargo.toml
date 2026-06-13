@@ -119,6 +119,9 @@ path = "sgip/sgip_longmsg_test.rs"
 name = "sgip-dynamic-connection-test"
 path = "sgip/dynamic_connection_test.rs"
 
+[features]
+unified-shadow = ["rsms-connector/unified-shadow"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tracing.workspace = true
