@@ -53,6 +53,16 @@ impl Encodable for Deliver {
         buf.put_u8(self.tppid);
         buf.put_u8(self.tpudhi);
         buf.put_u8(self.msg_fmt);
+        if self.message_content.len() > u32::MAX as usize {
+            return Err(CodecError::FieldValidation {
+                field: "message_content",
+                reason: format!(
+                    "正文长度 {} 超过 MessageLength(u32) 上限 {}",
+                    self.message_content.len(),
+                    u32::MAX
+                ),
+            });
+        }
         buf.put_u32(self.message_content.len() as u32);
         buf.put_slice(&self.message_content);
         buf.put_slice(&self.reserve);
@@ -386,6 +396,16 @@ mod tests {
         let decoded = decode_pdu::<Deliver>(&bytes).unwrap();
         assert_eq!(decoded.message_content, b"MO reply");
         assert_eq!(decoded.user_number, "13800138000");
+    }
+
+    #[test]
+    fn encode_oversized_msg_content_ok_u32_field() {
+        // 4A.6：MessageLength 是 u32，256 字节正文远在上限内，encode 应正常 Ok。
+        let mut deliver = Deliver::new();
+        deliver.user_number = "13800138000".to_string();
+        deliver.message_content = vec![0x41u8; 256];
+        let mut buf = BytesMut::new();
+        assert!(deliver.encode(&mut buf).is_ok());
     }
 
     #[test]

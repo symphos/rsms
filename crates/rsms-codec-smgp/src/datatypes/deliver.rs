@@ -66,6 +66,15 @@ impl Encodable for Deliver {
                 reason: e,
             }
         })?;
+        if self.msg_content.len() > u8::MAX as usize {
+            return Err(CodecError::FieldValidation {
+                field: "msg_content",
+                reason: format!(
+                    "正文长度 {} 超过 MsgLength(u8) 上限 255",
+                    self.msg_content.len()
+                ),
+            });
+        }
         buf.put_u8(self.msg_content.len() as u8);
         buf.put_slice(&self.msg_content);
         buf.put_slice(&self.reserve);
@@ -471,6 +480,16 @@ mod tests {
         assert_eq!(decoded.is_report, 0);
         assert_eq!(decoded.msg_content, b"MO message");
         assert_eq!(decoded.src_term_id, "13800138000");
+    }
+
+    #[test]
+    fn encode_oversized_msg_content_returns_err_not_truncate() {
+        // 4A.6：MsgLength 是 u8（上限 255）。正文 256 字节时旧代码静默截断为 0，
+        // 修复后 encode 必须返回 Err。
+        let mut deliver = Deliver::new();
+        deliver.msg_content = vec![0x41u8; 256];
+        let mut buf = BytesMut::new();
+        assert!(deliver.encode(&mut buf).is_err());
     }
 
     #[test]

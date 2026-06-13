@@ -143,6 +143,16 @@ impl Encodable for Submit {
         buf.put_u8(self.tpudhi);
         buf.put_u8(self.msg_fmt);
         buf.put_u8(self.message_type);
+        if self.message_content.len() > u32::MAX as usize {
+            return Err(CodecError::FieldValidation {
+                field: "message_content",
+                reason: format!(
+                    "正文长度 {} 超过 MessageLength(u32) 上限 {}",
+                    self.message_content.len(),
+                    u32::MAX
+                ),
+            });
+        }
         buf.put_u32(self.message_content.len() as u32);
         buf.put_slice(&self.message_content);
         buf.put_slice(&self.reserve);
@@ -342,6 +352,15 @@ mod tests {
         assert_eq!(decoded.service_type, "SMS");
         assert_eq!(decoded.fee_value, "000100");
         assert_eq!(decoded.user_numbers, vec!["13800138000"]);
+    }
+
+    #[test]
+    fn encode_oversized_msg_content_ok_u32_field() {
+        // 4A.6：MessageLength 是 u32，256 字节正文远在上限内，encode 应正常 Ok
+        // （不误伤回归；u32 域容得下，无需像 u8 协议那样报错）。
+        let submit = Submit::new().with_message("10655000000", "13800138000", &vec![0x41u8; 256]);
+        let mut buf = BytesMut::new();
+        assert!(submit.encode(&mut buf).is_ok());
     }
 
     #[test]

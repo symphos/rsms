@@ -149,6 +149,15 @@ impl Encodable for Submit {
             })?;
         }
         buf.put_u8(self.dest_terminal_type);
+        if self.msg_content.len() > u8::MAX as usize {
+            return Err(CodecError::FieldValidation {
+                field: "msg_content",
+                reason: format!(
+                    "正文长度 {} 超过 Msg_Length(u8) 上限 255",
+                    self.msg_content.len()
+                ),
+            });
+        }
         buf.put_u8(self.msg_content.len() as u8);
         buf.put_slice(&self.msg_content);
         encode_pstring(buf, &self.link_id, 20, "link_id").map_err(|e| {
@@ -380,6 +389,16 @@ mod tests {
         assert_eq!(decoded.fee_code, "000000");
         assert_eq!(decoded.src_id, "106900");
         assert_eq!(decoded.link_id, "ABC123");
+    }
+
+    #[test]
+    fn encode_oversized_msg_content_returns_err_not_truncate() {
+        // 4A.6：Msg_Length 是 u8（上限 255）。正文 256 字节时，旧代码
+        // `len() as u8` 会静默截断为 0，导致长度域与正文不符。修复后 encode
+        // 必须返回 Err，而非截断成功。
+        let submit = Submit::new().with_message("9000", "13800138000", &vec![0x41u8; 256]);
+        let mut buf = BytesMut::new();
+        assert!(submit.encode(&mut buf).is_err());
     }
 
     #[test]

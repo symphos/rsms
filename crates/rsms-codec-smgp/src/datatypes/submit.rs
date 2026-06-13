@@ -132,6 +132,15 @@ impl Encodable for Submit {
                 }
             })?;
         }
+        if self.msg_content.len() > u8::MAX as usize {
+            return Err(CodecError::FieldValidation {
+                field: "msg_content",
+                reason: format!(
+                    "正文长度 {} 超过 MsgLength(u8) 上限 255",
+                    self.msg_content.len()
+                ),
+            });
+        }
         buf.put_u8(self.msg_content.len() as u8);
         buf.put_slice(&self.msg_content);
         buf.put_slice(&self.reserve);
@@ -304,6 +313,15 @@ mod tests {
         assert_eq!(decoded.src_term_id, "1065900000");
         assert_eq!(decoded.dest_term_ids, vec!["13800138000"]);
         assert_eq!(decoded.msg_content, b"Hello");
+    }
+
+    #[test]
+    fn encode_oversized_msg_content_returns_err_not_truncate() {
+        // 4A.6：MsgLength 是 u8（上限 255）。正文 256 字节时旧代码 `len() as u8`
+        // 静默截断为 0，修复后 encode 必须返回 Err。
+        let submit = Submit::new().with_message("1065900000", "13800138000", &vec![0x41u8; 256]);
+        let mut buf = BytesMut::new();
+        assert!(submit.encode(&mut buf).is_err());
     }
 
     #[test]

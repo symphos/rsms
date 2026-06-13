@@ -123,6 +123,15 @@ pub fn encode_pdu_submit_v20(buf: &mut BytesMut, submit: &SubmitV20) -> Result<(
     for dest in &submit.dest_terminal_ids {
         encode_pstring(buf, dest, 21, "dest_terminal_id").map_err(|_| CodecError::Incomplete)?;
     }
+    if submit.msg_content.len() > u8::MAX as usize {
+        return Err(CodecError::FieldValidation {
+            field: "msg_content",
+            reason: format!(
+                "正文长度 {} 超过 Msg_Length(u8) 上限 255",
+                submit.msg_content.len()
+            ),
+        });
+    }
     buf.put_u8(submit.msg_content.len() as u8);
     buf.put_slice(&submit.msg_content);
     buf.put_slice(&submit.reserve);
@@ -395,6 +404,15 @@ pub fn encode_pdu_deliver_v20(buf: &mut BytesMut, deliver: &DeliverV20) -> Resul
     encode_pstring(buf, &deliver.src_terminal_id, 21, "src_terminal_id")
         .map_err(|_| CodecError::Incomplete)?;
     buf.put_u8(deliver.registered_delivery);
+    if deliver.msg_content.len() > u8::MAX as usize {
+        return Err(CodecError::FieldValidation {
+            field: "msg_content",
+            reason: format!(
+                "正文长度 {} 超过 Msg_Length(u8) 上限 255",
+                deliver.msg_content.len()
+            ),
+        });
+    }
     buf.put_u8(deliver.msg_content.len() as u8);
     buf.put_slice(&deliver.msg_content);
     Ok(())

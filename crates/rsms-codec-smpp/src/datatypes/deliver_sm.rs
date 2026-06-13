@@ -49,6 +49,15 @@ impl Encodable for DeliverSm {
         buf.put_u8(self.replace_if_present_flag);
         buf.put_u8(self.data_coding);
         buf.put_u8(self.sm_default_msg_id);
+        if self.short_message.len() > u8::MAX as usize {
+            return Err(CodecError::FieldValidation {
+                field: "short_message",
+                reason: format!(
+                    "正文长度 {} 超过 sm_length(u8) 上限 255",
+                    self.short_message.len()
+                ),
+            });
+        }
         buf.put_u8(self.short_message.len() as u8);
         buf.put_slice(&self.short_message);
         for tlv in &self.tlvs {
@@ -176,5 +185,39 @@ impl Decodable for DeliverSmResp {
 
     fn command_id() -> CommandId {
         CommandId::DELIVER_SM_RESP
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_oversized_msg_content_returns_err_not_truncate() {
+        // 4A.6：sm_length 是 u8（上限 255）。short_message 256 字节时旧代码
+        // `len() as u8` 静默截断为 0，修复后 encode 必须返回 Err。
+        let mut deliver = DeliverSm {
+            service_type: String::new(),
+            source_addr_ton: 0,
+            source_addr_npi: 0,
+            source_addr: String::new(),
+            dest_addr_ton: 0,
+            dest_addr_npi: 0,
+            destination_addr: String::new(),
+            esm_class: 0,
+            protocol_id: 0,
+            priority_flag: 0,
+            schedule_delivery_time: String::new(),
+            validity_period: String::new(),
+            registered_delivery: 0,
+            replace_if_present_flag: 0,
+            data_coding: 0,
+            sm_default_msg_id: 0,
+            short_message: Vec::new(),
+            tlvs: Vec::new(),
+        };
+        deliver.short_message = vec![0x41u8; 256];
+        let mut buf = BytesMut::new();
+        assert!(deliver.encode(&mut buf).is_err());
     }
 }

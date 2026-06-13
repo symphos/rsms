@@ -87,6 +87,15 @@ impl Encodable for SubmitSm {
         buf.put_u8(self.replace_if_present_flag);
         buf.put_u8(self.data_coding);
         buf.put_u8(self.sm_default_msg_id);
+        if self.short_message.len() > u8::MAX as usize {
+            return Err(CodecError::FieldValidation {
+                field: "short_message",
+                reason: format!(
+                    "正文长度 {} 超过 sm_length(u8) 上限 255",
+                    self.short_message.len()
+                ),
+            });
+        }
         buf.put_u8(self.short_message.len() as u8);
         buf.put_slice(&self.short_message);
         for tlv in &self.tlvs {
@@ -214,5 +223,19 @@ impl Decodable for SubmitSmResp {
 
     fn command_id() -> CommandId {
         CommandId::SUBMIT_SM_RESP
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_oversized_msg_content_returns_err_not_truncate() {
+        // 4A.6：sm_length 是 u8（上限 255）。short_message 256 字节时旧代码
+        // `len() as u8` 静默截断为 0，修复后 encode 必须返回 Err。
+        let submit = SubmitSm::new().with_message("13800138000", "9000", &vec![0x41u8; 256]);
+        let mut buf = BytesMut::new();
+        assert!(submit.encode(&mut buf).is_err());
     }
 }
