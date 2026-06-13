@@ -233,6 +233,64 @@ async fn start_test_server(port: u16) -> tokio::task::JoinHandle<()> {
     })
 }
 
+/// 4B.1 回归：连接断开时应立即 drain 所有在途 send_request 请求并返回 Err，
+/// 而非让它们各自挂到 endpoint.timeout（断开-重连场景的延迟尖峰）。
+#[tokio::test]
+async fn test_pending_requests_fail_immediately_on_disconnect() {
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    // 假 server：accept 后只读不回，使请求永远收不到响应。
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                while sock.read(&mut buf).await.unwrap_or(0) > 0 {}
+            });
+        }
+    });
+
+    // timeout 设 30s，以区分「断开立即失败」与「挂到超时失败」。
+    let endpoint = Arc::new(
+        EndpointConfig::new("test-4b1", "127.0.0.1", port, 100, 60)
+            .with_timeout(Duration::from_secs(30)),
+    );
+    let handler = Arc::new(TransactionTestHandler::new());
+    let conn = ClientBuilder::new(endpoint, handler, CmppDecoder)
+        .client_config(Default::default())
+        .connect()
+        .await
+        .unwrap();
+
+    // 发一个请求，server 永不回复 → 进入 pending_responses 等待。
+    let connect = Connect {
+        source_addr: TEST_ACCOUNT.to_string(),
+        authenticator_source: [0u8; 16],
+        version: 0x30,
+        timestamp: 0,
+    };
+    let connect_pdu: Pdu = connect.into();
+    let fut = conn
+        .send_request(connect_pdu.to_pdu_bytes(1))
+        .await
+        .expect("send_request 应成功入队");
+
+    // 断开连接：应立即 drain 在途请求并使其失败。
+    conn.mark_disconnected().await;
+
+    // future 应在远短于 timeout(30s) 内返回 Err(ConnectionClosed)。
+    match tokio::time::timeout(Duration::from_secs(2), fut).await {
+        Ok(Err(rsms_core::RsmsError::ConnectionClosed(_))) => {}
+        Ok(other) => panic!("期望 ConnectionClosed Err，实得 {:?}", other),
+        Err(_) => panic!("future 未在 2s 内返回——断开未 drain 在途请求（回归）"),
+    }
+}
+
 #[tokio::test]
 async fn test_transaction_manager_integration() {
     let _ = tracing_subscriber::fmt()

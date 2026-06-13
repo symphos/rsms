@@ -346,6 +346,14 @@ impl ClientConnection {
         if let Some(tx) = self.event_tx.lock().await.take() {
             let _ = tx.send(ConnectionEvent::disconnected(self.id)).await;
         }
+        // 连接断开：立即让所有在途 send_request 失败，而非各自挂到 endpoint.timeout。
+        // 否则断开-重连场景下大量在途请求全部卡满超时窗口，造成延迟尖峰。
+        let mut pending = self.pending_responses.lock().await;
+        for (_, tx) in pending.drain() {
+            let _ = tx.send(Err(RsmsError::ConnectionClosed(
+                "connection closed while awaiting response".to_string(),
+            )));
+        }
     }
     
     pub fn config(&self) -> &ClientConfig {
