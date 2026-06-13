@@ -383,6 +383,7 @@ dependencies = [
  "md-5",
  "num_enum",
  "rsms-core",
+ "rsms-model",
  "thiserror",
 ]
 

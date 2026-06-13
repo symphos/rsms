@@ -10,4 +10,5 @@ bytes.workspace = true
 md-5.workspace = true
 num_enum.workspace = true
 rsms-core = { path = "../rsms-core" }
+rsms-model = { path = "../rsms-model" }
 thiserror.workspace = true
