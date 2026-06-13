@@ -174,7 +174,9 @@ impl Pdu {
     }
 
     pub fn to_pdu_bytes(&self, sequence_number: u32) -> RawPdu {
-        let mut buf = BytesMut::new();
+        // 预留 头(12) + body 容量，消除编码热路径的反复 realloc（对齐 SGIP 写法，
+        // 同时让各 PDU 的 encoded_size() 真正发挥作用，不再是死代码）。
+        let mut buf = BytesMut::with_capacity(12 + self.encoded_size());
 
         buf.resize(12, 0);
 
