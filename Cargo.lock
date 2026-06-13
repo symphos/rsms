@@ -371,6 +371,7 @@ dependencies = [
  "async-trait",
  "rsms-codec-cmpp",
  "rsms-core",
+ "rsms-model",
  "tracing",
 ]
 
@@ -514,6 +515,7 @@ dependencies = [
  "rsms-connector",
  "rsms-core",
  "rsms-longmsg",
+ "rsms-model",
  "rsms-session",
  "rsms-test-common",
  "tokio",
