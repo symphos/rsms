@@ -2,8 +2,8 @@ use bytes::Buf;
 use rsms_core::RsmsError;
 use std::io::Cursor;
 
-use crate::codec::decode_cstring;
-use crate::datatypes::{DeliverSm, SubmitSm};
+use crate::codec::{decode_cstring, CodecError};
+use crate::datatypes::{DeliverSm, SubmitSm, Tlv};
 use crate::version::SmppVersion;
 
 fn default_version(version: Option<SmppVersion>) -> SmppVersion {
@@ -79,6 +79,15 @@ pub fn decode_submit_sm(
         vec![]
     };
 
+    let mut tlvs = Vec::new();
+    while cursor.has_remaining() {
+        match Tlv::decode(&mut cursor) {
+            Ok(tlv) => tlvs.push(tlv),
+            Err(CodecError::Incomplete) => break,
+            Err(e) => return Err(RsmsError::Codec(e.to_string())),
+        }
+    }
+
     Ok(SubmitSm {
         service_type,
         source_addr_ton,
@@ -97,7 +106,7 @@ pub fn decode_submit_sm(
         data_coding,
         sm_default_msg_id,
         short_message,
-        tlvs: vec![],
+        tlvs,
     })
 }
 
@@ -170,6 +179,15 @@ pub fn decode_deliver_sm(
         vec![]
     };
 
+    let mut tlvs = Vec::new();
+    while cursor.has_remaining() {
+        match Tlv::decode(&mut cursor) {
+            Ok(tlv) => tlvs.push(tlv),
+            Err(CodecError::Incomplete) => break,
+            Err(e) => return Err(RsmsError::Codec(e.to_string())),
+        }
+    }
+
     Ok(DeliverSm {
         service_type,
         source_addr_ton,
@@ -188,6 +206,6 @@ pub fn decode_deliver_sm(
         data_coding,
         sm_default_msg_id,
         short_message,
-        tlvs: vec![],
+        tlvs,
     })
 }
