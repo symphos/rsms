@@ -227,3 +227,89 @@ P1 的 window/decode/flush/锁/去拷贝改动均验证正确。但审查追查�
 2. **API builder 化**：✅ builder 化且**不保留旧签名**，同步改示例/文档（阶段 2.3）。
 3. **推进节奏**：✅ 先完成阶段 0，验证通过后停下评审，再决定后续。
 4. 提交粒度：阶段 0 作为一个修复提交（或按 0.1/0.2 两提交）。
+
+---
+
+## 阶段 4（P4）：压测盲区缺陷 —— 二轮架构研究（2026-06-13）
+
+> 体检方式：三路并行 `architect`（连接核心/并发 · 四协议 codec · API/错误/longmsg/测试）只读分析 + 主调逐项源码核实。
+> 标记：✅ = 已逐行核对源码确认为真；⚠️ = agent 报告，实施前需复核。
+> **关键洞察**：阶段 0–3 与既有压测覆盖的是**主路径**（固定长连接 5×5×300s、MT/MO 收发、解码安全）。本轮发现的缺陷集中在**压测覆盖不到的区域**——连接断开/重连路径、配置边界、以及 `rsms-longmsg` 业务工具库（connector 内零引用，压测从不经过）。故基线零丢失**并不能**证明这些路径无缺陷。
+
+### 4A 必修（正确性）—— 真实可触发缺陷，逐项已核实
+
+#### 4A.1 ✅ 服务端连接断开后从不从 `AccountConnections` 移除（内存泄漏）
+- **位置**：`connection.rs` `run_connection` 收尾仅 `mark_disconnected` + 回调；`server.rs:182` spawn 收尾只 `pool2.remove(id)`（移除的是 `ConnectionPool`）。连接在 `connection.rs` 经 `acc_pool.add_connection` 注册进 `AccountConnections.connections`，但 `remove_connection`(pool.rs:119) 的**唯一调用点**是 `pool.rs:198` 的缩容 `evict_excess_connections`。
+- **影响**：每条断开连接的 `Arc<Connection>`（含 `OwnedWriteHalf`、多个 Mutex）永久驻留向量 → 长期重连下内存单调增长；`fetch_available_connection` 线性扫描成本随泄漏增长。`HealthChecker::check_connections` 只打日志不移除。
+- **触发**：任何生产环境客户端重连（压测固定长连接，永不触发）。
+- **改动**：`run_connection` 收尾取 `account_connections` 调 `remove_connection(conn.id)`（早期未认证即断开的连接本就没注册，逻辑天然安全）；可叠加 `HealthChecker` 兜底回收。
+- **验证**：新增「重复连接-断开 N 次后 `connection_count()` 回落」测试。
+
+#### 4A.2 ✅ `SmoothRateLimiter` `max_qps=0` 整数除零 panic
+- **位置**：`smooth_rate_limiter.rs:30`（`new`）、`:90`（`set_rate`）：`Duration::from_micros(1_000_000 / max_qps)`。
+- **影响**：`AccountConfigProvider` 返回 `max_qps=0`（配置错误）即在账号注册/配置更新的 IO 路径上 panic。
+- **改动**：入口 `let qps = max_qps.max(1);`（或返回 `Result`）。
+- **验证**：`max_qps=0` 构造不再 panic 的单测。
+
+#### 4A.3 ✅ 长短信 16-bit UDH 分段超长 1 字节（违反 GSM 03.40）
+- **位置**：`split.rs:56-62` 分段步长固定 `max_per_segment - UDH_HEADER_LEN`（`UDH_HEADER_LEN=6`，frame.rs:7），但 16-bit 分支 `build_16bit_udh_frame`(split.rs:108-126) 拼 **7** 字节头。故 `frame_content = 7 + 147 = 154 > 153`（GSM 多段上限）。UCS2 分支同理（67-6 vs 67-7）。
+- **触发**：`reference_id` 由随机种子生成，**多数 >255 即默认走 16-bit 分支**，几乎每条多段长短信都超长。
+- **改动**：先决定 ref_id 宽度，步长按实际 UDH 长度（8-bit=6 / 16-bit=7）计算。
+- **验证**：断言每段 `frame_content.len() <= 协议上限`（现有 split→merge 往返测试没断言字节上限，故漏掉）。
+
+#### 4A.4 ✅ 删除 `InMemoryFrameCache`（async 上下文必 panic 的死重复代码）
+- **位置**：`cache.rs:49/59/66/75` `put/get/remove/cleanup` 在同步方法内 `Handle::current().block_on()` —— 在 tokio 任务里调用必 panic（"Cannot block the current thread from within a runtime"）。
+- **理由**：与 `LongMessageMerger` 功能重复（均 `HashMap + TTL`）且实现质量更低；connector 内**零引用**；构造时已另起后台清理任务，`cleanup()` 方法本身多余。
+- **改动**：删除 `cache.rs` 整个 `FrameCache`/`InMemoryFrameCache`（workspace 内零引用，破坏面极小）；统一用 `LongMessageMerger`。
+- **验证**：删除后 `cargo build --workspace` + 全测试全绿。
+
+#### 4A.5 ✅ `LongMessageMerger` 不完整分片无自动 TTL 清理（OOM）+ ref_id 跨会话碰撞
+- **位置**：`merge.rs:62` `cleanup_expired` 定义但**全仓零调用点**；`frame.rs:120` `unique_id = "{ref_id}-{total}"` 不含主/被叫号码。
+- **影响**：MO 接收丢段（常见）→ `PendingEntry` 永久驻留 → 内存无界；16 位 ref_id 不含号码 → 高并发跨会话碰撞 → 两条长短信内容串台。与框架「不缓存 MsgId 避免 OOM」哲学一致——merger 也必须有界。
+- **改动**：(a) `add_frame` 内惰性触发 `cleanup_expired`（记 `last_cleanup`）或文档强制调用方周期清理；(b) `unique_id` 纳入号码维度。
+- **验证**：「只发 N-1 段 + 推进时间 → `pending_count()` 归 0」「相同 ref_id 不同号码不被错并」两个测试。
+
+#### 4A.6 ⚠️ 编码侧长度字段 `.len() as u8/u32` 静默截断（错帧）
+- **位置**：`codec-*/datatypes/submit*.rs` 等约 11 处 `put_u8(x.len() as u8)`（CMPP/SMGP 单字节长度）/`put_u32(... as u32)`。
+- **影响**：正文 >255（单字节长度域）时静默截断，PDU 长度字段与实际正文不符 → 对端解析错帧/丢字节。是阶段 0「解码越界守卫」的对称编码面。
+- **改动**：encode 入口校验 `len`，超限返回 `CodecError::FieldValidation`。
+- **验证**：超长正文 encode 断言返回 `Err` 的单测。
+
+### 4B 健壮性 / 可维护性（建议）
+- **4B.1 ✅** 客户端断开时 `pending_responses` 不批量 drain（`client.rs:784` `mark_disconnected` 不清理）→ 在途请求挂到各自 timeout 才失败（有 per-request timeout 兜底，故为延迟尖峰非永久泄漏）。改：断开时 `drain()` 全部 `send(Err(ConnectionClosed))`。
+- **4B.2 ✅** `account_pool` 账号条目永不回收（`pool.rs:374` `remove` 无调用点）+ `inbound_fetch_loop` 无退出条件、空账号下僵尸任务空转。改：空闲账号由 `HealthChecker` 定期 `remove`，fetch loop 加退出条件并递减线程计数。
+- **4B.3 ⚠️** `EndpointConfig.protocol` 裸 `String`，拼错/漏设静默退化为 cmpp 偏移（AGENTS Discovery#9 记录的 SMPP TPS 骤降根因）。改：`enum Protocol { Cmpp, Smgp, Smpp, Sgip }` 派生 `header_len()`/`seq_offset()`，并由 `with_decoder` 推导。**对外破坏性变更**，需同步示例/文档。
+- **4B.4 ⚠️** `RawPdu::sequence_id()`(encoded_pdu.rs:63) 硬编码偏移 8–11，对 SMPP/SGIP（12–15）错误的潜伏陷阱。随 4B.3 一并处理或加文档限定。
+- **4B.5 ⚠️** codec→connector `From<CodecError>` 一律 `to_string()` 压成 `String`，连接层丢失 `Incomplete`（半包）vs 真错误的可编程区分。改：`RsmsError` 携带 codec 错误分类枚举，至少保留 `Incomplete` 语义位。
+
+### 4C 性能微调（可选，需 profile 佐证）
+- **4C.1 ⚠️** CMPP/SMGP `to_pdu_bytes`(codec.rs:177/144) 用 `BytesMut::new()` 不预留容量 → 每条 encode realloc，且各 PDU 的 `encoded_size()` 沦为死代码。改：`with_capacity(12 + encoded_size())` 对齐 SGIP。
+- **4C.2 ⚠️** `transaction::on_report`(mod.rs:193-221) 兜底分支 O(n) 全表扫描；按命中率决定是否加反向索引。
+- **4C.3 ⚠️** server `inbound_fetch_loop` inflight 信号量两次独立读 `window_size`（TOCTOU），配置中途改 0 会令计数器永偏高、账号外发卡死。改：单次读 + RAII guard 配对。
+- **4C.4 ⚠️** `client.rs:732` 每条响应 `tokio::spawn` 一个 drain-pending 任务 → 任务创建开销 + 并发 drain 竞态。改：长驻单 drain 任务 + `Notify`。
+- **4C.5 ⚠️** 锁类型对齐：服务端 `Connection.last_active` 用 `tokio::Mutex<Instant>`，客户端用 `StdMutex`；`last_active` 可 `AtomicU64`，`authenticated_account`/`account_connections` 认证后不变可去锁。
+- **4C.6 ⚠️** SGIP/SMPP `message.rs` 解码 body 多余 `.to_vec()`，可借用 `&buf[H..body_end]` 建 Cursor。
+
+### 4D 合规（doc + 测试）
+- **4D.1** 补公共 API doc 注释（项目硬约定）：`BusinessHandler`/`InboundContext`（尤其固化「收到 Submit 必须业务方回 Resp」契约）、`MessageSource`/`MessageItem`、longmsg 全部 pub API、各 codec `decode_message`/`encode_message`/`Pdu`/`PduHeader`。
+- **4D.2** 下沉三份重复 `CodecError`（CMPP/SMGP/SGIP 近乎逐字节相同）+ `to_command_status()` 到 `rsms-core`，四 crate 复用。
+- **4D.3** 补测试盲区：① 长短信分段字节上限（漏掉 4A.3）；② Merger TTL 回收 & ref_id 碰撞（4A.5）；③ 连接断开后资源回收（4A.1/4B.1）；④ `with_protocol` 误用退化行为；⑤ codec `Incomplete` 半包语义跨层。
+
+### 4A 实施记录（2026-06-13）
+全部 TDD（先写失败测试看红 → 修 → 验证绿）。回归基线：改动前四协议压测零丢失、TPS 12,542.x。
+- ✅ **4A.2 除零**：`smooth_rate_limiter.rs` `new`/`set_rate` 入口 `max_qps.max(1)`；新增 `new_with_zero_qps_does_not_panic`、`set_rate_zero_does_not_panic`（红：两处 `divide by zero` → 绿 5 passed）。
+- ✅ **4A.3 16-bit 分段**：`split.rs` 改按实际 UDH 宽度（8-bit=6 / 16-bit=7）算 `payload_per_segment`，段数用 `div_ceil`；import 换 `UDH_HEADER_8BIT_LEN`/`UDH_HEADER_16BIT_LEN`。新增 4 测试（GSM/UCS2 上限断言 + 8-bit 回归 + 去头往返还原）（红：154>153、68>67 → 绿）。
+- ✅ **4A.4 删 cache**：删除 `cache.rs`（`InMemoryFrameCache`，async 上下文 `block_on` 必 panic 的死重复代码，全仓零引用）；`lib.rs` 移除 `mod cache` + 再导出。
+- ✅ **4A.5 Merger TTL**：`merge.rs` 加 `last_cleanup` 字段，`add_frame` 入口距上次清理超 ttl 即惰性 `cleanup_expired`，防丢段无界堆积 OOM。新增 `cleanup_expired_removes_stale_incomplete_entries`、`add_frame_triggers_lazy_cleanup_of_stale_entries`（红：pending=2≠1 → 绿）。**号码维度 key**（`unique_id` 跨会话碰撞）因 `LongMessageFrame` 无号码字段，属 API 变更，移至 4B/文档。
+- ✅ **4A.1 连接泄漏**：`connection.rs` `run_connection` 收尾补 `conn.account_connections() → remove_connection(conn_id)`，与 `mark_disconnected` 同处注销。新增集成测试 `test_disconnected_connections_removed_from_account_pool`（裸 TcpStream 4 连接，断开前 4 → 断开后 0）。
+- ✅ **4A.6 编码截断**：10 处正文长度域 encode 前校验 `len ≤ u8/u32 上限`，超限返回 `CodecError::FieldValidation`（CMPP 4 + SMGP 2 + SMPP 2 + SGIP 2 u32）。四协议各加 encode 超长测试（cmpp43/smgp33/smpp10/sgip18 全绿）。
+  - **遗留（→ 4D 死代码清理）**：`codec-cmpp/datatypes/v20.rs:159` `build_submit_v20_pdu`（pub、二级再导出、不返回 Result）同样截断，但**全仓零生产调用点**，生产 V2.0 encode 走已修的 `encode_pdu_submit_v20`，截断 bug **生产不可达**；`message.rs:321` 为 `#[cfg(test)]` 测试夹具。两者均建议作为死代码删除或改签名，不在 4A.6「生产可达缺陷」范围内强行改 API。
+
+### 阶段 4 验收
+- 4A 每项 TDD（先写失败测试再修）；`cargo build --workspace` + `cargo test --workspace --lib` + 四协议集成测试全绿；四协议多账号压测复跑零丢失、TPS ≥ 基线。
+- 提交按子项拆分：`fix:`（4A/4B 缺陷）、`perf:`（4C）、`docs:`/`test:`（4D）。
+
+### 决策点（待确认）
+- **4B.3 protocol enum**：是否接受对外 API 破坏性变更（builder 已重构过，迁移成本可控）？
+- **4A.4 删除 cache**：确认 workspace 外无第三方依赖该 pub 类型。
+- **推进顺序**：建议 4A 全修 → 评审 → 再决定 4B/4C/4D。
