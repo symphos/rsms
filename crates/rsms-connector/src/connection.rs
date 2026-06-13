@@ -119,7 +119,7 @@ impl Connection {
             let ctx = self.ctx.lock().await;
             ctx.mark_disconnected();
         }
-        if let Some(close_pkt) = encode_close_packet(self.config.protocol) {
+        if let Some(close_pkt) = close_packet(self.config.protocol) {
             let _ = self.write_frame(&close_pkt).await;
         }
         {
@@ -344,7 +344,7 @@ pub async fn run_connection(
             Err(_) => {
                 if conn.is_idle(idle_timeout).await {
                     tracing::warn!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), idle_timeout_secs = idle_timeout.as_secs(), "connection idle timeout, closing");
-                    if let Some(close_pkt) = encode_close_packet(protocol) {
+                    if let Some(close_pkt) = close_packet(protocol) {
                         let _ = conn.write_frame(&close_pkt).await;
                     }
                     break;
@@ -537,4 +537,44 @@ fn encode_close_packet(protocol: Protocol) -> Option<Vec<u8>> {
         pdu.extend_from_slice(&[0u8; 1]);
     }
     Some(pdu)
+}
+
+/// 关闭包编码（部分收敛）：CMPP/SGIP/SMPP 经 adapter 统一编码（已门控字节相等）；
+/// SMGP 旧实现带 1 字节保留位、与 adapter(12B) 不一致，保留旧实现以不改变上线字节。
+/// 非 SMGP 协议若 adapter 编码意外失败，兜底回旧实现。
+fn close_packet(protocol: Protocol) -> Option<Vec<u8>> {
+    use rsms_model::ProtocolAdapter as _;
+    match protocol {
+        Protocol::Smgp => encode_close_packet(protocol),
+        _ => crate::adapter_registry::adapter_for(protocol)
+            .encode(&rsms_model::UnifiedMessage::Unbind, 0)
+            .ok()
+            .or_else(|| encode_close_packet(protocol)),
+    }
+}
+
+#[cfg(test)]
+mod converge_close_gating {
+    use super::*;
+    use crate::adapter_registry::adapter_for;
+    use rsms_model::{ProtocolAdapter as _, UnifiedMessage};
+
+    /// 锁定收敛：CMPP/SGIP/SMPP 的 adapter Unbind 编码须与旧 encode_close_packet 字节一致。
+    #[test]
+    fn converged_close_arms_byte_identical() {
+        for p in [Protocol::Cmpp, Protocol::Sgip, Protocol::Smpp] {
+            let legacy = encode_close_packet(p);
+            let via = adapter_for(p).encode(&UnifiedMessage::Unbind, 0).ok();
+            assert_eq!(via, legacy, "{p:?} close：adapter 应与旧实现字节一致（已收敛）");
+        }
+    }
+
+    /// 锁定已知差异：SMGP 旧关闭包多 1 字节保留位，与 adapter(12B) 不一致，故保留旧路径。
+    /// 若此断言失败，说明差异已消除，可将 SMGP 也纳入收敛。
+    #[test]
+    fn smgp_close_known_divergence() {
+        let legacy = encode_close_packet(Protocol::Smgp);
+        let via = adapter_for(Protocol::Smgp).encode(&UnifiedMessage::Unbind, 0).ok();
+        assert_ne!(via, legacy, "SMGP close 预期字节不一致（旧 13B vs adapter 12B）");
+    }
 }
