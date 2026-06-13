@@ -1,0 +1,4 @@
+# 统一所有文本文件行尾为 LF，消除 Windows(Git Bash autocrlf=true) 与 WSL(autocrlf 未设置)
+# 的行尾视角差异。此前不同 git 环境 commit 导致整文件行尾翻转、污染 diff（见项目记忆）。
+# text=auto 让 git 自动识别文本/二进制；eol=lf 强制文本文件签出与入库均为 LF。
+* text=auto eol=lf
