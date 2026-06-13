@@ -323,6 +323,7 @@ P1 的 window/decode/flush/锁/去拷贝改动均验证正确。但审查追查�
 - ✅ **4A.6 遗留死代码清理**：删除 codec-cmpp `v20.rs::build_submit_v20_pdu`（pub、含截断隐患、全仓零生产调用）连同私有辅助 `encode_pstring_fixed`、2 个唯一调用测试、`datatypes/mod.rs`+`lib.rs` 再导出；生产 V2.0 编码走 `encode_pdu_submit_v20`。
 - ⏭️ **4D.2 CodecError 下沉暂缓**：跨 4 crate 架构改动，且 SMPP 的 `CodecError` 与 CMPP/SMGP/SGIP 不完全相同（去重不彻底），纯去重无功能收益、有破坏 `From` 实现风险，记为可单独专项。
 - ✅ **4D.3 测试盲区核实**：分段上限/Merger TTL/连接回收/pending drain 已在 4A/4B 补齐；`with_protocol` 误用经 4B.3 已变编译期（N/A）；半包语义 4B.5 已核实暂缓。无新增缺口。
+  - **P0–P2 长稳/异常注入测试落地（生产就绪加固）**：资源采样基建 `ResourceSampler`（RSS/fd + 稳定性断言）；`cmpp-soak-test`（周期断连重连长稳，`RSMS_SOAK_SECS` 驱动，实证 4A.1 零泄漏）；`cmpp-fault-injection-test`（畸形流不崩 + 逐字节分片重组）；`cmpp-soak-dynamic-test`（动态账号轮换，量化 4B.2 ~17KB/账号）；`cmpp-network-fault-test`（**纯 Rust** 故障代理：高延迟认证 + 中途突断清理）。网络层故障用测试内 tokio 代理模拟，**无需 toxiproxy 等外部工具、生产零依赖**。真实运营商联调 + 天级长稳实跑需真实环境（框架入口已就绪）。
 
 ### 阶段 4 验收
 - 4A 每项 TDD（先写失败测试再修）；`cargo build --workspace` + `cargo test --workspace --lib` + 四协议集成测试全绿；四协议多账号压测复跑零丢失、TPS ≥ 基线。

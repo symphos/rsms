@@ -48,6 +48,10 @@ path = "cmpp/fault_injection_test.rs"
 name = "cmpp-soak-dynamic-test"
 path = "cmpp/soak_dynamic_test.rs"
 
+[[test]]
+name = "cmpp-network-fault-test"
+path = "cmpp/network_fault_test.rs"
+
 # SMGP
 [[test]]
 name = "smgp-integration"
