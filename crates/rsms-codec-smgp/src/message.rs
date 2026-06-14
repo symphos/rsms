@@ -165,7 +165,7 @@ pub fn encode_message(msg: &SmgpMessage) -> Result<Vec<u8>, RsmsError> {
             crate::codec::Pdu::ActiveTestResp(ActiveTestResp { reserved: 0 })
         }
         SmgpMessage::Exit { .. } => crate::codec::Pdu::Exit(Exit),
-        SmgpMessage::ExitResp { .. } => crate::codec::Pdu::ExitResp(ExitResp { reserved: 0 }),
+        SmgpMessage::ExitResp { .. } => crate::codec::Pdu::ExitResp(ExitResp),
         SmgpMessage::Unknown {
             command_id, body, ..
         } => {

@@ -1,10 +1,18 @@
 use async_trait::async_trait;
 use rsms_business::{BusinessHandler, InboundContext};
+// 窄腰统一模型：V3.0-only 的构造（Bind/Submit/Deliver-MO）经 CmppAdapter。
+// 但本测试同时覆盖 CMPP 2.0 长短信（SubmitV20/DeliverV20 + decode_message_with_version），
+// 而 adapter 仅 V3.0，无法表达 V2.0；故版本化 decode（biz/client handler）与全部 V2.0 构造保留裸
+// codec（规则 3：纯 V2.0 wire 路径不可经统一模型表达）。compute_connect_auth 是鉴权工具，保留。
+use rsms_codec_cmpp::adapter::CmppAdapter;
 use rsms_codec_cmpp::{
     decode_message, decode_message_with_version, auth::compute_connect_auth,
-    CmppMessage, CommandId, Connect, Decodable, Deliver, DeliverV20, DeliverResp, Pdu, Submit,
+    CmppMessage, CommandId, DeliverV20, DeliverResp, Pdu,
     SubmitResp, SubmitV20,
-    codec::PduHeader,
+};
+use rsms_model::{
+    Address, CmppExtra, Encoding, ProtocolAdapter, ProtocolExtra, Sequence, UnifiedBind,
+    UnifiedDeliver, UnifiedMessage, UnifiedSubmit,
 };
 use rsms_connector::{
     ClientBuilder, ServerBuilder, AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler,
@@ -143,14 +151,18 @@ impl LongMsgClientHandler {
     fn build_connect_pdu(&self) -> RawPdu {
         let timestamp = 0u32;
         let auth = compute_connect_auth(TEST_ACCOUNT, TEST_PASSWORD, timestamp);
-        let connect = Connect {
-            source_addr: TEST_ACCOUNT.to_string(),
-            authenticator_source: auth,
-            version: self.version,
+        // 统一 Bind：version 字段承载握手版本（0x20/0x30）；Connect PDU 字节结构与版本无关。
+        let bind = UnifiedMessage::Bind(UnifiedBind {
+            client_id: TEST_ACCOUNT.to_string(),
+            authenticator: auth.to_vec(),
             timestamp,
-        };
-        let pdu: Pdu = connect.into();
-        pdu.to_pdu_bytes(self.next_seq())
+            version: self.version,
+            system_type: None,
+            mode: rsms_model::BindMode::default(),
+            login_mode: None,
+        });
+        let bytes = CmppAdapter.encode(&bind, Sequence::Plain(self.next_seq())).expect("encode bind");
+        RawPdu::from_vec(bytes)
     }
 
     fn build_long_submit_pdus_v20(&self, content: &[u8], msg_fmt: u8) -> Vec<RawPdu> {
@@ -182,22 +194,29 @@ impl LongMsgClientHandler {
             8 => SmsAlphabet::UCS2,
             _ => SmsAlphabet::ASCII,
         };
+        // V3.0 长短信：统一 Submit；msg_fmt 由 encoding 驱动；pk_total/pk_number/tpudhi 落 CmppExtra。
+        let encoding = if msg_fmt == 8 { Encoding::Ucs2 } else { Encoding::Other(msg_fmt) };
         let mut splitter = LongMessageSplitter::new();
         let frames = splitter.split(content, alphabet);
 
         frames.iter().map(|frame| {
-            let mut submit = Submit::new();
-            submit.src_id = "106900".to_string();
-            submit.dest_usr_tl = 1;
-            submit.dest_terminal_ids = vec!["13800138000".to_string()];
-            submit.msg_fmt = msg_fmt;
-            submit.msg_content = frame.content.clone();
-            submit.pk_total = frame.total_segments;
-            submit.pk_number = frame.segment_number;
-            submit.tpudhi = if frame.has_udhi { 1 } else { 0 };
-            submit.registered_delivery = 0;
-            let pdu: Pdu = submit.into();
-            pdu.to_pdu_bytes(self.next_seq())
+            let submit = UnifiedMessage::Submit(UnifiedSubmit {
+                src: Address::plain("106900"),
+                dests: vec![Address::plain("13800138000")],
+                content: frame.content.clone(),
+                encoding,
+                want_report: false,
+                concat: None,
+                extra: ProtocolExtra::Cmpp(CmppExtra {
+                    pk_total: frame.total_segments,
+                    pk_number: frame.segment_number,
+                    tpudhi: if frame.has_udhi { 1 } else { 0 },
+                    ..Default::default()
+                }),
+                tlvs: vec![],
+            });
+            let bytes = CmppAdapter.encode(&submit, Sequence::Plain(self.next_seq())).expect("encode submit");
+            RawPdu::from_vec(bytes)
         }).collect()
     }
 }
@@ -302,21 +321,22 @@ fn build_deliver_mo_pdu_v20(seq_id: u32, src: &str, dest: &str, msg_fmt: u8, tpu
     pdu.to_pdu_bytes(seq_id)
 }
 
-fn build_deliver_mo_pdu_v30(seq_id: u32, src: &str, dest: &str, msg_fmt: u8, tpudhi: u8, msg_content: Vec<u8>) -> RawPdu {
-    let pdu: Pdu = Deliver {
-        msg_id: [0u8; 8],
-        dest_id: dest.to_string(),
-        service_id: "SMS".to_string(),
-        tppid: 0,
-        tpudhi,
-        msg_fmt,
-        src_terminal_id: src.to_string(),
-        src_terminal_type: 0,
-        registered_delivery: 0,
-        msg_content,
-        link_id: String::new(),
-    }.into();
-    pdu.to_pdu_bytes(seq_id)
+fn build_deliver_mo_pdu_v30(seq_id: u32, src: &str, dest: &str, msg_fmt: u8, _tpudhi: u8, msg_content: Vec<u8>) -> RawPdu {
+    // V3.0 MO 上行：统一 Deliver（registered_delivery=0）。长短信 UDH 由 msg_content 字节携带，
+    // 接收侧 UdhParser 解析合包；CMPP Deliver 的 tpudhi 标志字段在 adapter Deliver 编码中不承载
+    // （统一模型 Deliver 不读 extra.tpudhi），不影响按内容 UDH 合包的断言。
+    let encoding = if msg_fmt == 8 { Encoding::Ucs2 } else { Encoding::Other(msg_fmt) };
+    let deliver = UnifiedMessage::Deliver(UnifiedDeliver {
+        src: Address::plain(src),
+        dest: Address::plain(dest),
+        content: msg_content,
+        encoding,
+        concat: None,
+        extra: ProtocolExtra::Cmpp(CmppExtra::default()),
+        tlvs: vec![],
+    });
+    let bytes = CmppAdapter.encode(&deliver, Sequence::Plain(seq_id)).expect("encode deliver(mo) v30");
+    RawPdu::from_vec(bytes)
 }
 
 fn merge_segments(segments: &[Vec<u8>]) -> Vec<u8> {

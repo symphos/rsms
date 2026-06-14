@@ -4,11 +4,11 @@ Rust 多协议短信消息中间件框架，支持 **CMPP 2.0/3.0**、**SMGP 3.0
 
 > ⚠️ **WIP / 早期阶段**：当前版本 `0.0.1`，尚未发布。四协议收发、300s 压测零丢失、连接/资源长稳已验证，适合**受控试点**；作为关键生产链路前建议补充真实运营商联调与天级长稳（见 [`docs/OPTIMIZATION_PLAN.md`](docs/OPTIMIZATION_PLAN.md)）。
 >
-> 另有一项「**统一消息模型 / 协议窄腰**」架构演进正处于**设计与试点验证阶段**（设计见 [`docs/superpowers/specs/`](docs/superpowers/specs/)、计划见 [`docs/superpowers/plans/`](docs/superpowers/plans/)），**尚未落地**，现有四协议 API 不受影响。
+> 「**统一消息模型 / 协议窄腰**」架构已落地为**推荐主路径**：业务经 `rsms-model` 的 `UnifiedMessage` + `ProtocolAdapter`（`CmppAdapter`/`SmgpAdapter`/`SmppAdapter`/`SgipAdapter`）收发，不再直接接触各协议裸 codec；四协议 `examples/` 与 `tests/` 均已按此实现（设计见 [`docs/superpowers/specs/`](docs/superpowers/specs/)）。底层 `rsms-codec-*` 仍可直接使用。
 
 ## 特性
 
-- **四协议统一抽象** — 服务端/客户端 API 统一，切换协议只需改 Decoder 和 EndpointConfig
+- **四协议统一抽象（窄腰模型）** — 业务只依赖协议无关的 `UnifiedMessage` + `ProtocolAdapter` 收发，切换协议基本只改 `EndpointConfig.protocol`、客户端 Decoder 和所用 Adapter
 - **高性能** — 单账号 TPS 2500+，5 账号并发 TPS 12500+，300 秒压测消息零丢失
 - **结构化日志** — 所有连接日志自动携带 `remote_ip`/`remote_port`，支持按端点配置日志级别
 - **动态调整** — 运行时动态调整连接数上限和 QPS，自动剔除多余连接（发送协议层 Close Packet）
@@ -36,14 +36,16 @@ rsms-codec-cmpp = { path = "crates/rsms-codec-cmpp" }
 
 ```rust
 use rsms_connector::{ServerBuilder, AuthHandler, AuthCredentials, AuthResult};
-use rsms_business::BusinessHandler;
-use rsms_core::{EndpointConfig, Frame, Protocol, Result};
+use rsms_business::{BusinessHandler, InboundContext};
+use rsms_core::{ConnectionInfo, EndpointConfig, Frame, Protocol, Result};
+use rsms_codec_cmpp::adapter::CmppAdapter;        // 各协议：rsms_codec_<proto>::adapter::<Proto>Adapter
+use rsms_model::{ProtocolAdapter, UnifiedMessage};
 
 struct MyAuth;
 #[async_trait]
 impl AuthHandler for MyAuth {
     fn name(&self) -> &'static str { "my-auth" }
-    async fn authenticate(&self, _: &str, credentials: AuthCredentials) -> Result<AuthResult> {
+    async fn authenticate(&self, _: &str, credentials: AuthCredentials, _: &ConnectionInfo) -> Result<AuthResult> {
         // 验证客户端认证
         Ok(AuthResult::success("account"))
     }
@@ -54,8 +56,15 @@ struct MyBiz;
 impl BusinessHandler for MyBiz {
     fn name(&self) -> &'static str { "my-biz" }
     async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        // 处理收到的 Submit/Deliver 等 PDU
-        // ctx.conn.write_frame() 发送响应
+        // 窄腰统一模型：解码为 UnifiedMessage 后按枚举分支处理
+        match CmppAdapter.decode(frame)? {
+            UnifiedMessage::Submit(_s) => {
+                // 框架不自动回 SubmitResp，业务方自行构造：
+                // let bytes = CmppAdapter.encode(&resp, CmppAdapter.sequence_of(frame))?;
+                // ctx.conn.write_frame(&bytes).await?;
+            }
+            _ => {}
+        }
         Ok(())
     }
 }
@@ -81,6 +90,8 @@ async fn main() -> Result<()> {
 ```rust
 use rsms_connector::{ClientBuilder, CmppDecoder, ClientHandler};
 use rsms_core::{EndpointConfig, Frame, Result};
+use rsms_codec_cmpp::adapter::CmppAdapter;
+use rsms_model::{ProtocolAdapter, UnifiedMessage};
 
 struct MyClient;
 #[async_trait]
@@ -100,6 +111,9 @@ async fn main() -> Result<()> {
         .connect()
         .await?;
 
+    // 构造 UnifiedMessage 经适配器编码后发送（CMPP 序列用 Sequence::Plain）
+    let msg = UnifiedMessage::Submit(/* UnifiedSubmit { .. } */);
+    let pdu_bytes = CmppAdapter.encode(&msg, rsms_model::Sequence::Plain(seq))?;
     conn.write_frame(&pdu_bytes).await?;
     Ok(())
 }
@@ -113,12 +127,15 @@ async fn main() -> Result<()> {
 // 1. protocol（需 use rsms_core::Protocol; 或 use rsms_connector::Protocol;）
 .with_protocol(Protocol::Smpp)    // Protocol::Cmpp | Smgp | Smpp | Sgip
 
-// 2. Decoder
+// 2. 客户端 Decoder（ClientBuilder 第三参）
 SmppDecoder                // CmppDecoder | SmgpDecoder | SmppDecoder | SgipDecoder
 
-// 3. Codec 类型
-use rsms_codec_smpp::{BindTransmitter, SubmitSm, ...};
+// 3. 协议适配器（收发统一走它，不直接碰裸 codec PDU 类型）
+use rsms_codec_smpp::adapter::SmppAdapter;   // CmppAdapter | SmgpAdapter | SmppAdapter | SgipAdapter
 ```
+
+业务/收发代码只依赖协议无关的 `UnifiedMessage`，换协议时基本不动——把 `<Proto>Adapter` 换成目标协议即可。
+也可按枚举动态取适配器：`rsms_connector::adapter_registry::adapter_for(Protocol::Smpp)`。
 
 ## 架构
 
@@ -144,19 +161,23 @@ use rsms_codec_smpp::{BindTransmitter, SubmitSm, ...};
 └───────────────────────────┬──────────────────────────────────┘
                             │
 ┌───────────────────────────┼──────────────────────────────────┐
-│  rsms-codec-cmpp / smgp / smpp / sgip                       │
-│           (协议编解码，Header 解析，PDU 序列化)                 │
+│  rsms-model（窄腰）：UnifiedMessage ↔ 字节，经 *Adapter 适配各协议   │
+│  rsms-codec-cmpp / smgp / smpp / sgip（适配器底层编解码）            │
+│           (Header 解析，PDU 序列化)                            │
 └───────────────────────────┬──────────────────────────────────┘
                             │
                         TCP Socket
 ```
 
+> 业务代码经 `rsms-model` 的 `ProtocolAdapter` 在 `UnifiedMessage` 与字节间互译，`rsms-codec-*` 退居适配器底层。
+
 ## Crate 结构
 
 | Crate | 说明 |
 |-------|------|
-| `rsms-core` | 核心类型：`Frame`、`RawPdu`、`EncodedPdu` trait、`EndpointConfig` |
-| `rsms-connector` | 连接管理：服务端 `serve()`、客户端 `connect()`、`AccountPool`、`MessageSource` |
+| `rsms-core` | 核心类型：`Frame`、`RawPdu`、`EncodedPdu` trait、`EndpointConfig`、`Protocol` |
+| `rsms-model` | 窄腰统一模型：`UnifiedMessage`、`ProtocolAdapter` trait、`Sequence`、`Address`/`MessageId`/`Encoding` |
+| `rsms-connector` | 连接管理：服务端 `serve()`、客户端 `connect()`、`AccountPool`、`MessageSource`、`adapter_registry` |
 | `rsms-business` | 业务处理器：`BusinessHandler` trait |
 | `rsms-codec-cmpp` | CMPP 2.0/3.0 协议编解码 |
 | `rsms-codec-smgp` | SMGP 3.0.3 协议编解码 |

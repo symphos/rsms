@@ -8,8 +8,13 @@
 //! 账号数由 `RSMS_SOAK_ACCOUNTS` 驱动（默认 60）。WARN 日志（CLAUDE.md 铁律）。
 
 use async_trait::async_trait;
+// 窄腰统一模型：Connect/Submit 构造经 CmppAdapter。compute_connect_auth 为鉴权工具，保留。
+use rsms_codec_cmpp::adapter::CmppAdapter;
 use rsms_codec_cmpp::auth::compute_connect_auth;
-use rsms_codec_cmpp::{Connect, Pdu, Submit};
+use rsms_model::{
+    Address, Encoding, ProtocolAdapter, ProtocolExtra, Sequence, UnifiedBind, UnifiedMessage,
+    UnifiedSubmit,
+};
 use rsms_connector::{
     AccountConfig, AccountConfigProvider, AccountPool, AuthCredentials, AuthHandler, AuthResult,
     Protocol, ServerBuilder,
@@ -68,24 +73,31 @@ impl AccountConfigProvider for FixedConfig {
 
 fn build_connect_pdu(account: &str, seq: u32) -> Vec<u8> {
     let ts = 0u32;
-    let connect = Connect {
-        source_addr: account.to_string(),
-        authenticator_source: compute_connect_auth(account, TEST_PASSWORD, ts),
-        version: CMPP_VERSION,
+    let bind = UnifiedMessage::Bind(UnifiedBind {
+        client_id: account.to_string(),
+        authenticator: compute_connect_auth(account, TEST_PASSWORD, ts).to_vec(),
         timestamp: ts,
-    };
-    let pdu: Pdu = connect.into();
-    pdu.to_pdu_bytes(seq).to_vec()
+        version: CMPP_VERSION,
+        system_type: None,
+        mode: rsms_model::BindMode::default(),
+        login_mode: None,
+    });
+    CmppAdapter.encode(&bind, Sequence::Plain(seq)).expect("encode bind")
 }
 
 fn build_submit_pdu(account: &str, seq: u32) -> Vec<u8> {
-    let mut submit = Submit::new();
-    submit.src_id = account.to_string();
-    submit.dest_usr_tl = 1;
-    submit.dest_terminal_ids = vec!["13800138000".to_string()];
-    submit.msg_content = b"soak".to_vec();
-    let pdu: Pdu = submit.into();
-    pdu.to_pdu_bytes(seq).to_vec()
+    // 统一 Submit（CMPP 方言取默认，与原 Submit::new() 默认一致）。
+    let submit = UnifiedMessage::Submit(UnifiedSubmit {
+        src: Address::plain(account),
+        dests: vec![Address::plain("13800138000")],
+        content: b"soak".to_vec(),
+        encoding: Encoding::Ascii,
+        want_report: false,
+        concat: None,
+        extra: ProtocolExtra::Cmpp(Default::default()),
+        tlvs: vec![],
+    });
+    CmppAdapter.encode(&submit, Sequence::Plain(seq)).expect("encode submit")
 }
 
 async fn start_server() -> (u16, Arc<AccountPool>, tokio::task::JoinHandle<()>) {

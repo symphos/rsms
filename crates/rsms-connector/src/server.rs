@@ -176,6 +176,9 @@ impl BoundServer {
             let protocol = self.config.protocol;
 
             tokio::spawn(async move {
+                // 先把会话状态机推进到 Connecting，否则认证时无法转到 Authenticated/Logined，
+                // 服务端 MessageSource 的 MO/回执将永不下发（见 Connection::mark_connected 注释）。
+                conn.mark_connected().await;
                 conn.mark_ready().await;
                 pool2.add(Arc::clone(&conn)).await;
                 run_connection(read, Arc::clone(&conn), h, Some(account_pool2), account_config_provider, auth_handler_clone, protocol, event_handler_clone).await;

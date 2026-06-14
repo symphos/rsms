@@ -7,10 +7,12 @@ use rsms_connector::{
 };
 use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler};
 use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Protocol, Frame, Result};
-use rsms_codec_smpp::{
-    decode_message, SmppMessage, Pdu,
-    CommandId, SubmitSm, SubmitSmResp, DeliverSm, DeliverSmResp,
-    BindTransmitter, Encodable,
+// 窄腰统一模型：构造/解码全程走 SmppAdapter，不再裸 codec。
+use rsms_codec_smpp::adapter::SmppAdapter;
+use rsms_model::{
+    Address, BindMode, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra,
+    Sequence, SmppExtra, UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmit,
+    UnifiedSubmitResp,
 };
 use rsms_test_common::{
     TestStats, StressMockMessageSource, MockAccountConfigProvider,
@@ -110,45 +112,43 @@ impl ClientState {
         self.seq.fetch_add(1, Ordering::Relaxed) as u32
     }
 
+    /// BindTransmitter（统一模型）：SMPP 明文鉴权，口令明文字节进 authenticator。
     pub fn build_bind_transmitter_pdu(&self) -> RawPdu {
-        let bind = BindTransmitter::new(
-            &self.account.system_id,
-            &self.account.password,
-            "CMT",
-            0x34,
-        );
-        let pdu: Pdu = bind.into();
-        pdu.to_pdu_bytes(self.next_seq())
+        let bind = UnifiedMessage::Bind(UnifiedBind {
+            client_id: self.account.system_id.clone(),
+            authenticator: self.account.password.as_bytes().to_vec(),
+            timestamp: 0,
+            version: 0x34,
+            system_type: Some("CMT".to_string()),
+            mode: BindMode::Transmitter,
+            login_mode: None,
+        });
+        RawPdu::from(SmppAdapter.encode(&bind, Sequence::Plain(self.next_seq())).expect("encode bind"))
     }
 
+    /// SubmitSm（统一模型）：registered_delivery=1 落 SmppExtra；data_coding=0x03→Encoding::Other(0x03)。
     pub fn build_submit_sm_pdu(&self, src: &str, dst: &str, content: &str) -> (RawPdu, u32) {
-        let mut submit = SubmitSm::new();
-        submit.source_addr = src.to_string();
-        submit.dest_addr_ton = 1;
-        submit.dest_addr_npi = 1;
-        submit.destination_addr = dst.to_string();
-        submit.esm_class = 0;
-        submit.registered_delivery = 1;
-        submit.data_coding = 0x03;
-        submit.short_message = content.as_bytes().to_vec();
-
+        let submit = UnifiedMessage::Submit(UnifiedSubmit {
+            src: Address::plain(src),
+            dests: vec![Address { number: dst.to_string(), ton: Some(1), npi: Some(1) }],
+            content: content.as_bytes().to_vec(),
+            encoding: Encoding::Other(0x03),
+            want_report: true,
+            concat: None,
+            extra: ProtocolExtra::Smpp(SmppExtra {
+                esm_class: 0,
+                registered_delivery: 1,
+                ..Default::default()
+            }),
+            tlvs: vec![],
+        });
         let seq = self.next_seq();
-        let pdu: Pdu = submit.into();
-        (pdu.to_pdu_bytes(seq), seq)
+        (RawPdu::from(SmppAdapter.encode(&submit, Sequence::Plain(seq)).expect("encode submit")), seq)
     }
 
     fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
     }
-}
-
-fn parse_cstring_from_body(pdu: &[u8]) -> Option<String> {
-    if pdu.len() <= 16 {
-        return None;
-    }
-    let body = &pdu[16..];
-    let end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
-    Some(String::from_utf8_lossy(&body[..end]).into_owned())
 }
 
 #[async_trait]
@@ -163,70 +163,67 @@ impl ClientHandler for ClientState {
             return Ok(());
         }
 
-        let cmd_id = frame.command_id;
+        // 消息类型经 SmppAdapter 识别；command_status 不透传，裸读 bytes 8..12（规则3）。
+        let status = u32::from_be_bytes([pdu[8], pdu[9], pdu[10], pdu[11]]);
+        let unified = match SmppAdapter.decode(frame) {
+            Ok(m) => m,
+            Err(_) => return Ok(()),
+        };
 
-        if cmd_id == CommandId::BIND_TRANSMITTER_RESP as u32 {
-            let status = u32::from_be_bytes([pdu[8], pdu[9], pdu[10], pdu[11]]);
-            *self.login_status.lock().unwrap() = Some(status);
-            if status == 0 {
-                self.connected.store(true, Ordering::Relaxed);
-            }
-        } else if cmd_id == CommandId::SUBMIT_SM_RESP as u32 {
-            let status = u32::from_be_bytes([pdu[8], pdu[9], pdu[10], pdu[11]]);
-            self.stats.submit_resp_received.fetch_add(1, Ordering::Relaxed);
-            if status == 0 {
-                if let Some(msg_id) = parse_cstring_from_body(pdu) {
-                    self.msg_ids.write().unwrap().push_back(msg_id);
+        match unified {
+            UnifiedMessage::BindResp(_) => {
+                *self.login_status.lock().unwrap() = Some(status);
+                if status == 0 {
+                    self.connected.store(true, Ordering::Relaxed);
                 }
-            } else {
-                self.stats.submit_errors.fetch_add(1, Ordering::Relaxed);
             }
-        } else if cmd_id == CommandId::DELIVER_SM as u32 {
-            if let Ok(msg) = decode_message(pdu) {
-                if let SmppMessage::DeliverSm(d) = msg {
-                    if d.esm_class == 0x04 {
-                        let content = String::from_utf8_lossy(&d.short_message).to_string();
-                        if let Some(report_msg_id) = parse_msg_id_from_report(&content) {
-                            self.stats.report_received.fetch_add(1, Ordering::Relaxed);
-                            let already_matched = self.matched_msg_ids.lock().unwrap().contains(&report_msg_id);
-                            if already_matched {
-                                return build_deliver_sm_resp(ctx, frame).await;
-                            }
-                            let mut pending = self.msg_ids.write().unwrap();
-                            if let Some(pos) = pending.iter().position(|id| *id == report_msg_id) {
-                                pending.remove(pos);
-                                self.matched_msg_ids.lock().unwrap().insert(report_msg_id);
-                                self.stats.report_matched.fetch_add(1, Ordering::Relaxed);
-                            }
+            UnifiedMessage::SubmitResp(resp) => {
+                self.stats.submit_resp_received.fetch_add(1, Ordering::Relaxed);
+                if status == 0 {
+                    let msg_id = match resp.msg_id {
+                        MessageId::Text(t) => t,
+                        MessageId::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
+                    };
+                    if !msg_id.is_empty() {
+                        self.msg_ids.write().unwrap().push_back(msg_id);
+                    }
+                } else {
+                    self.stats.submit_errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            // esm_class=0x04 的 DeliverSm → 统一模型 Report（report 文本在 raw）。
+            UnifiedMessage::Report(report) => {
+                let content = String::from_utf8_lossy(&report.raw).to_string();
+                if let Some(report_msg_id) = parse_msg_id_from_report(&content) {
+                    self.stats.report_received.fetch_add(1, Ordering::Relaxed);
+                    let already_matched = self.matched_msg_ids.lock().unwrap().contains(&report_msg_id);
+                    if !already_matched {
+                        let mut pending = self.msg_ids.write().unwrap();
+                        if let Some(pos) = pending.iter().position(|id| *id == report_msg_id) {
+                            pending.remove(pos);
+                            self.matched_msg_ids.lock().unwrap().insert(report_msg_id);
+                            self.stats.report_matched.fetch_add(1, Ordering::Relaxed);
                         }
-                    } else {
-                        self.stats.mo_received.fetch_add(1, Ordering::Relaxed);
                     }
                 }
+                return build_deliver_sm_resp(ctx, frame).await;
             }
-            return build_deliver_sm_resp(ctx, frame).await;
+            // 普通 MO → 统一模型 Deliver。
+            UnifiedMessage::Deliver(_) => {
+                self.stats.mo_received.fetch_add(1, Ordering::Relaxed);
+                return build_deliver_sm_resp(ctx, frame).await;
+            }
+            _ => {}
         }
 
         Ok(())
     }
 }
 
+/// 回 DeliverSmResp（统一模型 DeliverResp，sequence_of 回显请求序列）。
 async fn build_deliver_sm_resp(ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-    let resp = DeliverSmResp {
-        message_id: String::new(),
-    };
-    let mut buf = bytes::BytesMut::new();
-    resp.encode(&mut buf).unwrap();
-    let body_len = buf.len() as u32;
-    let total_len = 16 + body_len;
-    let seq_id = frame.sequence_id;
-    let mut resp_pdu = Vec::new();
-    resp_pdu.extend_from_slice(&total_len.to_be_bytes());
-    resp_pdu.extend_from_slice(&(CommandId::DELIVER_SM_RESP as u32).to_be_bytes());
-    resp_pdu.extend_from_slice(&0u32.to_be_bytes());
-    resp_pdu.extend_from_slice(&seq_id.to_be_bytes());
-    resp_pdu.extend_from_slice(&buf);
-    ctx.conn.write_frame(resp_pdu.as_slice()).await
+    let resp_bytes = SmppAdapter.encode(&UnifiedMessage::DeliverResp, SmppAdapter.sequence_of(frame))?;
+    ctx.conn.write_frame(&resp_bytes).await
 }
 
 fn parse_msg_id_from_report(content: &str) -> Option<String> {
@@ -262,28 +259,21 @@ impl rsms_business::BusinessHandler for ServerHandler {
 
     async fn on_inbound(&self, ctx: &rsms_business::InboundContext, frame: &Frame) -> Result<()> {
         let account = ctx.conn.authenticated_account().await.unwrap_or_else(|| "unknown".to_string());
-        if let Ok(msg) = decode_message(frame.data_as_slice()) {
+        if let Ok(msg) = SmppAdapter.decode(frame) {
             match msg {
-                SmppMessage::SubmitSm(s) => {
+                UnifiedMessage::Submit(s) => {
                     let count = self.submit_count.fetch_add(1, Ordering::Relaxed);
                     let msg_id = format!("{}", count);
 
-                    let resp = SubmitSmResp {
-                        message_id: msg_id.clone(),
-                    };
-                    let mut buf = bytes::BytesMut::new();
-                    resp.encode(&mut buf).unwrap();
-                    let body_len = buf.len() as u32;
-                    let total_len = 16 + body_len;
-                    let mut resp_pdu = Vec::new();
-                    resp_pdu.extend_from_slice(&total_len.to_be_bytes());
-                    resp_pdu.extend_from_slice(&(CommandId::SUBMIT_SM_RESP as u32).to_be_bytes());
-                    resp_pdu.extend_from_slice(&0u32.to_be_bytes());
-                    resp_pdu.extend_from_slice(&frame.sequence_id.to_be_bytes());
-                    resp_pdu.extend_from_slice(&buf);
-                    ctx.conn.write_frame(resp_pdu.as_slice()).await?;
+                    // 回 SubmitResp：msg_id 用 MessageId::Text，sequence_of 回显请求序列。
+                    let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                        msg_id: MessageId::Text(msg_id.clone()),
+                        status: 0,
+                    });
+                    let resp_bytes = SmppAdapter.encode(&resp, SmppAdapter.sequence_of(frame))?;
+                    ctx.conn.write_frame(&resp_bytes).await?;
 
-                    let dest_id = s.destination_addr.clone();
+                    let dest_id = s.dests.first().map(|a| a.number.clone()).unwrap_or_default();
                     let item = ReportItem {
                         msg_id,
                         conn_id: ctx.conn.id(),
@@ -291,7 +281,7 @@ impl rsms_business::BusinessHandler for ServerHandler {
                     };
                     self.msg_source.push_item(&account, item.to_bytes()).await;
                 }
-                SmppMessage::DeliverSmResp { .. } => {}
+                UnifiedMessage::DeliverResp => {}
                 _ => {}
             }
         }
@@ -391,39 +381,17 @@ async fn report_generator_task(
                         item.msg_id, now, now
                     );
 
-                    let deliver = DeliverSm {
-                        service_type: String::new(),
-                        source_addr_ton: 1,
-                        source_addr_npi: 1,
-                        source_addr: "13800138000".to_string(),
-                        dest_addr_ton: 0,
-                        dest_addr_npi: 0,
-                        destination_addr: item.dest_id,
-                        esm_class: 0x04,
-                        protocol_id: 0,
-                        priority_flag: 0,
-                        schedule_delivery_time: String::new(),
-                        validity_period: String::new(),
-                        registered_delivery: 1,
-                        replace_if_present_flag: 0,
-                        data_coding: 0x03,
-                        sm_default_msg_id: 0,
-                        short_message: report_content.as_bytes().to_vec(),
-                        tlvs: Vec::new(),
-                    };
-
-                    let mut buf = bytes::BytesMut::new();
-                    deliver.encode(&mut buf).unwrap();
-                    let body_len = buf.len() as u32;
-                    let total_len = 16 + body_len;
-                    let seq = rand_u32();
-                    let mut pdu = Vec::new();
-                    pdu.extend_from_slice(&total_len.to_be_bytes());
-                    pdu.extend_from_slice(&(CommandId::DELIVER_SM as u32).to_be_bytes());
-                    pdu.extend_from_slice(&0u32.to_be_bytes());
-                    pdu.extend_from_slice(&seq.to_be_bytes());
-                    pdu.extend_from_slice(&buf);
-                    if conn.write_frame(pdu.as_slice()).await.is_ok() {
+                    // 投递回执 → 统一模型 Report，adapter 自动产出 esm_class=0x04 的 DeliverSm；
+                    // report 文本作为 raw 落入 short_message（client 从 raw 解析 id:）。
+                    let report = UnifiedMessage::Report(UnifiedReport {
+                        msg_id: MessageId::Text(item.msg_id.clone()),
+                        status: DeliveryStatus::Delivered,
+                        src: Address { number: "13800138000".to_string(), ton: Some(1), npi: Some(1) },
+                        dest: Address { number: item.dest_id, ton: Some(0), npi: Some(0) },
+                        raw: report_content.into_bytes(),
+                    });
+                    let pdu = SmppAdapter.encode(&report, Sequence::Plain(rand_u32())).expect("encode report");
+                    if conn.write_frame(&pdu).await.is_ok() {
                         report_sent.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -449,39 +417,18 @@ async fn mo_generator_task(
                 let src = src_numbers[rand_u32() as usize % src_numbers.len()];
                 let content = format!("MO Test #{}", mo_sent.load(Ordering::Relaxed) + 1);
 
-                let deliver = DeliverSm {
-                    service_type: String::new(),
-                    source_addr_ton: 1,
-                    source_addr_npi: 1,
-                    source_addr: src.to_string(),
-                    dest_addr_ton: 0,
-                    dest_addr_npi: 0,
-                    destination_addr: account.clone(),
-                    esm_class: 0,
-                    protocol_id: 0,
-                    priority_flag: 0,
-                    schedule_delivery_time: String::new(),
-                    validity_period: String::new(),
-                    registered_delivery: 0,
-                    replace_if_present_flag: 0,
-                    data_coding: 0x03,
-                    sm_default_msg_id: 0,
-                    short_message: content.as_bytes().to_vec(),
-                    tlvs: Vec::new(),
-                };
-
-                let mut buf = bytes::BytesMut::new();
-                deliver.encode(&mut buf).unwrap();
-                let body_len = buf.len() as u32;
-                let total_len = 16 + body_len;
-                let seq = rand_u32();
-                let mut pdu = Vec::new();
-                pdu.extend_from_slice(&total_len.to_be_bytes());
-                pdu.extend_from_slice(&(CommandId::DELIVER_SM as u32).to_be_bytes());
-                pdu.extend_from_slice(&0u32.to_be_bytes());
-                pdu.extend_from_slice(&seq.to_be_bytes());
-                pdu.extend_from_slice(&buf);
-                if conn.write_frame(pdu.as_slice()).await.is_ok() {
+                // 普通 MO（esm_class=0）→ 统一模型 Deliver；data_coding=0x03→Encoding::Other(0x03)。
+                let deliver = UnifiedMessage::Deliver(UnifiedDeliver {
+                    src: Address { number: src.to_string(), ton: Some(1), npi: Some(1) },
+                    dest: Address { number: account.clone(), ton: Some(0), npi: Some(0) },
+                    content: content.into_bytes(),
+                    encoding: Encoding::Other(0x03),
+                    concat: None,
+                    extra: ProtocolExtra::Smpp(SmppExtra { esm_class: 0, ..Default::default() }),
+                    tlvs: vec![],
+                });
+                let pdu = SmppAdapter.encode(&deliver, Sequence::Plain(rand_u32())).expect("encode mo");
+                if conn.write_frame(&pdu).await.is_ok() {
                     mo_sent.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -504,20 +451,25 @@ async fn mt_producer_task(
     loop {
         interval.tick().await;
         let content = format!("MT Test #{}", msg_count);
-        let mut submit = SubmitSm::new();
-        submit.source_addr = "13800138000".to_string();
-        submit.dest_addr_ton = 1;
-        submit.dest_addr_npi = 1;
-        submit.destination_addr = account.clone();
-        submit.esm_class = 0;
-        submit.registered_delivery = 1;
-        submit.data_coding = 0x03;
-        submit.short_message = content.as_bytes().to_vec();
+        // MT SubmitSm（统一模型）：registered_delivery=1 落 SmppExtra；data_coding=0x03→Encoding::Other(0x03)。
+        let submit = UnifiedMessage::Submit(UnifiedSubmit {
+            src: Address::plain("13800138000"),
+            dests: vec![Address { number: account.clone(), ton: Some(1), npi: Some(1) }],
+            content: content.into_bytes(),
+            encoding: Encoding::Other(0x03),
+            want_report: true,
+            concat: None,
+            extra: ProtocolExtra::Smpp(SmppExtra {
+                esm_class: 0,
+                registered_delivery: 1,
+                ..Default::default()
+            }),
+            tlvs: vec![],
+        });
 
         let seq_val = seq.fetch_add(1, Ordering::Relaxed) as u32;
-        let pdu: Pdu = submit.into();
-        let pdu_bytes = pdu.to_pdu_bytes(seq_val);
-        if msg_source.push(&fetch_key, pdu_bytes.as_slice().to_vec()).await.is_ok() {
+        let pdu_bytes = SmppAdapter.encode(&submit, Sequence::Plain(seq_val)).expect("encode submit");
+        if msg_source.push(&fetch_key, pdu_bytes).await.is_ok() {
             stats.submit_sent.fetch_add(1, Ordering::Relaxed);
         }
         msg_count += 1;

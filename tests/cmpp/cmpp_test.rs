@@ -9,12 +9,17 @@ use rsms_connector::client::{ClientContext, ClientConfig};
 use rsms_business::BusinessHandler;
 use rsms_business::InboundContext;
 use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Frame, Result};
-use rsms_codec_cmpp::{decode_message, CmppMessage, Pdu, Connect, Deliver, DeliverResp, Terminate, ActiveTest, CommandId, Submit, SubmitResp, Decodable};
-use rsms_codec_cmpp::codec::PduHeader;
+// 窄腰统一模型：编解码全程经 CmppAdapter（decode→UnifiedMessage / encode UnifiedMessage→字节）。
+// compute_connect_auth 是 MD5 鉴权工具（非裸消息构造），保留。
+use rsms_codec_cmpp::adapter::CmppAdapter;
 use rsms_codec_cmpp::auth::compute_connect_auth;
+use rsms_model::{
+    Address, CmppExtra, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra,
+    Sequence, UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmit,
+    UnifiedSubmitResp,
+};
 use rsms_test_common::{TestEventHandler, TestClientEventHandler, TestMessageSource, MockAccountConfigProvider};
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -141,75 +146,48 @@ impl BusinessHandler for TestBusinessHandler {
     }
 
     async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        if let Ok(msg) = decode_message(frame.data_as_slice()) {
-            match msg {
-                CmppMessage::SubmitV30 { submit: s, .. } => {
-                    let result = if ctx.conn.authenticated_account().await.is_some() {
-                        if let Some(limiter) = ctx.conn.rate_limiter().await {
-                            if !limiter.try_acquire().await {
-                                8
-                            } else {
-                                self.submit_count.fetch_add(1, Ordering::Relaxed);
-                                let content = String::from_utf8_lossy(&s.msg_content).to_string();
-                                self.messages.lock().unwrap().push(content);
-                                0
-                            }
+        // 统一模型分支：Submit（含限流判定回 SubmitResp）；Report/Deliver 分别记 report/mo。
+        match CmppAdapter.decode(frame) {
+            Ok(UnifiedMessage::Submit(s)) => {
+                let result = if ctx.conn.authenticated_account().await.is_some() {
+                    if let Some(limiter) = ctx.conn.rate_limiter().await {
+                        if !limiter.try_acquire().await {
+                            8
                         } else {
                             self.submit_count.fetch_add(1, Ordering::Relaxed);
-                            let content = String::from_utf8_lossy(&s.msg_content).to_string();
+                            let content = String::from_utf8_lossy(&s.content).to_string();
                             self.messages.lock().unwrap().push(content);
                             0
                         }
                     } else {
-                        3
-                    };
-                    let resp = SubmitResp {
-                        msg_id: [0u8; 8],
-                        result,
-                    };
-                    let resp_pdu: Pdu = resp.into();
-                    ctx.conn.write_frame(resp_pdu.to_pdu_bytes(frame.sequence_id).as_slice()).await?;
-                }
-                CmppMessage::SubmitV20 { submit: s, .. } => {
-                    let result = if ctx.conn.authenticated_account().await.is_some() {
-                        if let Some(limiter) = ctx.conn.rate_limiter().await {
-                            if !limiter.try_acquire().await {
-                                8
-                            } else {
-                                self.submit_count.fetch_add(1, Ordering::Relaxed);
-                                let content = String::from_utf8_lossy(&s.msg_content).to_string();
-                                self.messages.lock().unwrap().push(content);
-                                0
-                            }
-                        } else {
-                            self.submit_count.fetch_add(1, Ordering::Relaxed);
-                            let content = String::from_utf8_lossy(&s.msg_content).to_string();
-                            self.messages.lock().unwrap().push(content);
-                            0
-                        }
-                    } else {
-                        3
-                    };
-                    let resp = SubmitResp {
-                        msg_id: [0u8; 8],
-                        result,
-                    };
-                    let resp_pdu: Pdu = resp.into();
-                    ctx.conn.write_frame(resp_pdu.to_pdu_bytes(frame.sequence_id).as_slice()).await?;
-                }
-                CmppMessage::DeliverV30 { deliver: d, .. } => {
-                    if d.registered_delivery == 1 {
-                        let report = String::from_utf8_lossy(&d.msg_content).to_string();
-                        self.reports.lock().unwrap().push(report);
-                    } else {
-                        self.mo_messages.lock().unwrap().push((
-                            d.src_terminal_id.clone(),
-                            String::from_utf8_lossy(&d.msg_content).to_string(),
-                        ));
+                        self.submit_count.fetch_add(1, Ordering::Relaxed);
+                        let content = String::from_utf8_lossy(&s.content).to_string();
+                        self.messages.lock().unwrap().push(content);
+                        0
                     }
-                }
-                _ => {}
+                } else {
+                    3
+                };
+                let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                    msg_id: MessageId::Binary(vec![0u8; 8]),
+                    status: result,
+                });
+                let resp_bytes = CmppAdapter.encode(&resp, CmppAdapter.sequence_of(frame))?;
+                ctx.conn.write_frame(&resp_bytes).await?;
             }
+            // 状态报告（CMPP Deliver registered_delivery=1）→ Report，记原始正文。
+            Ok(UnifiedMessage::Report(r)) => {
+                let report = String::from_utf8_lossy(&r.raw).to_string();
+                self.reports.lock().unwrap().push(report);
+            }
+            // MO 上行（registered_delivery=0）→ Deliver，记 (src, content)。
+            Ok(UnifiedMessage::Deliver(d)) => {
+                self.mo_messages.lock().unwrap().push((
+                    d.src.number.clone(),
+                    String::from_utf8_lossy(&d.content).to_string(),
+                ));
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -248,40 +226,46 @@ impl TestClientHandler {
     pub fn build_connect_pdu(&self, account: &str, password: &str) -> RawPdu {
         let timestamp = 0u32;
         let auth = compute_connect_auth(account, password, timestamp);
-
-        let connect = Connect {
-            source_addr: account.to_string(),
-            authenticator_source: auth,
-            version: 0x30,
+        // 统一 Bind：MD5 authenticator 原样填入，adapter 不重算。
+        let bind = UnifiedMessage::Bind(UnifiedBind {
+            client_id: account.to_string(),
+            authenticator: auth.to_vec(),
             timestamp,
-        };
-
-        let pdu: Pdu = connect.into();
-        pdu.to_pdu_bytes(self.next_seq())
+            version: 0x30,
+            system_type: None,
+            mode: rsms_model::BindMode::default(),
+            login_mode: None,
+        });
+        let bytes = CmppAdapter.encode(&bind, Sequence::Plain(self.next_seq())).expect("encode bind");
+        RawPdu::from_vec(bytes)
     }
 
     pub fn build_submit_pdu(&self, src: &str, dst: &str, content: &str) -> RawPdu {
-        let mut submit = rsms_codec_cmpp::Submit::new();
-        submit.src_id = src.to_string();
-        submit.dest_usr_tl = 1;
-        submit.dest_terminal_ids = vec![dst.to_string()];
-        submit.msg_content = content.as_bytes().to_vec();
-        submit.registered_delivery = 1;
-
-        let pdu: Pdu = submit.into();
-        pdu.to_pdu_bytes(self.next_seq())
+        // 统一 Submit：want_report=true 对应 registered_delivery=1。
+        let submit = UnifiedMessage::Submit(UnifiedSubmit {
+            src: Address::plain(src),
+            dests: vec![Address::plain(dst)],
+            content: content.as_bytes().to_vec(),
+            encoding: Encoding::Ascii,
+            want_report: true,
+            concat: None,
+            extra: ProtocolExtra::Cmpp(Default::default()),
+            tlvs: vec![],
+        });
+        let bytes = CmppAdapter.encode(&submit, Sequence::Plain(self.next_seq())).expect("encode submit");
+        RawPdu::from_vec(bytes)
     }
 
     pub fn build_active_test_pdu(&self) -> RawPdu {
-        let at = ActiveTest;
-        let pdu: Pdu = at.into();
-        pdu.to_pdu_bytes(self.next_seq())
+        // 心跳 ActiveTest → 统一 Ping。
+        let bytes = CmppAdapter.encode(&UnifiedMessage::Ping, Sequence::Plain(self.next_seq())).expect("encode ping");
+        RawPdu::from_vec(bytes)
     }
 
     pub fn build_terminate_pdu(&self) -> RawPdu {
-        let term = Terminate;
-        let pdu: Pdu = term.into();
-        pdu.to_pdu_bytes(self.next_seq())
+        // Terminate → 统一 Unbind。
+        let bytes = CmppAdapter.encode(&UnifiedMessage::Unbind, Sequence::Plain(self.next_seq())).expect("encode unbind");
+        RawPdu::from_vec(bytes)
     }
 
     pub fn is_connected(&self) -> bool {
@@ -326,41 +310,42 @@ impl ClientHandler for TestClientHandler {
     }
 
     async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        let pdu = frame.data_as_slice();
-        if pdu.len() < 12 {
-            return Ok(());
-        }
+        // 统一模型分支替代手剥字节：BindResp/SubmitResp/Deliver/Report/PingResp/UnbindResp。
+        let unified = match CmppAdapter.decode(frame) {
+            Ok(m) => m,
+            Err(_) => return Ok(()),
+        };
 
-        let cmd_id = u32::from_be_bytes([pdu[4], pdu[5], pdu[6], pdu[7]]);
-
-        if cmd_id == CommandId::ConnectResp as u32 && pdu.len() >= 25 {
-            let status = u32::from_be_bytes([pdu[12], pdu[13], pdu[14], pdu[15]]);
-            *self.connect_resp_status.lock().unwrap() = Some(status);
-            if status == 0 {
-                self.connected.store(true, Ordering::Relaxed);
-            }
-        } else if cmd_id == CommandId::SubmitResp as u32 && pdu.len() >= 20 {
-            let result = u32::from_be_bytes([pdu[20], pdu[21], pdu[22], pdu[23]]);
-            *self.submit_resp_status.lock().unwrap() = Some(result);
-        } else if cmd_id == CommandId::Deliver as u32 {
-            self.deliver_count.fetch_add(1, Ordering::Relaxed);
-            if let Ok(msg) = decode_message(pdu) {
-                if let CmppMessage::DeliverV30 { deliver: d, .. } = msg {
-                    if d.registered_delivery == 1 {
-                        self.report_count.fetch_add(1, Ordering::Relaxed);
-                    }
+        match unified {
+            UnifiedMessage::BindResp(resp) => {
+                *self.connect_resp_status.lock().unwrap() = Some(resp.status);
+                if resp.status == 0 {
+                    self.connected.store(true, Ordering::Relaxed);
                 }
             }
-            let resp = DeliverResp {
-                msg_id: [0u8; 8],
-                result: 0,
-            };
-            let resp_pdu: Pdu = resp.into();
-            ctx.conn.write_frame(resp_pdu.to_pdu_bytes(frame.sequence_id).as_slice()).await?;
-        } else if cmd_id == CommandId::ActiveTestResp as u32 {
-            self.active_test_resp_count.fetch_add(1, Ordering::Relaxed);
-        } else if cmd_id == CommandId::TerminateResp as u32 {
-            self.terminate_resp_received.store(true, Ordering::Relaxed);
+            UnifiedMessage::SubmitResp(resp) => {
+                *self.submit_resp_status.lock().unwrap() = Some(resp.status);
+            }
+            // 状态报告（Deliver registered_delivery=1）：既计 deliver 又计 report，并回 DeliverResp。
+            UnifiedMessage::Report(_) => {
+                self.deliver_count.fetch_add(1, Ordering::Relaxed);
+                self.report_count.fetch_add(1, Ordering::Relaxed);
+                let resp_bytes = CmppAdapter.encode(&UnifiedMessage::DeliverResp, CmppAdapter.sequence_of(frame))?;
+                ctx.conn.write_frame(&resp_bytes).await?;
+            }
+            // MO 上行（registered_delivery=0）：仅计 deliver，并回 DeliverResp。
+            UnifiedMessage::Deliver(_) => {
+                self.deliver_count.fetch_add(1, Ordering::Relaxed);
+                let resp_bytes = CmppAdapter.encode(&UnifiedMessage::DeliverResp, CmppAdapter.sequence_of(frame))?;
+                ctx.conn.write_frame(&resp_bytes).await?;
+            }
+            UnifiedMessage::PingResp => {
+                self.active_test_resp_count.fetch_add(1, Ordering::Relaxed);
+            }
+            UnifiedMessage::UnbindResp => {
+                self.terminate_resp_received.store(true, Ordering::Relaxed);
+            }
+            _ => {}
         }
 
         Ok(())
@@ -638,44 +623,38 @@ async fn get_conn_from_pool(pool: &Arc<rsms_connector::ConnectionPool>) -> Optio
     pool.first().await
 }
 
-/// 辅助函数：构建 CMPP Deliver PDU (MO - 上行短信)
+/// 辅助函数：构建 CMPP Deliver PDU (MO - 上行短信)。
+/// 统一 Deliver（registered_delivery=0），encoding=Gbk 对应 msg_fmt=15。
 fn build_deliver_mo(seq_id: u32, src_terminal: &str, dest_id: &str, content: &str) -> RawPdu {
-    let pdu: Pdu = Deliver {
-        msg_id: [0u8; 8],
-        dest_id: dest_id.to_string(),
-        service_id: "SMS".to_string(),
-        tppid: 0,
-        tpudhi: 0,
-        msg_fmt: 15,
-        src_terminal_id: src_terminal.to_string(),
-        src_terminal_type: 0,
-        registered_delivery: 0,
-        msg_content: content.as_bytes().to_vec(),
-        link_id: "".to_string(),
-    }.into();
-    pdu.to_pdu_bytes(seq_id)
+    let deliver = UnifiedMessage::Deliver(UnifiedDeliver {
+        src: Address::plain(src_terminal),
+        dest: Address::plain(dest_id),
+        content: content.as_bytes().to_vec(),
+        encoding: Encoding::Gbk,
+        concat: None,
+        extra: ProtocolExtra::Cmpp(CmppExtra::default()),
+        tlvs: vec![],
+    });
+    let bytes = CmppAdapter.encode(&deliver, Sequence::Plain(seq_id)).expect("encode deliver(mo)");
+    RawPdu::from_vec(bytes)
 }
 
-/// 辅助函数：构建 CMPP Deliver PDU (Report - 状态报告)
+/// 辅助函数：构建 CMPP Deliver PDU (Report - 状态报告)。
+/// 统一 Report（adapter 编码为 Deliver registered_delivery=1）；msg_id 用 8 字节二进制。
 fn build_deliver_report(seq_id: u32, msg_id: &[u8; 8], dest_id: &str) -> RawPdu {
     let report_content = format!(
         "id:{:02x?}{:02x?}{:02x?}{:02x?}{:02x?}{:02x?}{:02x?}{:02x?} sub:001 dlvrd:001 submit date:26010100 done date:26010100 stat:DELIVRD err:000",
         msg_id[0], msg_id[1], msg_id[2], msg_id[3], msg_id[4], msg_id[5], msg_id[6], msg_id[7]
     );
-    let pdu: Pdu = Deliver {
-        msg_id: *msg_id,
-        dest_id: dest_id.to_string(),
-        service_id: "SMS".to_string(),
-        tppid: 0,
-        tpudhi: 0,
-        msg_fmt: 15,
-        src_terminal_id: "".to_string(),
-        src_terminal_type: 0,
-        registered_delivery: 1,
-        msg_content: report_content.as_bytes().to_vec(),
-        link_id: "".to_string(),
-    }.into();
-    pdu.to_pdu_bytes(seq_id)
+    let report = UnifiedMessage::Report(UnifiedReport {
+        msg_id: MessageId::Binary(msg_id.to_vec()),
+        status: DeliveryStatus::Delivered,
+        src: Address::plain(""),
+        dest: Address::plain(dest_id),
+        raw: report_content.into_bytes(),
+    });
+    let bytes = CmppAdapter.encode(&report, Sequence::Plain(seq_id)).expect("encode report");
+    RawPdu::from_vec(bytes)
 }
 
 #[tokio::test]
@@ -886,15 +865,18 @@ async fn test_submit_rate_limit_with_raw_socket() {
     let mut stream = TcpStream::connect(&addr).await.expect("connect to server");
     tracing::info!("已连接到服务器 port={}", port);
 
-    let connect = Connect {
-        source_addr: "106900".to_string(),
-        authenticator_source: compute_connect_auth("106900", "password123", 0),
-        version: 0x30,
+    // 统一 Bind 经 adapter 编码（裸 socket 发送）。
+    let bind = UnifiedMessage::Bind(UnifiedBind {
+        client_id: "106900".to_string(),
+        authenticator: compute_connect_auth("106900", "password123", 0).to_vec(),
         timestamp: 0,
-    };
-    let connect_pdu: Pdu = connect.into();
-    let connect_bytes = connect_pdu.to_pdu_bytes(1);
-    stream.write_all(connect_bytes.as_slice()).await.expect("send connect");
+        version: 0x30,
+        system_type: None,
+        mode: rsms_model::BindMode::default(),
+        login_mode: None,
+    });
+    let connect_bytes = CmppAdapter.encode(&bind, Sequence::Plain(1)).expect("encode bind");
+    stream.write_all(&connect_bytes).await.expect("send connect");
     tracing::info!("已发送 Connect PDU");
 
     let mut resp_buf = [0u8; 1024];
@@ -903,26 +885,37 @@ async fn test_submit_rate_limit_with_raw_socket() {
         .expect("read connect resp");
     tracing::info!("收到 ConnectResp: {} bytes", n);
 
-    let connect_resp = decode_message(&resp_buf[..n]).expect("decode connect resp");
+    // 经 adapter 解码 ConnectResp → BindResp，断言 status=0。
+    let connect_resp = CmppAdapter
+        .decode(&Frame::from(RawPdu::from_vec(resp_buf[..n].to_vec())))
+        .expect("decode connect resp");
     match connect_resp {
-        CmppMessage::ConnectResp { resp, .. } => {
+        UnifiedMessage::BindResp(resp) => {
             assert_eq!(resp.status, 0, "连接应该成功");
             tracing::info!("连接成功");
         }
-        _ => panic!("expected ConnectResp"),
+        _ => panic!("expected BindResp"),
     }
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let mut submit_results = Vec::new();
     for i in 0..5 {
-        let submit = Submit::new()
-            .with_message("106900", "13800138000", format!("Test SMS {}", i).as_bytes());
-        let submit_pdu: Pdu = submit.into();
+        // 统一 Submit 经 adapter 编码（裸 socket 发送）。
+        let submit = UnifiedMessage::Submit(UnifiedSubmit {
+            src: Address::plain("106900"),
+            dests: vec![Address::plain("13800138000")],
+            content: format!("Test SMS {}", i).into_bytes(),
+            encoding: Encoding::Ascii,
+            want_report: false,
+            concat: None,
+            extra: ProtocolExtra::Cmpp(Default::default()),
+            tlvs: vec![],
+        });
         let seq_id = 100 + i as u32;
-        let submit_bytes = submit_pdu.to_pdu_bytes(seq_id);
-        
-        stream.write_all(submit_bytes.as_slice()).await.expect("send submit");
+        let submit_bytes = CmppAdapter.encode(&submit, Sequence::Plain(seq_id)).expect("encode submit");
+
+        stream.write_all(&submit_bytes).await.expect("send submit");
         tracing::info!("已发送 Submit #{} (seq={})", i + 1, seq_id);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -930,19 +923,16 @@ async fn test_submit_rate_limit_with_raw_socket() {
         let mut resp_buf = [0u8; 1024];
         match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut resp_buf)).await {
             Ok(Ok(n)) if n > 0 => {
-                let resp_bytes = &resp_buf[..n];
-                let mut cursor = Cursor::new(resp_bytes);
-                let header = PduHeader::decode(&mut cursor).expect("decode header");
-                let body = &resp_bytes[PduHeader::SIZE..];
-                
-                if header.command_id == CommandId::SubmitResp {
-                    let submit_resp = SubmitResp::decode(header, &mut Cursor::new(body))
-                        .expect("decode submit resp");
-                    tracing::info!("收到 SubmitResp #{}: result={}", i + 1, submit_resp.result);
-                    submit_results.push(submit_resp.result);
-                } else {
-                    tracing::warn!("收到未知消息: command_id={:?}", header.command_id);
-                    submit_results.push(999);
+                // 经 adapter 解码响应；命中 SubmitResp 取 status，否则记 999。
+                match CmppAdapter.decode(&Frame::from(RawPdu::from_vec(resp_buf[..n].to_vec()))) {
+                    Ok(UnifiedMessage::SubmitResp(resp)) => {
+                        tracing::info!("收到 SubmitResp #{}: result={}", i + 1, resp.status);
+                        submit_results.push(resp.status);
+                    }
+                    other => {
+                        tracing::warn!("收到非 SubmitResp 消息: {:?}", other);
+                        submit_results.push(999);
+                    }
                 }
             }
             Ok(Ok(_)) | Err(_) => {
@@ -1124,7 +1114,6 @@ async fn test_submit_message() {
 #[test]
 fn test_compute_auth() {
 use rsms_codec_cmpp::auth::compute_connect_auth;
-use std::io::Cursor;
     let auth = compute_connect_auth("900001", "pwd", 0);
     assert_eq!(auth.len(), 16);
 }

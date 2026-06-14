@@ -6,11 +6,14 @@ use rsms_connector::{
 };
 use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler};
 use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Frame, Result};
-use rsms_codec_cmpp::{
-    decode_message, CmppMessage, Pdu, Connect, Deliver, DeliverResp,
-    CommandId, Submit, SubmitResp,
-};
+// 窄腰统一模型：本测试仅 CMPP 3.0，全程编解码经 CmppAdapter。compute_connect_auth 为鉴权工具，保留。
+use rsms_codec_cmpp::adapter::CmppAdapter;
 use rsms_codec_cmpp::auth::compute_connect_auth;
+use rsms_model::{
+    Address, CmppExtra, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra,
+    Sequence, UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmit,
+    UnifiedSubmitResp,
+};
 use rsms_test_common::{
     TestStats, StressMockMessageSource, MockAccountConfigProvider,
     rand_u32, format_timestamp, print_stress_results, StressTestResults,
@@ -104,14 +107,17 @@ impl ClientState {
     pub fn build_connect_pdu(&self) -> RawPdu {
         let timestamp = 0u32;
         let auth = compute_connect_auth(&self.account.account, &self.account.password, timestamp);
-        let connect = Connect {
-            source_addr: self.account.account.clone(),
-            authenticator_source: auth,
-            version: self.version,
+        let bind = UnifiedMessage::Bind(UnifiedBind {
+            client_id: self.account.account.clone(),
+            authenticator: auth.to_vec(),
             timestamp,
-        };
-        let pdu: Pdu = connect.into();
-        pdu.to_pdu_bytes(self.next_seq())
+            version: self.version,
+            system_type: None,
+            mode: rsms_model::BindMode::default(),
+            login_mode: None,
+        });
+        let bytes = CmppAdapter.encode(&bind, Sequence::Plain(self.next_seq())).expect("encode bind");
+        RawPdu::from_vec(bytes)
     }
 
     fn is_connected(&self) -> bool {
@@ -126,43 +132,43 @@ impl ClientHandler for ClientState {
     }
 
     async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        let pdu = frame.data_as_slice();
-        if pdu.len() < 12 {
-            return Ok(());
-        }
+        // 统一模型分支：BindResp/SubmitResp（取 8B 二进制 MsgId）/Report|Deliver（回 DeliverResp）。
+        let unified = match CmppAdapter.decode(frame) {
+            Ok(m) => m,
+            Err(_) => return Ok(()),
+        };
 
-        let cmd_id = u32::from_be_bytes([pdu[4], pdu[5], pdu[6], pdu[7]]);
-
-        if cmd_id == CommandId::ConnectResp as u32 && pdu.len() >= 25 {
-            let status = u32::from_be_bytes([pdu[12], pdu[13], pdu[14], pdu[15]]);
-            *self.connect_status.lock().unwrap() = Some(status);
-            if status == 0 {
-                self.connected.store(true, Ordering::Relaxed);
-            }
-        } else if cmd_id == CommandId::SubmitResp as u32 && pdu.len() >= 24 {
-            let result = u32::from_be_bytes([pdu[20], pdu[21], pdu[22], pdu[23]]);
-            self.stats.submit_resp_received.fetch_add(1, Ordering::Relaxed);
-            if result == 0 {
-                let msg_id: [u8; 8] = [pdu[12], pdu[13], pdu[14], pdu[15], pdu[16], pdu[17], pdu[18], pdu[19]];
-                self.msg_ids.write().unwrap().push_back(msg_id);
-            } else {
-                self.stats.submit_errors.fetch_add(1, Ordering::Relaxed);
-            }
-        } else if cmd_id == CommandId::Deliver as u32 {
-            if let Ok(msg) = decode_message(pdu) {
-                match msg {
-                    CmppMessage::DeliverV30 { deliver: d, .. } => {
-                        self.handle_deliver(&d);
-                    }
-                    CmppMessage::DeliverV20 { deliver: d, .. } => {
-                        self.handle_deliver_v20(&d);
-                    }
-                    _ => {}
+        match unified {
+            UnifiedMessage::BindResp(resp) => {
+                *self.connect_status.lock().unwrap() = Some(resp.status);
+                if resp.status == 0 {
+                    self.connected.store(true, Ordering::Relaxed);
                 }
             }
-            let resp = DeliverResp { msg_id: [0u8; 8], result: 0 };
-            let resp_pdu: Pdu = resp.into();
-            ctx.conn.write_frame(resp_pdu.to_pdu_bytes(frame.sequence_id).as_slice()).await?;
+            UnifiedMessage::SubmitResp(resp) => {
+                self.stats.submit_resp_received.fetch_add(1, Ordering::Relaxed);
+                if resp.status == 0 {
+                    if let MessageId::Binary(b) = &resp.msg_id {
+                        let mut msg_id = [0u8; 8];
+                        let n = b.len().min(8);
+                        msg_id[..n].copy_from_slice(&b[..n]);
+                        self.msg_ids.write().unwrap().push_back(msg_id);
+                    }
+                } else {
+                    self.stats.submit_errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            UnifiedMessage::Report(r) => {
+                self.handle_deliver_common(1, &r.raw);
+                let resp_bytes = CmppAdapter.encode(&UnifiedMessage::DeliverResp, CmppAdapter.sequence_of(frame))?;
+                ctx.conn.write_frame(&resp_bytes).await?;
+            }
+            UnifiedMessage::Deliver(d) => {
+                self.handle_deliver_common(0, &d.content);
+                let resp_bytes = CmppAdapter.encode(&UnifiedMessage::DeliverResp, CmppAdapter.sequence_of(frame))?;
+                ctx.conn.write_frame(&resp_bytes).await?;
+            }
+            _ => {}
         }
 
         Ok(())
@@ -190,14 +196,6 @@ impl ClientState {
         } else {
             self.stats.mo_received.fetch_add(1, Ordering::Relaxed);
         }
-    }
-
-    fn handle_deliver(&self, d: &Deliver) {
-        self.handle_deliver_common(d.registered_delivery, &d.msg_content);
-    }
-
-    fn handle_deliver_v20(&self, d: &rsms_codec_cmpp::DeliverV20) {
-        self.handle_deliver_common(d.registered_delivery, &d.msg_content);
     }
 
     fn parse_msg_id_from_report(content: &str) -> Option<[u8; 8]> {
@@ -242,35 +240,29 @@ impl rsms_business::BusinessHandler for ServerHandler {
 
     async fn on_inbound(&self, ctx: &rsms_business::InboundContext, frame: &Frame) -> Result<()> {
         let account = ctx.conn.authenticated_account().await.unwrap_or_else(|| "unknown".to_string());
-        if let Ok(msg) = decode_message(frame.data_as_slice()) {
-            match msg {
-                CmppMessage::SubmitV30 { .. } | CmppMessage::SubmitV20 { .. } => {
-                    let count = self.submit_count.fetch_add(1, Ordering::Relaxed);
-                    let mut msg_id = [0u8; 8];
-                    msg_id[4] = ((count >> 24) & 0xFF) as u8;
-                    msg_id[5] = ((count >> 16) & 0xFF) as u8;
-                    msg_id[6] = ((count >> 8) & 0xFF) as u8;
-                    msg_id[7] = (count & 0xFF) as u8;
+        // 统一模型：收到 Submit → 回 SubmitResp（8B 二进制 MsgId 编入 count）+ push report item。
+        if let Ok(UnifiedMessage::Submit(submit)) = CmppAdapter.decode(frame) {
+            let count = self.submit_count.fetch_add(1, Ordering::Relaxed);
+            let mut msg_id = [0u8; 8];
+            msg_id[4] = ((count >> 24) & 0xFF) as u8;
+            msg_id[5] = ((count >> 16) & 0xFF) as u8;
+            msg_id[6] = ((count >> 8) & 0xFF) as u8;
+            msg_id[7] = (count & 0xFF) as u8;
 
-                    let resp = SubmitResp { msg_id, result: 0 };
-                    let resp_pdu: Pdu = resp.into();
-                    ctx.conn.write_frame(resp_pdu.to_pdu_bytes(frame.sequence_id).as_slice()).await?;
+            let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                msg_id: MessageId::Binary(msg_id.to_vec()),
+                status: 0,
+            });
+            let resp_bytes = CmppAdapter.encode(&resp, CmppAdapter.sequence_of(frame))?;
+            ctx.conn.write_frame(&resp_bytes).await?;
 
-                    let dest_id = match &msg {
-                        CmppMessage::SubmitV30 { submit, .. } => submit.dest_terminal_ids.first().cloned().unwrap_or_default(),
-                        CmppMessage::SubmitV20 { submit, .. } => submit.dest_terminal_ids.first().cloned().unwrap_or_default(),
-                        _ => String::new(),
-                    };
-                    let item = ReportItem {
-                        msg_id,
-                        conn_id: ctx.conn.id(),
-                        dest_id,
-                    };
-                    self.msg_source.push_item(&account, item.to_bytes()).await;
-                }
-                CmppMessage::DeliverResp { .. } => {}
-                _ => {}
-            }
+            let dest_id = submit.dests.first().map(|a| a.number.clone()).unwrap_or_default();
+            let item = ReportItem {
+                msg_id,
+                conn_id: ctx.conn.id(),
+                dest_id,
+            };
+            self.msg_source.push_item(&account, item.to_bytes()).await;
         }
         Ok(())
     }
@@ -366,23 +358,19 @@ async fn report_generator_task(
                         item.msg_id[4], item.msg_id[5], item.msg_id[6], item.msg_id[7],
                         &now, &now
                     );
-                    let deliver = Deliver {
-                        msg_id: [0u8; 8],
-                        dest_id: item.dest_id,
-                        service_id: "SMS".to_string(),
-                        tppid: 0,
-                        tpudhi: 0,
-                        msg_fmt: 15,
-                        src_terminal_id: "13800138000".to_string(),
-                        src_terminal_type: 0,
-                        registered_delivery: 1,
-                        msg_content: report_content.as_bytes().to_vec(),
-                        link_id: "".to_string(),
-                    };
-                    let pdu: Pdu = deliver.into();
+                    // 状态报告：统一 Report（adapter 编码为 Deliver registered_delivery=1）。
+                    let report = UnifiedMessage::Report(UnifiedReport {
+                        msg_id: MessageId::Binary(vec![0u8; 8]),
+                        status: DeliveryStatus::Delivered,
+                        src: Address::plain("13800138000"),
+                        dest: Address::plain(item.dest_id),
+                        raw: report_content.into_bytes(),
+                    });
                     let seq = rand_u32();
-                    if conn.write_frame(pdu.to_pdu_bytes(seq).as_slice()).await.is_ok() {
-                        report_sent.fetch_add(1, Ordering::Relaxed);
+                    if let Ok(bytes) = CmppAdapter.encode(&report, Sequence::Plain(seq)) {
+                        if conn.write_frame(&bytes).await.is_ok() {
+                            report_sent.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -406,23 +394,21 @@ async fn mo_generator_task(
             if let Some(conn) = acc.first_connection().await {
                 let src = src_numbers[rand_u32() as usize % src_numbers.len()];
                 let content = format!("MO Test #{}", mo_sent.load(Ordering::Relaxed) + 1);
-                let deliver = Deliver {
-                    msg_id: [0u8; 8],
-                    dest_id: account.clone(),
-                    service_id: "SMS".to_string(),
-                    tppid: 0,
-                    tpudhi: 0,
-                    msg_fmt: 15,
-                    src_terminal_id: src.to_string(),
-                    src_terminal_type: 0,
-                    registered_delivery: 0,
-                    msg_content: content.as_bytes().to_vec(),
-                    link_id: "".to_string(),
-                };
-                let pdu: Pdu = deliver.into();
+                // MO 上行：统一 Deliver（registered_delivery=0），encoding=Gbk 对应 msg_fmt=15。
+                let deliver = UnifiedMessage::Deliver(UnifiedDeliver {
+                    src: Address::plain(src),
+                    dest: Address::plain(account.clone()),
+                    content: content.into_bytes(),
+                    encoding: Encoding::Gbk,
+                    concat: None,
+                    extra: ProtocolExtra::Cmpp(CmppExtra::default()),
+                    tlvs: vec![],
+                });
                 let seq = rand_u32();
-                if conn.write_frame(pdu.to_pdu_bytes(seq).as_slice()).await.is_ok() {
-                    mo_sent.fetch_add(1, Ordering::Relaxed);
+                if let Ok(bytes) = CmppAdapter.encode(&deliver, Sequence::Plain(seq)) {
+                    if conn.write_frame(&bytes).await.is_ok() {
+                        mo_sent.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -430,19 +416,24 @@ async fn mo_generator_task(
 }
 
 fn build_cmpp_submit_pdu(src: &str, dst: &str, content: &str, seq: u32) -> Vec<u8> {
-    let mut submit = Submit::new();
-    submit.pk_total = 1;
-    submit.pk_number = 1;
-    submit.registered_delivery = 1;
-    submit.msg_level = 1;
-    submit.service_id = "SMS".to_string();
-    submit.src_id = src.to_string();
-    submit.dest_usr_tl = 1;
-    submit.dest_terminal_ids = vec![dst.to_string()];
-    submit.msg_fmt = 15;
-    submit.msg_content = content.as_bytes().to_vec();
-    let pdu: Pdu = submit.into();
-    pdu.to_pdu_bytes(seq).as_slice().to_vec()
+    // 统一 Submit（want_report=true 对应 registered_delivery=1，encoding=Gbk 对应 msg_fmt=15）。
+    let submit = UnifiedMessage::Submit(UnifiedSubmit {
+        src: Address::plain(src),
+        dests: vec![Address::plain(dst)],
+        content: content.as_bytes().to_vec(),
+        encoding: Encoding::Gbk,
+        want_report: true,
+        concat: None,
+        extra: ProtocolExtra::Cmpp(CmppExtra {
+            pk_total: 1,
+            pk_number: 1,
+            msg_level: 1,
+            service_id: "SMS".to_string(),
+            ..Default::default()
+        }),
+        tlvs: vec![],
+    });
+    CmppAdapter.encode(&submit, Sequence::Plain(seq)).expect("encode submit")
 }
 
 async fn mt_producer_task(

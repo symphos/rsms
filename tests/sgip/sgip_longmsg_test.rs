@@ -1,8 +1,10 @@
 use async_trait::async_trait;
 use rsms_business::{BusinessHandler, InboundContext};
-use rsms_codec_sgip::{
-    decode_message, Bind, CommandId, Deliver, DeliverResp, Encodable, SgipMessage,
-    Submit, SubmitResp,
+// 窄腰统一模型：收发一律走 SgipAdapter + UnifiedMessage，不再手构裸 codec / 手剥头部字节。
+use rsms_codec_sgip::adapter::SgipAdapter;
+use rsms_model::{
+    Address, Encoding, ProtocolAdapter, ProtocolExtra, Sequence, SgipExtra, UnifiedBind,
+    UnifiedDeliver, UnifiedMessage, UnifiedSubmit, UnifiedSubmitResp,
 };
 use rsms_connector::client::{ClientConfig, ClientContext, ClientHandler};
 use rsms_connector::{
@@ -91,29 +93,24 @@ impl BusinessHandler for LongMsgBizHandler {
     }
 
     async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        let pdu = frame.data_as_slice();
-        if pdu.len() < 20 {
-            return Ok(());
-        }
+        if let Ok(UnifiedMessage::Submit(s)) = SgipAdapter.decode(frame) {
+            // tpudhi 取自 SGIP 方言字段；msg_content 即 submit.content。
+            let tpudhi = match &s.extra {
+                ProtocolExtra::Sgip(e) => e.tpudhi,
+                _ => 0,
+            };
+            self.received_segments.lock().unwrap().push(SgipSegment {
+                tpudhi,
+                msg_content: s.content.clone(),
+            });
 
-        let cmd_id = u32::from_be_bytes([pdu[4], pdu[5], pdu[6], pdu[7]]);
-        if cmd_id == CommandId::Submit as u32 {
-            if let Ok(msg) = decode_message(pdu) {
-                if let SgipMessage::Submit(s) = msg {
-                    self.received_segments.lock().unwrap().push(SgipSegment {
-                        tpudhi: s.tpudhi,
-                        msg_content: s.message_content.clone(),
-                    });
-                }
-            }
-
-            let node_id = u32::from_be_bytes([pdu[8], pdu[9], pdu[10], pdu[11]]);
-            let timestamp = u32::from_be_bytes([pdu[12], pdu[13], pdu[14], pdu[15]]);
-            let number = u32::from_be_bytes([pdu[16], pdu[17], pdu[18], pdu[19]]);
-
-            let resp = SubmitResp { result: 0 };
-            let resp_bytes = resp.to_pdu_bytes(node_id, timestamp, number);
-            ctx.conn.write_frame(resp_bytes.as_ref()).await?;
+            // 回 SubmitResp：序列用 sequence_of 回显请求复合序列。
+            let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                msg_id: rsms_model::MessageId::Text(String::new()),
+                status: 0,
+            });
+            let resp_bytes = SgipAdapter.encode(&resp, SgipAdapter.sequence_of(frame))?;
+            ctx.conn.write_frame(resp_bytes.as_slice()).await?;
         }
         Ok(())
     }
@@ -141,14 +138,18 @@ impl LongMsgClientHandler {
     }
 
     fn build_bind_pdu(&self) -> RawPdu {
-        let bind = Bind {
-            login_type: 1,
-            login_name: TEST_ACCOUNT.to_string(),
-            login_password: TEST_PASSWORD.to_string(),
-            reserve: [0u8; 8],
-        };
-        let seq_num = self.next_seq();
-        bind.to_pdu_bytes(SGIP_NODE_ID, SGIP_TIMESTAMP, seq_num).into()
+        // 明文认证：authenticator 装口令字节；version 承载 login_type=1。
+        let bind = UnifiedMessage::Bind(UnifiedBind {
+            client_id: TEST_ACCOUNT.to_string(),
+            authenticator: TEST_PASSWORD.as_bytes().to_vec(),
+            timestamp: 0,
+            version: 1,
+            system_type: None,
+            mode: rsms_model::BindMode::default(),
+            login_mode: None,
+        });
+        let seq = Sequence::Sgip { node_id: SGIP_NODE_ID, timestamp: SGIP_TIMESTAMP, number: self.next_seq() };
+        RawPdu::from(SgipAdapter.encode(&bind, seq).expect("encode bind"))
     }
 
     fn build_long_submit_pdus(&self, content: &[u8], msg_fmt: u8) -> Vec<RawPdu> {
@@ -156,24 +157,36 @@ impl LongMsgClientHandler {
             8 => SmsAlphabet::UCS2,
             _ => SmsAlphabet::ASCII,
         };
+        // msg_fmt → 统一 Encoding（8=UCS2，否则 ASCII）。
+        let encoding = match msg_fmt {
+            8 => Encoding::Ucs2,
+            _ => Encoding::Ascii,
+        };
         let mut splitter = LongMessageSplitter::new();
         let frames = splitter.split(content, alphabet);
+        // 保留原序列号生成节奏（首段取一个 number，再额外消耗一个 seq）。
         let start_number = self.next_seq();
         let _ = self.next_seq();
         let start_number = start_number;
 
         frames.iter().enumerate().map(|(i, frame)| {
-            let mut submit = Submit::new();
-            submit.sp_number = "106900".to_string();
-            submit.charge_number = "106900".to_string();
-            submit.user_count = 1;
-            submit.user_numbers = vec!["13800138000".to_string()];
-            submit.msg_fmt = msg_fmt;
-            submit.message_content = frame.content.clone();
-            submit.tpudhi = if frame.has_udhi { 1 } else { 0 };
-            submit.report_flag = 0;
+            // 长短信分段：tpudhi=1 标记含 UDH；report_flag=0；方言走 SgipExtra。
+            let submit = UnifiedMessage::Submit(UnifiedSubmit {
+                src: Address::plain("106900"),
+                dests: vec![Address::plain("13800138000")],
+                content: frame.content.clone(),
+                encoding,
+                want_report: false, // report_flag=0
+                concat: None,
+                extra: ProtocolExtra::Sgip(SgipExtra {
+                    tpudhi: if frame.has_udhi { 1 } else { 0 },
+                    ..Default::default()
+                }),
+                tlvs: vec![],
+            });
             let number = start_number + i as u32;
-            RawPdu::from(submit.to_pdu_bytes(SGIP_NODE_ID, SGIP_TIMESTAMP, number))
+            let seq = Sequence::Sgip { node_id: SGIP_NODE_ID, timestamp: SGIP_TIMESTAMP, number };
+            RawPdu::from(SgipAdapter.encode(&submit, seq).expect("encode submit segment"))
         }).collect()
     }
 }
@@ -185,34 +198,28 @@ impl ClientHandler for LongMsgClientHandler {
     }
 
     async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        let pdu = frame.data_as_slice();
-        if pdu.len() < 20 {
-            return Ok(());
-        }
+        let unified = match SgipAdapter.decode(frame) {
+            Ok(m) => m,
+            Err(_) => return Ok(()),
+        };
 
-        let cmd_id = frame.command_id;
-
-        if cmd_id == CommandId::BindResp as u32 {
-            let result = pdu[20] as u32;
-            if result == 0 {
-                self.connected.store(true, Ordering::Relaxed);
-            }
-        } else if cmd_id == CommandId::SubmitResp as u32 {
-            self.submit_resp_count.fetch_add(1, Ordering::Relaxed);
-        } else if cmd_id == CommandId::Deliver as u32 {
-            if let Ok(msg) = decode_message(pdu) {
-                if let SgipMessage::Deliver(d) = msg {
-                    self.deliver_segments.lock().unwrap().push(d.message_content.clone());
+        match unified {
+            UnifiedMessage::BindResp(resp) => {
+                if resp.status == 0 {
+                    self.connected.store(true, Ordering::Relaxed);
                 }
             }
-
-            let node_id = u32::from_be_bytes([pdu[8], pdu[9], pdu[10], pdu[11]]);
-            let timestamp = u32::from_be_bytes([pdu[12], pdu[13], pdu[14], pdu[15]]);
-            let number = u32::from_be_bytes([pdu[16], pdu[17], pdu[18], pdu[19]]);
-
-            let resp = DeliverResp { result: 0 };
-            let resp_bytes = resp.to_pdu_bytes(node_id, timestamp, number);
-            ctx.conn.write_frame(resp_bytes.as_ref()).await?;
+            UnifiedMessage::SubmitResp(_) => {
+                self.submit_resp_count.fetch_add(1, Ordering::Relaxed);
+            }
+            UnifiedMessage::Deliver(d) => {
+                self.deliver_segments.lock().unwrap().push(d.content.clone());
+                // 回 DeliverResp：序列用 sequence_of 回显请求复合序列。
+                let resp_bytes =
+                    SgipAdapter.encode(&UnifiedMessage::DeliverResp, SgipAdapter.sequence_of(frame))?;
+                ctx.conn.write_frame(resp_bytes.as_slice()).await?;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -228,13 +235,23 @@ fn build_deliver_mo_pdu(
     tpudhi: u8,
     msg_content: Vec<u8>,
 ) -> RawPdu {
-    let mut deliver = Deliver::new();
-    deliver.user_number = user.to_string();
-    deliver.sp_number = sp.to_string();
-    deliver.msg_fmt = msg_fmt;
-    deliver.tpudhi = tpudhi;
-    deliver.message_content = msg_content;
-    deliver.to_pdu_bytes(node_id, timestamp, number).into()
+    // msg_fmt → 统一 Encoding（8=UCS2，否则 ASCII）。
+    let encoding = match msg_fmt {
+        8 => Encoding::Ucs2,
+        _ => Encoding::Ascii,
+    };
+    // MO 上行 Deliver（统一模型）：decode 对称 src=sp_number, dest=user_number；tpudhi 经 SgipExtra。
+    let deliver = UnifiedMessage::Deliver(UnifiedDeliver {
+        src: Address::plain(sp),
+        dest: Address::plain(user),
+        content: msg_content,
+        encoding,
+        concat: None,
+        extra: ProtocolExtra::Sgip(SgipExtra { tpudhi, ..Default::default() }),
+        tlvs: vec![],
+    });
+    let seq = Sequence::Sgip { node_id, timestamp, number };
+    RawPdu::from(SgipAdapter.encode(&deliver, seq).expect("encode deliver(MO)"))
 }
 
 fn merge_segments(segments: &[Vec<u8>]) -> Vec<u8> {

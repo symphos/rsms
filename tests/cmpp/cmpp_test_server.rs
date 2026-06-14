@@ -6,7 +6,9 @@ use rsms_connector::{
 use rsms_business::BusinessHandler;
 use rsms_business::InboundContext;
 use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, Result};
-use rsms_codec_cmpp::{decode_message, CmppMessage};
+// 窄腰统一模型：用 CmppAdapter.decode(frame) → UnifiedMessage 替代裸 decode_message/CmppMessage。
+use rsms_codec_cmpp::adapter::CmppAdapter;
+use rsms_model::{ProtocolAdapter, UnifiedMessage};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -157,11 +159,12 @@ impl BusinessHandler for TestBusinessHandler {
     }
 
     async fn on_inbound(&self, _ctx: &InboundContext, frame: &rsms_core::Frame) -> Result<()> {
-        match decode_message(frame.data_as_slice()) {
-            Ok(CmppMessage::SubmitV20 { .. }) | Ok(CmppMessage::SubmitV30 { .. }) => {
+        // 统一模型分支：Submit 计 submit；Deliver/Report（CMPP Deliver 承载）计 deliver。
+        match CmppAdapter.decode(frame) {
+            Ok(UnifiedMessage::Submit(_)) => {
                 self.submit_count.fetch_add(1, Ordering::Relaxed);
             }
-            Ok(CmppMessage::DeliverV20 { .. }) | Ok(CmppMessage::DeliverV30 { .. }) => {
+            Ok(UnifiedMessage::Deliver(_)) | Ok(UnifiedMessage::Report(_)) => {
                 self.deliver_count.fetch_add(1, Ordering::Relaxed);
             }
             _ => {}

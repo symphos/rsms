@@ -5,8 +5,13 @@
 //! （固定长连接压测触发不到此路径）。以 WARN 日志运行（CLAUDE.md 压测铁律）。
 
 use async_trait::async_trait;
+// 窄腰统一模型：Connect/Submit 构造经 CmppAdapter。compute_connect_auth 为鉴权工具，保留。
+use rsms_codec_cmpp::adapter::CmppAdapter;
 use rsms_codec_cmpp::auth::compute_connect_auth;
-use rsms_codec_cmpp::{Connect, Pdu, Submit};
+use rsms_model::{
+    Address, Encoding, ProtocolAdapter, ProtocolExtra, Sequence, UnifiedBind, UnifiedMessage,
+    UnifiedSubmit,
+};
 use rsms_connector::{
     AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler, AuthResult, Protocol,
     ServerBuilder,
@@ -66,24 +71,31 @@ impl AccountConfigProvider for FixedConfig {
 
 fn build_connect_pdu(seq: u32) -> Vec<u8> {
     let ts = 0u32;
-    let connect = Connect {
-        source_addr: TEST_ACCOUNT.to_string(),
-        authenticator_source: compute_connect_auth(TEST_ACCOUNT, TEST_PASSWORD, ts),
-        version: CMPP_VERSION,
+    let bind = UnifiedMessage::Bind(UnifiedBind {
+        client_id: TEST_ACCOUNT.to_string(),
+        authenticator: compute_connect_auth(TEST_ACCOUNT, TEST_PASSWORD, ts).to_vec(),
         timestamp: ts,
-    };
-    let pdu: Pdu = connect.into();
-    pdu.to_pdu_bytes(seq).to_vec()
+        version: CMPP_VERSION,
+        system_type: None,
+        mode: rsms_model::BindMode::default(),
+        login_mode: None,
+    });
+    CmppAdapter.encode(&bind, Sequence::Plain(seq)).expect("encode bind")
 }
 
 fn build_submit_pdu(seq: u32) -> Vec<u8> {
-    let mut submit = Submit::new();
-    submit.src_id = TEST_ACCOUNT.to_string();
-    submit.dest_usr_tl = 1;
-    submit.dest_terminal_ids = vec!["13800138000".to_string()];
-    submit.msg_content = b"soak".to_vec();
-    let pdu: Pdu = submit.into();
-    pdu.to_pdu_bytes(seq).to_vec()
+    // 统一 Submit（其余 CMPP 方言取默认，与原 Submit::new() 默认一致）。
+    let submit = UnifiedMessage::Submit(UnifiedSubmit {
+        src: Address::plain(TEST_ACCOUNT),
+        dests: vec![Address::plain("13800138000")],
+        content: b"soak".to_vec(),
+        encoding: Encoding::Ascii,
+        want_report: false,
+        concat: None,
+        extra: ProtocolExtra::Cmpp(Default::default()),
+        tlvs: vec![],
+    });
+    CmppAdapter.encode(&submit, Sequence::Plain(seq)).expect("encode submit")
 }
 
 #[tokio::test]

@@ -2,30 +2,17 @@ use md5::{Digest, Md5};
 
 /// 计算 CMPP Connect 请求的 AuthenticatorSource
 ///
-/// AuthenticatorSource = MD5(SourceAddr + 9个零字节 + Password + Timestamp)
+/// AuthenticatorSource = MD5(SourceAddr原始 + 9个零字节 + Password + Timestamp的10位十进制字符串)
 ///
-/// - SourceAddr: 6字节 SP 企业代码
-/// - Password: 明文密码
-/// - Timestamp: 4字节大端 MMDDHHMMSS 格式
+/// 对齐 lihuanghe/SMSGate `SessionLoginManager.validClientMsg`：SourceAddr 用登录名**原始字节**
+/// （不补齐到 6B），Timestamp 用 `String.format("%010d", ts)` 的 ASCII 串（**非 4 字节整数**）。
+/// 2026-06-14 经 cmos 模拟器联调验证。
 pub fn compute_connect_auth(source_addr: &str, password: &str, timestamp: u32) -> [u8; 16] {
     let mut hasher = Md5::new();
-
-    // SourceAddr (6 bytes, space-padded)
-    let mut addr_buf = [b' '; 6];
-    let addr_bytes = source_addr.as_bytes();
-    let copy_len = addr_bytes.len().min(6);
-    addr_buf[..copy_len].copy_from_slice(&addr_bytes[..copy_len]);
-    hasher.update(addr_buf);
-
-    // 9 null bytes
+    hasher.update(source_addr.as_bytes());
     hasher.update([0u8; 9]);
-
-    // Password
     hasher.update(password.as_bytes());
-
-    // Timestamp (4 bytes big-endian)
-    hasher.update(timestamp.to_be_bytes());
-
+    hasher.update(format!("{timestamp:010}").as_bytes());
     hasher.finalize().into()
 }
 

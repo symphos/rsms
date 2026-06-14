@@ -1,6 +1,8 @@
 //! 协议无关的统一消息枚举与各消息结构。
 
-use crate::types::{Address, Concat, DeliveryStatus, Encoding, MessageId, ProtocolExtra, Tlv};
+use crate::types::{
+    Address, BindMode, Concat, DeliveryStatus, Encoding, MessageId, ProtocolExtra, Tlv,
+};
 
 /// 统一消息（主干；Query/Cancel 等次要消息后续补充）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +59,8 @@ pub struct UnifiedDeliver {
 pub struct UnifiedReport {
     pub msg_id: MessageId,
     pub status: DeliveryStatus,
+    /// 报告源地址（构造下行 Deliver-报告需要；CMPP/SMGP/SMPP 的 src_terminal_id 等）。
+    pub src: Address,
     pub dest: Address,
     /// 原始报告正文，便于业务需要时取协议原始信息。
     pub raw: Vec<u8>,
@@ -66,9 +70,17 @@ pub struct UnifiedReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnifiedBind {
     pub client_id: String,
+    /// 鉴权凭据：CMPP/SMGP 为 16 字节 MD5；SMPP/SGIP 为明文口令字节。
     pub authenticator: Vec<u8>,
     pub timestamp: u32,
+    /// 协议版本；SGIP 复用此字段承载 login_type（1=SP→SMG）。
     pub version: u8,
+    /// SMPP system_type（CMT 等）；其余协议为 None。
+    pub system_type: Option<String>,
+    /// SMPP bind 模式（Transceiver/Transmitter/Receiver）；其余协议取默认值、encode 时忽略。
+    pub mode: BindMode,
+    /// SMGP login_mode（0/1/2，DUPLEX 端点须 2）；其余协议为 None。
+    pub login_mode: Option<u8>,
 }
 
 /// 认证响应。

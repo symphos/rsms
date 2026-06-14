@@ -1,5 +1,12 @@
 // ============================================================================
-// SMPP 服务端完整参考实现
+// SMPP 服务端参考实现（统一模型 / 窄腰架构版）
+//
+// 与旧版的根本区别：业务代码不再直接接触 SMPP 裸 codec 类型
+// （SubmitSm/DeliverSm/SubmitSmResp/Pdu/decode_message_with_version…），
+// 全程只用协议无关的 `rsms_model::UnifiedMessage` + `SmppAdapter`（实现 ProtocolAdapter）：
+//   - 收包：SmppAdapter.decode(frame) -> UnifiedMessage，业务按统一枚举分支处理
+//   - 回包/下发：构造 UnifiedMessage -> SmppAdapter.encode(msg, Sequence) -> 字节
+// 切换协议只需换 adapter（CmppAdapter/SmgpAdapter/SgipAdapter）与 EndpointConfig.protocol，业务逻辑零改。
 //
 // 功能：认证 + 限流 + MessageSource 队列 + 错误处理 + 长短信合包/拆分
 // 运行：cargo run
@@ -7,27 +14,24 @@
 //
 // 核心流程：
 //   1. 从 accounts.conf 读取账号配置
-//   2. 客户端连接 → 框架自动完成 SMPP 协议握手（BindTransmitter/Resp）
-//   3. 客户端发送 SubmitSm → BusinessHandler.on_inbound() 收到
-//   4. 业务方解码 SubmitSm、回 SubmitSmResp、处理业务
-//   5. 通过 MessageSource 异步发送 DeliverSm（MO/Report）
+//   2. 客户端连接 → 框架自动完成 SMPP 协议握手（Bind/BindResp）
+//   3. 客户端发送 Submit → BusinessHandler.on_inbound() 收到，统一模型解码
+//   4. 业务方回 SubmitResp、处理业务（含长短信合包）
+//   5. 通过 MessageSource 异步发送 Deliver（MO）/ Report（回执）
 //
-// SMPP 与 CMPP 的关键差异：
-//   - 认证是明文（无 MD5）：AuthCredentials::Smpp { system_id, password, interface_version }
-//   - 16 字节 Header（多了 4 字节 command_status）
-//   - Report 通过 DeliverSm(esm_class=0x04) 承载
-//   - MsgId 是 String 类型（非 [u8; 8]）
-//   - decode_message_with_version 需要版本参数
-//   - 长短信用 esm_class bit 6 (0x40) 表示 TP-UDHI（无独立 tpudhi 字段）
+// SMPP 协议要点（统一模型已封装在 SmppAdapter 内，业务无需关心）：
+//   - 认证明文（无 MD5）：AuthHandler 走框架握手范畴，保持原样
+//   - Report 经 DeliverSm(esm_class=0x04) 承载——SmppAdapter.encode(Report) 自动置位
+//   - MO 长短信用 esm_class bit6 (0x40) 表示 TP-UDHI（无独立 tpudhi 字段）
+//   - adapter.decode 不透传 esm_class，故收包侧靠 UdhParser 直接判 UDH 决定是否合包
+//   - SMPP 版本差异(V3.4/V5.0)仅字段长度限制，统一模型无需显式处理；如需限定版本
+//     可在 EndpointConfig 侧设置（本例使用默认）
 // ============================================================================
 
 use async_trait::async_trait;
 use rsms_business::BusinessHandler;
 use rsms_business::InboundContext;
-use rsms_codec_smpp::{
-    decode_message_with_version, DeliverSm, DeliverSmResp, Pdu, SmppMessage, SmppVersion,
-    SubmitSmResp, Tlv,
-};
+use rsms_codec_smpp::adapter::SmppAdapter;
 use rsms_connector::{
     ServerBuilder, AccountConfig, AccountConfigProvider, AccountPoolConfig, AuthCredentials,
     AuthHandler, AuthResult, MessageItem, MessageSource, ProtocolConnection, ServerEventHandler,
@@ -37,12 +41,14 @@ use rsms_longmsg::{
     LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser,
     split::SmsAlphabet,
 };
+use rsms_model::{
+    Address, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra, Sequence,
+    SmppExtra, UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmitResp,
+};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-
-use rsms_codec_smpp::datatypes::tags;
 
 // ============================================================================
 // 配置读取
@@ -114,8 +120,51 @@ fn detect_alphabet(content: &str) -> SmsAlphabet {
     }
 }
 
+/// 把统一 SmsAlphabet 翻译为统一模型 Encoding。
+fn encoding_of(alphabet: SmsAlphabet) -> Encoding {
+    match alphabet {
+        SmsAlphabet::ASCII | SmsAlphabet::GSM7 => Encoding::Ascii,
+        _ => Encoding::Ucs2,
+    }
+}
+
+/// 把文本按目标编码转为 wire 字节：UCS2 须为 UTF-16BE（每字符 2 字节大端），
+/// 否则按 ASCII/原字节。
+/// **关键**：LongMessageSplitter 只按字节分段、不转码，若直接传 content.as_bytes()
+/// （UTF-8）却标 data_coding=8(UCS2)，对端按 UTF-16BE 解 UTF-8 → 全乱码。
+fn to_wire_bytes(content: &str, alphabet: SmsAlphabet) -> Vec<u8> {
+    match alphabet {
+        SmsAlphabet::UCS2 => content.encode_utf16().flat_map(|u| u.to_be_bytes()).collect(),
+        _ => content.as_bytes().to_vec(),
+    }
+}
+
+/// 将 wire 字节按编码解码为可显示字符串：UCS2 按 UTF-16BE 解，否则按 UTF-8 解。
+fn decode_text(bytes: &[u8], encoding: Encoding) -> String {
+    match encoding {
+        Encoding::Ucs2 => {
+            // UTF-16BE：每 2 字节一个 u16，按大端序组装后解码
+            let u16s: Vec<u16> = bytes
+                .chunks(2)
+                .map(|chunk| {
+                    if chunk.len() == 2 {
+                        u16::from_be_bytes([chunk[0], chunk[1]])
+                    } else {
+                        // 字节数为奇数时最后一字节补 0
+                        u16::from_be_bytes([chunk[0], 0])
+                    }
+                })
+                .collect();
+            String::from_utf16_lossy(&u16s)
+        }
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
 // ============================================================================
 // AuthHandler：SMPP 明文认证
+//
+// 注：AuthHandler 属框架握手范畴（仅校验账密，不构造业务 PDU），统一模型重构保持原样。
 // ============================================================================
 
 struct SmppAuthHandler {
@@ -167,8 +216,8 @@ impl AuthHandler for SmppAuthHandler {
 // MessageSource：内存队列（按账号隔离）
 //
 // 长短信 MO 支持：
-//   - 超过单条限制的 MO 消息自动拆分为多个 DeliverSm
-//   - 每个分段 esm_class |= 0x40（TP-UDHI）
+//   - 超过单条限制的 MO 消息自动拆分为多个 Deliver（统一模型 UnifiedDeliver）
+//   - 每个分段经 SmppExtra.esm_class |= 0x40（TP-UDHI）标记，内容携带 UDH 头
 //   - 使用 MessageItem::Group 保证同组帧走同一连接顺序发出
 // ============================================================================
 
@@ -190,18 +239,23 @@ impl FileMessageSource {
 
         for mo in &messages {
             let alphabet = detect_alphabet(&mo.content);
-            let frames = splitter.split(mo.content.as_bytes(), alphabet);
+            let encoding = encoding_of(alphabet);
+            // UCS2 须先转 UTF-16BE 再分段，否则 splitter 按字节分段后对端解 UTF-16BE 得乱码
+            let wire = to_wire_bytes(&mo.content, alphabet);
+            let frames = splitter.split(&wire, alphabet);
 
             if frames.len() == 1 && !frames[0].has_udhi {
-                let pdu = build_deliver_sm_mo(&mo.account, &mo.phone, &mo.content, 0);
-                source.push_sync(&mo.account, pdu);
+                // 普通 MO：单条 Deliver，esm_class 不置 UDH 位
+                let bytes = encode_deliver_mo(&mo.account, &mo.phone, &frames[0].content, encoding, 0);
+                source.push_sync(&mo.account, RawPdu::from(bytes));
             } else {
+                // 长短信 MO：每段 esm_class 置 TP-UDHI(0x40)，同组顺序发出
                 let items: Vec<Arc<dyn EncodedPdu>> = frames
                     .into_iter()
                     .map(|frame| {
-                        let pdu =
-                            build_deliver_sm_mo_raw(&mo.account, &mo.phone, 0x40, &frame.content);
-                        Arc::new(pdu) as Arc<dyn EncodedPdu>
+                        let bytes =
+                            encode_deliver_mo(&mo.account, &mo.phone, &frame.content, encoding, 0x40);
+                        Arc::new(RawPdu::from(bytes)) as Arc<dyn EncodedPdu>
                     })
                     .collect();
                 source.push_group_sync(&mo.account, items);
@@ -262,12 +316,11 @@ impl MessageSource for FileMessageSource {
 }
 
 // ============================================================================
-// BusinessHandler：处理 SubmitSm，回 SubmitSmResp，推送 Report
+// BusinessHandler：统一模型分支处理客户端上行的所有帧
 //
 // 长短信 MT 合包：
-//   - 检查 esm_class & 0x40 判断是否有 UDH
-//   - 有 UDH 的 SubmitSm 用 merger 合包
-//   - 合包完成后处理完整消息
+//   - adapter.decode 不透传 esm_class，故对 UnifiedSubmit.content 直接跑 UdhParser
+//   - 有 UDH 则 merger 合包，合包完成后处理完整消息
 // ============================================================================
 
 struct SmppBusinessHandler {
@@ -282,8 +335,7 @@ impl BusinessHandler for SmppBusinessHandler {
     }
 
     async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        let msg = match decode_message_with_version(frame.data_as_slice(), Some(SmppVersion::V34))
-        {
+        let unified = match SmppAdapter.decode(frame) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(conn_id = ctx.conn.id(), "消息解码失败: {}", e);
@@ -291,20 +343,17 @@ impl BusinessHandler for SmppBusinessHandler {
             }
         };
 
-        match msg {
-            SmppMessage::SubmitSm(ref s) => {
-                self.handle_submit(ctx, frame.sequence_id, s).await?;
+        match unified {
+            UnifiedMessage::Submit(submit) => {
+                self.handle_submit(ctx, frame, submit).await?;
             }
-            SmppMessage::DeliverSm(ref _d) => {
-                let resp = DeliverSmResp {
-                    message_id: String::new(),
-                };
-                let resp_pdu: Pdu = resp.into();
-                ctx.conn
-                    .write_frame(resp_pdu.to_pdu_bytes(frame.sequence_id).as_bytes_ref())
-                    .await?;
+            UnifiedMessage::Deliver(_) | UnifiedMessage::Report(_) => {
+                // 客户端上行 DeliverSm（极少见），回 DeliverResp（sequence_of 自动回显请求序列）
+                let bytes =
+                    SmppAdapter.encode(&UnifiedMessage::DeliverResp, SmppAdapter.sequence_of(frame))?;
+                ctx.conn.write_frame(&bytes).await?;
             }
-            SmppMessage::EnquireLink { .. } => {
+            UnifiedMessage::Ping => {
                 tracing::debug!(conn_id = ctx.conn.id(), "收到 EnquireLink");
             }
             _ => {}
@@ -317,63 +366,71 @@ impl SmppBusinessHandler {
     async fn handle_submit(
         &self,
         ctx: &InboundContext,
-        sequence_id: u32,
-        submit: &rsms_codec_smpp::SubmitSm,
+        frame: &Frame,
+        submit: rsms_model::UnifiedSubmit,
     ) -> Result<()> {
-        let phone = &submit.destination_addr;
-        let source = &submit.source_addr;
+        let phone = submit
+            .dests
+            .first()
+            .map(|a| a.number.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let source = submit.src.number.clone();
 
-        let msg_id = ctx.id_generator
+        // 生成 msg_id：经 IdGenerator（无则回退用序列号），文本化承载到 SubmitResp
+        let msg_id = ctx
+            .id_generator
             .as_ref()
             .map(|g| g.next_msg_id().to_string())
-            .unwrap_or_else(|| format!("{:010}", sequence_id));
-        let resp = SubmitSmResp {
-            message_id: msg_id.clone(),
-        };
-        let resp_pdu: Pdu = resp.into();
-        ctx.conn
-            .write_frame(resp_pdu.to_pdu_bytes(sequence_id).as_bytes_ref())
-            .await?;
+            .unwrap_or_else(|| format!("{:010}", frame.sequence_id));
 
-        if submit.esm_class & 0x40 != 0 {
-            if let Some((udh, _)) = UdhParser::extract_udh(&submit.short_message) {
-                let seg_num = udh.segment_number;
-                let total = udh.total_segments;
-                let frame = LongMessageFrame::new(
-                    udh.reference_id,
-                    total,
-                    seg_num,
-                    submit.short_message.clone(),
-                    true,
-                    Some(udh),
-                );
-                let mut merger = self.merger.lock().unwrap();
-                match merger.add_frame(frame) {
-                    Ok(Some(merged)) => {
-                        let content = String::from_utf8_lossy(&merged);
-                        tracing::info!(
-                            conn_id = ctx.conn.id(),
-                            source = %source,
-                            phone = %phone,
-                            content = %content,
-                            "长短信 MT 合包完成"
-                        );
-                    }
-                    Ok(None) => {
-                        tracing::debug!(
-                            conn_id = ctx.conn.id(),
-                            segment = seg_num,
-                            total = total,
-                            "长短信 MT 分段等待更多"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(conn_id = ctx.conn.id(), "长短信合包失败: {}", e);
-                    }
+        // 回 SubmitResp（框架不自动回，业务方自己回）。sequence_of 自动回显请求序列。
+        let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+            msg_id: MessageId::Text(msg_id.clone()),
+            status: 0,
+        });
+        let resp_bytes = SmppAdapter.encode(&resp, SmppAdapter.sequence_of(frame))?;
+        ctx.conn.write_frame(&resp_bytes).await?;
+
+        // 长短信合包：adapter 不透传 esm_class，对 content 直接判 UDH
+        if let Some((udh, _)) = UdhParser::extract_udh(&submit.content) {
+            let seg_num = udh.segment_number;
+            let total = udh.total_segments;
+            let lm_frame = LongMessageFrame::new(
+                udh.reference_id,
+                total,
+                seg_num,
+                submit.content.clone(),
+                true,
+                Some(udh),
+            );
+            let mut merger = self.merger.lock().unwrap();
+            match merger.add_frame(lm_frame) {
+                Ok(Some(merged)) => {
+                    // 合包完成后按实际编码解码（UCS2→UTF-16BE，否则 UTF-8）
+                    let content = decode_text(&merged, submit.encoding);
+                    tracing::info!(
+                        conn_id = ctx.conn.id(),
+                        source = %source,
+                        phone = %phone,
+                        content = %content,
+                        "长短信 MT 合包完成"
+                    );
+                }
+                Ok(None) => {
+                    tracing::debug!(
+                        conn_id = ctx.conn.id(),
+                        segment = seg_num,
+                        total = total,
+                        "长短信 MT 分段等待更多"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(conn_id = ctx.conn.id(), "长短信合包失败: {}", e);
                 }
             }
         } else {
-            let content = String::from_utf8_lossy(&submit.short_message);
+            // 按实际编码解码（UCS2→UTF-16BE，否则 UTF-8）
+            let content = decode_text(&submit.content, submit.encoding);
             tracing::info!(
                 conn_id = ctx.conn.id(),
                 source = %source,
@@ -383,11 +440,11 @@ impl SmppBusinessHandler {
             );
         }
 
-        if submit.registered_delivery == 1 {
+        // 需要状态报告 → 通过 MessageSource 异步发送（registered_delivery bit0 即 want_report）
+        if submit.want_report {
             if let Some(account) = ctx.conn.authenticated_account().await {
-                let report =
-                    build_deliver_sm_report(&account, &msg_id, phone);
-                self.msg_source.push(&account, report).await;
+                let report = encode_deliver_report(&account, &msg_id, &phone);
+                self.msg_source.push(&account, RawPdu::from(report)).await;
             }
         }
 
@@ -396,89 +453,56 @@ impl SmppBusinessHandler {
 }
 
 // ============================================================================
-// 辅助函数：构建 DeliverSm PDU
+// 辅助函数：构建下行帧字节（经 SmppAdapter.encode，零裸 codec）
 // ============================================================================
 
-fn build_deliver_sm_report(account: &str, msg_id: &str, phone: &str) -> RawPdu {
-    let deliver = DeliverSm {
-        service_type: String::new(),
-        source_addr_ton: 0,
-        source_addr_npi: 0,
-        source_addr: phone.to_string(),
-        dest_addr_ton: 0,
-        dest_addr_npi: 0,
-        destination_addr: account.to_string(),
-        esm_class: 0x04,
-        protocol_id: 0,
-        priority_flag: 0,
-        schedule_delivery_time: String::new(),
-        validity_period: String::new(),
-        registered_delivery: 0,
-        replace_if_present_flag: 0,
-        data_coding: 0,
-        sm_default_msg_id: 0,
-        short_message: format!(
-            "id:{} sub:001 dlvrd:001 submit date:done date:stat:DELIVRD err:000",
-            msg_id
-        )
-        .into_bytes(),
-        tlvs: vec![
-            Tlv::new(tags::RECEIPTED_MESSAGE_ID, msg_id.as_bytes().to_vec()),
-            Tlv::new(tags::MESSAGE_STATE, vec![1]),
-        ],
-    };
-    let pdu: Pdu = deliver.into();
-    pdu.to_pdu_bytes(0)
+/// 构建投递状态报告字节。
+/// 统一模型 UnifiedMessage::Report → SmppAdapter 自动产出 DeliverSm(esm_class=0x04)
+/// 并写入 receipted_message_id TLV，raw 作为回执正文 short_message。
+fn encode_deliver_report(account: &str, msg_id: &str, phone: &str) -> Vec<u8> {
+    let raw = format!(
+        "id:{} sub:001 dlvrd:001 submit date:done date:stat:DELIVRD err:000",
+        msg_id
+    )
+    .into_bytes();
+    let report = UnifiedMessage::Report(UnifiedReport {
+        msg_id: MessageId::Text(msg_id.to_string()),
+        status: DeliveryStatus::Delivered,
+        // 报告源是手机号，目的是接入账号（与下行 MO 方向一致）
+        src: Address::plain(phone),
+        dest: Address::plain(account),
+        raw,
+    });
+    SmppAdapter
+        .encode(&report, Sequence::Plain(0))
+        .expect("encode report")
 }
 
-fn build_deliver_sm_mo(account: &str, phone: &str, content: &str, esm_class: u8) -> RawPdu {
-    let deliver = DeliverSm {
-        service_type: String::new(),
-        source_addr_ton: 0,
-        source_addr_npi: 0,
-        source_addr: phone.to_string(),
-        dest_addr_ton: 0,
-        dest_addr_npi: 0,
-        destination_addr: account.to_string(),
-        esm_class,
-        protocol_id: 0,
-        priority_flag: 0,
-        schedule_delivery_time: String::new(),
-        validity_period: String::new(),
-        registered_delivery: 0,
-        replace_if_present_flag: 0,
-        data_coding: 0,
-        sm_default_msg_id: 0,
-        short_message: content.as_bytes().to_vec(),
+/// 构建 MO 上行字节。
+/// 统一模型 UnifiedMessage::Deliver（非回执位）→ SmppAdapter 产出 DeliverSm。
+/// esm_class=0x40 时标记 TP-UDHI（长短信分段，content 已带 UDH 头）。
+fn encode_deliver_mo(
+    account: &str,
+    phone: &str,
+    content: &[u8],
+    encoding: Encoding,
+    esm_class: u8,
+) -> Vec<u8> {
+    let deliver = UnifiedMessage::Deliver(UnifiedDeliver {
+        src: Address::plain(phone),
+        dest: Address::plain(account),
+        content: content.to_vec(),
+        encoding,
+        concat: None,
+        extra: ProtocolExtra::Smpp(SmppExtra {
+            esm_class,
+            ..Default::default()
+        }),
         tlvs: vec![],
-    };
-    let pdu: Pdu = deliver.into();
-    pdu.to_pdu_bytes(0)
-}
-
-fn build_deliver_sm_mo_raw(account: &str, phone: &str, esm_class: u8, short_message: &[u8]) -> RawPdu {
-    let deliver = DeliverSm {
-        service_type: String::new(),
-        source_addr_ton: 0,
-        source_addr_npi: 0,
-        source_addr: phone.to_string(),
-        dest_addr_ton: 0,
-        dest_addr_npi: 0,
-        destination_addr: account.to_string(),
-        esm_class,
-        protocol_id: 0,
-        priority_flag: 0,
-        schedule_delivery_time: String::new(),
-        validity_period: String::new(),
-        registered_delivery: 0,
-        replace_if_present_flag: 0,
-        data_coding: 0,
-        sm_default_msg_id: 0,
-        short_message: short_message.to_vec(),
-        tlvs: vec![],
-    };
-    let pdu: Pdu = deliver.into();
-    pdu.to_pdu_bytes(0)
+    });
+    SmppAdapter
+        .encode(&deliver, Sequence::Plain(0))
+        .expect("encode deliver mo")
 }
 
 // ============================================================================

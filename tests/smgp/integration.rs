@@ -4,7 +4,14 @@ use rsms_connector::{AuthHandler, AuthCredentials, AuthResult, ServerEventHandle
 use rsms_business::BusinessHandler;
 use rsms_business::InboundContext;
 use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Protocol, Frame, Result};
-use rsms_codec_smgp::Decodable;
+// 窄腰统一模型：业务/对端代码不再直接用裸 codec PDU，统一走 SmgpAdapter + UnifiedMessage。
+use rsms_codec_smgp::adapter::SmgpAdapter;
+use rsms_codec_smgp::datatypes::SmgpReport;
+use rsms_model::{
+    Address, BindMode, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra,
+    Sequence, UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmit,
+    UnifiedSubmitResp,
+};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
@@ -121,29 +128,30 @@ impl BusinessHandler for TestBusinessHandler {
     }
 
     async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        if let Ok(msg) = rsms_codec_smgp::decode_message(frame.data_as_slice()) {
+        if let Ok(msg) = SmgpAdapter.decode(frame) {
             match msg {
-                rsms_codec_smgp::SmgpMessage::Submit { submit: s, .. } => {
+                UnifiedMessage::Submit(s) => {
                     self.submit_count.fetch_add(1, Ordering::Relaxed);
-                    let content = String::from_utf8_lossy(&s.msg_content).to_string();
+                    let content = String::from_utf8_lossy(&s.content).to_string();
                     self.messages.lock().unwrap().push(content);
 
-                    let resp = rsms_codec_smgp::SubmitResp {
-                        msg_id: rsms_codec_smgp::SmgpMsgId::from_u64(1),
+                    // 立即回 SubmitResp：msg_id 为 10 字节二进制，sequence_of 回显请求序列。
+                    let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                        msg_id: MessageId::Binary(rsms_codec_smgp::SmgpMsgId::from_u64(1).bytes.to_vec()),
                         status: 0,
-                    };
-                    let resp_pdu: rsms_codec_smgp::Pdu = resp.into();
-                    ctx.conn.write_frame(resp_pdu.to_pdu_bytes(frame.sequence_id).as_slice()).await?;
+                    });
+                    let resp_bytes = SmgpAdapter.encode(&resp, SmgpAdapter.sequence_of(frame))?;
+                    ctx.conn.write_frame(&resp_bytes).await?;
                 }
-                rsms_codec_smgp::SmgpMessage::Deliver { deliver: d, .. } => {
-                    if d.is_report == 1 {
-                        self.reports.lock().unwrap().push(String::from_utf8_lossy(&d.msg_content).to_string());
-                    } else {
-                        self.mo_messages.lock().unwrap().push((
-                            d.src_term_id.clone(),
-                            String::from_utf8_lossy(&d.msg_content).to_string(),
-                        ));
-                    }
+                // is_report=1 经 adapter 翻译为 Report，is_report=0 翻译为 Deliver。
+                UnifiedMessage::Report(r) => {
+                    self.reports.lock().unwrap().push(String::from_utf8_lossy(&r.raw).to_string());
+                }
+                UnifiedMessage::Deliver(d) => {
+                    self.mo_messages.lock().unwrap().push((
+                        d.src.number.clone(),
+                        String::from_utf8_lossy(&d.content).to_string(),
+                    ));
                 }
                 _ => {}
             }
@@ -181,48 +189,57 @@ impl TestClientHandler {
 
     pub fn build_login_pdu(&self, client_id: &str, password: &str) -> RawPdu {
         let timestamp = 0u32;
-        let authenticator = rsms_codec_smgp::compute_login_auth(client_id, password, timestamp);
+        // compute_login_auth 保留：鉴权 MD5 加密非 codec 范畴，把算好的 16B 摘要塞进 UnifiedBind。
+        let authenticator = rsms_codec_smgp::compute_login_auth(client_id, password, timestamp).to_vec();
 
-        let login = rsms_codec_smgp::Login {
+        let bind = UnifiedMessage::Bind(UnifiedBind {
             client_id: client_id.to_string(),
             authenticator,
-            login_mode: 0,
             timestamp,
             version: 0x30,
-        };
-
-        let pdu: rsms_codec_smgp::Pdu = login.into();
-        pdu.to_pdu_bytes(self.next_seq())
+            system_type: None,
+            mode: BindMode::default(),
+            login_mode: Some(0),
+        });
+        let bytes = SmgpAdapter.encode(&bind, Sequence::Plain(self.next_seq())).expect("encode login");
+        RawPdu::from(bytes)
     }
 
     pub fn build_submit_pdu(&self, src: &str, dest: &str, content: &str) -> RawPdu {
-        let mut submit = rsms_codec_smgp::Submit::new();
-        submit.need_report = 1;
-        submit.service_id = "SMS".to_string();
-        submit.fee_type = "02".to_string();
-        submit.fee_code = "000000".to_string();
-        submit.fixed_fee = "000000".to_string();
-        submit.msg_fmt = 15;
-        submit.src_term_id = src.to_string();
-        submit.charge_term_id = dest.to_string();
-        submit.dest_term_id_count = 1;
-        submit.dest_term_ids = vec![dest.to_string()];
-        submit.msg_content = content.as_bytes().to_vec();
-
-        let pdu: rsms_codec_smgp::Pdu = submit.into();
-        pdu.to_pdu_bytes(1001)
+        // 原 msg_fmt=15(GBK)，对应 Encoding::Gbk；service_id/fee 等方言字段走 ProtocolExtra::Smgp。
+        let submit = UnifiedMessage::Submit(UnifiedSubmit {
+            src: Address::plain(src),
+            dests: vec![Address::plain(dest)],
+            content: content.as_bytes().to_vec(),
+            encoding: Encoding::Gbk,
+            want_report: true,
+            concat: None,
+            extra: ProtocolExtra::Smgp(rsms_model::SmgpExtra {
+                service_id: "SMS".to_string(),
+                fee_type: "02".to_string(),
+                fee_code: "000000".to_string(),
+                fixed_fee: "000000".to_string(),
+                charge_term_id: dest.to_string(),
+                ..Default::default()
+            }),
+            tlvs: vec![],
+        });
+        let bytes = SmgpAdapter.encode(&submit, Sequence::Plain(1001)).expect("encode submit");
+        RawPdu::from(bytes)
     }
 
     pub fn build_active_test_pdu(&self) -> RawPdu {
-        let active_test = rsms_codec_smgp::ActiveTest;
-        let pdu: rsms_codec_smgp::Pdu = active_test.into();
-        pdu.to_pdu_bytes(self.next_seq())
+        let bytes = SmgpAdapter
+            .encode(&UnifiedMessage::Ping, Sequence::Plain(self.next_seq()))
+            .expect("encode active_test");
+        RawPdu::from(bytes)
     }
 
     pub fn build_exit_pdu(&self) -> RawPdu {
-        let exit = rsms_codec_smgp::Exit;
-        let pdu: rsms_codec_smgp::Pdu = exit.into();
-        pdu.to_pdu_bytes(self.next_seq())
+        let bytes = SmgpAdapter
+            .encode(&UnifiedMessage::Unbind, Sequence::Plain(self.next_seq()))
+            .expect("encode exit");
+        RawPdu::from(bytes)
     }
 
     pub fn is_connected(&self) -> bool {
@@ -253,55 +270,38 @@ impl ClientHandler for TestClientHandler {
     }
 
     async fn on_inbound(&self, ctx: &rsms_connector::client::ClientContext<'_>, frame: &Frame) -> Result<()> {
-        let pdu = frame.data_as_slice();
-        if pdu.len() < 12 {
-            return Ok(());
-        }
-
-        let header = match rsms_codec_smgp::PduHeader::decode(&mut std::io::Cursor::new(pdu)) {
-            Ok(h) => h,
+        let unified = match SmgpAdapter.decode(frame) {
+            Ok(m) => m,
             Err(_) => return Ok(()),
         };
 
-        let body = &pdu[rsms_codec_smgp::PduHeader::SIZE..];
-
-        match header.command_id {
-            rsms_codec_smgp::CommandId::LoginResp => {
-                let resp = match rsms_codec_smgp::LoginResp::decode(header, &mut std::io::Cursor::new(body)) {
-                    Ok(r) => r,
-                    Err(_) => return Ok(()),
-                };
+        match unified {
+            UnifiedMessage::BindResp(resp) => {
                 *self.login_resp_status.lock().unwrap() = Some(resp.status);
                 if resp.status == 0 {
                     self.connected.store(true, Ordering::Relaxed);
                 }
             }
-            rsms_codec_smgp::CommandId::SubmitResp => {
-                let resp = match rsms_codec_smgp::SubmitResp::decode(header, &mut std::io::Cursor::new(body)) {
-                    Ok(r) => r,
-                    Err(_) => return Ok(()),
-                };
+            UnifiedMessage::SubmitResp(resp) => {
                 *self.submit_resp_status.lock().unwrap() = Some(resp.status);
             }
-            rsms_codec_smgp::CommandId::Deliver => {
+            // is_report=1→Report，is_report=0→Deliver；两者都计入 deliver_count 并回 DeliverResp。
+            UnifiedMessage::Report(_) => {
                 self.deliver_count.fetch_add(1, Ordering::Relaxed);
-                if let Ok(msg) = rsms_codec_smgp::decode_message(pdu) {
-                    if let rsms_codec_smgp::SmgpMessage::Deliver { deliver: d, .. } = msg {
-                        if d.is_report == 1 {
-                            tracing::info!("[客户端] 收到状态报告");
-                        } else {
-                            tracing::info!("[客户端] 收到上行短信");
-                        }
-                    }
-                }
-                let resp = rsms_codec_smgp::DeliverResp { msg_id: rsms_codec_smgp::SmgpMsgId::default(), status: 0 };
-                let resp_pdu: rsms_codec_smgp::Pdu = resp.into();
-                ctx.conn.write_frame(resp_pdu.to_pdu_bytes(header.sequence_id).as_slice()).await?;
+                tracing::info!("[客户端] 收到状态报告");
+                let bytes = SmgpAdapter.encode(&UnifiedMessage::DeliverResp, SmgpAdapter.sequence_of(frame))?;
+                ctx.conn.write_frame(&bytes).await?;
             }
-            rsms_codec_smgp::CommandId::ActiveTestResp => {
+            UnifiedMessage::Deliver(_) => {
+                self.deliver_count.fetch_add(1, Ordering::Relaxed);
+                tracing::info!("[客户端] 收到上行短信");
+                let bytes = SmgpAdapter.encode(&UnifiedMessage::DeliverResp, SmgpAdapter.sequence_of(frame))?;
+                ctx.conn.write_frame(&bytes).await?;
+            }
+            UnifiedMessage::PingResp => {
                 self.active_test_resp_count.fetch_add(1, Ordering::Relaxed);
             }
-            rsms_codec_smgp::CommandId::ExitResp => {
+            UnifiedMessage::UnbindResp => {
                 self.exit_resp_received.store(true, Ordering::Relaxed);
             }
             _ => {}
@@ -381,49 +381,44 @@ fn chrono_lite_timestamp() -> String {
 }
 
 pub fn build_deliver_mo(seq_id: u32, src_term: &str, dest_term: &str, content: &str) -> RawPdu {
-    let mut msg_id_bytes = [0u8; 10];
-    msg_id_bytes[2..].copy_from_slice(&20001u64.to_be_bytes());
-
-    let now = chrono_lite_timestamp();
-
-    let deliver = rsms_codec_smgp::Deliver {
-        msg_id: rsms_codec_smgp::SmgpMsgId::new(msg_id_bytes),
-        is_report: 0,
-        msg_fmt: 15,
-        recv_time: now,
-        src_term_id: src_term.to_string(),
-        dest_term_id: dest_term.to_string(),
-        msg_content: content.as_bytes().to_vec(),
-        reserve: [0u8; 8],
-        optional_params: rsms_codec_smgp::datatypes::tlv::OptionalParameters::new(),
-    };
-
-    let pdu: rsms_codec_smgp::Pdu = deliver.into();
-    pdu.to_pdu_bytes(seq_id)
+    // 下行单条 MO：is_report=0 的 Deliver，原 msg_fmt=15→Encoding::Gbk。
+    // 注：UnifiedDeliver 不携带 recv_time/msg_id 头字段，经 adapter 走 Deliver::new() 默认（语义无关）。
+    let unified = UnifiedMessage::Deliver(UnifiedDeliver {
+        src: Address::plain(src_term),
+        dest: Address::plain(dest_term),
+        content: content.as_bytes().to_vec(),
+        encoding: Encoding::Gbk,
+        concat: None,
+        extra: ProtocolExtra::None,
+        tlvs: vec![],
+    });
+    let bytes = SmgpAdapter.encode(&unified, Sequence::Plain(seq_id)).expect("encode MO");
+    RawPdu::from(bytes)
 }
 
 pub fn build_deliver_report(seq_id: u32, dest_term: &str) -> RawPdu {
-    let mut msg_id_bytes = [0u8; 10];
-    msg_id_bytes[2..].copy_from_slice(&10001u64.to_be_bytes());
-
     let now = chrono_lite_timestamp();
-    let report_content = format!("id:{} sub:001 dlvrd:001 submit date:{} done date:{} stat:DELIVRD err:000 text:Hello", 
-        10001, &now, &now);
-
-    let deliver = rsms_codec_smgp::Deliver {
-        msg_id: rsms_codec_smgp::SmgpMsgId::new(msg_id_bytes),
-        is_report: 1,
-        msg_fmt: 15,
-        recv_time: now,
-        src_term_id: "13800138000".to_string(),
-        dest_term_id: dest_term.to_string(),
-        msg_content: report_content.into_bytes(),
-        reserve: [0u8; 8],
-        optional_params: rsms_codec_smgp::datatypes::tlv::OptionalParameters::new(),
+    // 报告正文经 SmgpReport 序列化（SMGP 报告 payload 格式化助手，非裸 PDU 消息类型）。
+    let report = SmgpReport {
+        msg_id: rsms_codec_smgp::SmgpMsgId::from_u64(10001).bytes,
+        sub: "001".to_string(),
+        dlvrd: "001".to_string(),
+        submit_time: now.clone(),
+        done_time: now,
+        stat: "DELIVRD".to_string(),
+        err: "000".to_string(),
+        txt: "Hello".to_string(),
     };
-
-    let pdu: rsms_codec_smgp::Pdu = deliver.into();
-    pdu.to_pdu_bytes(seq_id)
+    // is_report=1 经 UnifiedMessage::Report → adapter 编码；msg_id 头取默认全零（匹配靠正文 id:）。
+    let unified = UnifiedMessage::Report(UnifiedReport {
+        msg_id: MessageId::Binary(vec![0u8; 10]),
+        status: DeliveryStatus::Delivered,
+        src: Address::plain("13800138000"),
+        dest: Address::plain(dest_term),
+        raw: report.to_bytes(),
+    });
+    let bytes = SmgpAdapter.encode(&unified, Sequence::Plain(seq_id)).expect("encode report");
+    RawPdu::from(bytes)
 }
 
 async fn get_conn_from_pool(pool: &Arc<rsms_connector::ConnectionPool>) -> Option<Arc<rsms_connector::Connection>> {

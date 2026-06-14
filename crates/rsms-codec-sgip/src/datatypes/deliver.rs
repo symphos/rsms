@@ -122,12 +122,14 @@ pub struct DeliverResp {
 }
 
 impl DeliverResp {
-    pub const BODY_SIZE: usize = 4;
+    // SGIP 1.2 Deliver_Resp body = Result(1B) + Reserve(8B) = 9B（同 Submit_Resp）。
+    pub const BODY_SIZE: usize = 1 + 8;
 }
 
 impl Encodable for DeliverResp {
     fn encode(&self, buf: &mut BytesMut) -> Result<(), CodecError> {
-        buf.put_u32(self.result);
+        buf.put_u8(self.result as u8);
+        buf.put_slice(&[0u8; 8]);
         Ok(())
     }
 
@@ -141,7 +143,9 @@ impl Decodable for DeliverResp {
         if buf.remaining() < Self::BODY_SIZE {
             return Err(CodecError::Incomplete);
         }
-        let result = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
+        let result = buf.try_get_u8().map_err(|_| CodecError::Incomplete)? as u32;
+        let mut reserve = [0u8; 8];
+        buf.try_copy_to_slice(&mut reserve).map_err(|_| CodecError::Incomplete)?;
         Ok(DeliverResp { result })
     }
 
@@ -220,12 +224,14 @@ pub struct ReportResp {
 }
 
 impl ReportResp {
-    pub const BODY_SIZE: usize = 4;
+    // SGIP 1.2 Report_Resp body = Result(1B) + Reserve(8B) = 9B（同 Submit_Resp）。
+    pub const BODY_SIZE: usize = 1 + 8;
 }
 
 impl Encodable for ReportResp {
     fn encode(&self, buf: &mut BytesMut) -> Result<(), CodecError> {
-        buf.put_u32(self.result);
+        buf.put_u8(self.result as u8);
+        buf.put_slice(&[0u8; 8]);
         Ok(())
     }
 
@@ -239,7 +245,9 @@ impl Decodable for ReportResp {
         if buf.remaining() < Self::BODY_SIZE {
             return Err(CodecError::Incomplete);
         }
-        let result = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
+        let result = buf.try_get_u8().map_err(|_| CodecError::Incomplete)? as u32;
+        let mut reserve = [0u8; 8];
+        buf.try_copy_to_slice(&mut reserve).map_err(|_| CodecError::Incomplete)?;
         Ok(ReportResp { result })
     }
 

@@ -6,8 +6,11 @@ use rsms_connector::{
 };
 use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler, ClientConnection};
 use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Frame, Result};
-use rsms_codec_sgip::{
-    Bind, Submit, CommandId, Encodable,
+// 窄腰统一模型：收发一律走 SgipAdapter + UnifiedMessage，不再手构裸 codec / 手剥头部字节。
+use rsms_codec_sgip::adapter::SgipAdapter;
+use rsms_model::{
+    Address, Encoding, ProtocolAdapter, ProtocolExtra, Sequence, SgipExtra, UnifiedBind,
+    UnifiedMessage, UnifiedSubmit,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -81,7 +84,7 @@ impl TestClientHandler {
 impl ClientHandler for TestClientHandler {
     fn name(&self) -> &'static str { "test-client" }
     async fn on_inbound(&self, _ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        if frame.command_id == CommandId::SubmitResp as u32 {
+        if let Ok(UnifiedMessage::SubmitResp(_)) = SgipAdapter.decode(frame) {
             self.submit_resp_count.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
@@ -95,54 +98,41 @@ fn next_seq() -> u32 {
 }
 
 fn build_bind_pdu() -> RawPdu {
-    let bind = Bind {
-        login_type: 1,
-        login_name: TEST_ACCOUNT.to_string(),
-        login_password: TEST_PASSWORD.to_string(),
-        reserve: [0u8; 8],
-    };
-    bind.to_pdu_bytes(SGIP_NODE_ID, SGIP_TIMESTAMP, next_seq()).into()
+    // 明文认证：authenticator 装口令字节；version 承载 login_type=1。
+    let bind = UnifiedMessage::Bind(UnifiedBind {
+        client_id: TEST_ACCOUNT.to_string(),
+        authenticator: TEST_PASSWORD.as_bytes().to_vec(),
+        timestamp: 0,
+        version: 1,
+        system_type: None,
+        mode: rsms_model::BindMode::default(),
+        login_mode: None,
+    });
+    let seq = Sequence::Sgip { node_id: SGIP_NODE_ID, timestamp: SGIP_TIMESTAMP, number: next_seq() };
+    RawPdu::from(SgipAdapter.encode(&bind, seq).expect("encode bind"))
 }
 
 fn build_submit_pdu(sp_number: &str, dest_number: &str, content: &str, seq_num: u32) -> Vec<u8> {
-    let mut submit = Submit::new();
-    submit.sp_number = sp_number.to_string();
-    submit.charge_number = sp_number.to_string();
-    submit.user_count = 1;
-    submit.user_numbers = vec![dest_number.to_string()];
-    submit.corp_id = "".to_string();
-    submit.service_type = "SMS".to_string();
-    submit.fee_type = 2;
-    submit.fee_value = "000000".to_string();
-    submit.given_value = "000000".to_string();
-    submit.agent_flag = 0;
-    submit.morelate_to_mt_flag = 0;
-    submit.priority = 0;
-    submit.expire_time = "".to_string();
-    submit.schedule_time = "".to_string();
-    submit.report_flag = 1;
-    submit.tppid = 0;
-    submit.tpudhi = 0;
-    submit.msg_fmt = 15;
-    submit.message_type = 0;
-    submit.message_content = content.as_bytes().to_vec();
-    submit.reserve = [0u8; 8];
-
-    let body_bytes = {
-        let mut buf = bytes::BytesMut::new();
-        submit.encode(&mut buf).unwrap();
-        buf.to_vec()
-    };
-
-    let total_len = (20 + body_bytes.len()) as u32;
-    let mut pdu = Vec::new();
-    pdu.extend_from_slice(&total_len.to_be_bytes());
-    pdu.extend_from_slice(&(CommandId::Submit as u32).to_be_bytes());
-    pdu.extend_from_slice(&SGIP_NODE_ID.to_be_bytes());
-    pdu.extend_from_slice(&SGIP_TIMESTAMP.to_be_bytes());
-    pdu.extend_from_slice(&seq_num.to_be_bytes());
-    pdu.extend(body_bytes);
-    pdu
+    // 统一模型构造 Submit；SGIP 方言字段经 SgipExtra 传递；复合序列 number=seq_num。
+    let submit = UnifiedMessage::Submit(UnifiedSubmit {
+        src: Address::plain(sp_number),
+        dests: vec![Address::plain(dest_number)],
+        content: content.as_bytes().to_vec(),
+        encoding: Encoding::Gbk, // msg_fmt=15(GBK)
+        want_report: true,       // report_flag=1
+        concat: None,
+        extra: ProtocolExtra::Sgip(SgipExtra {
+            charge_number: sp_number.to_string(),
+            service_type: "SMS".to_string(),
+            fee_type: 2,
+            fee_value: "000000".to_string(),
+            given_value: "000000".to_string(),
+            ..Default::default()
+        }),
+        tlvs: vec![],
+    });
+    let seq = Sequence::Sgip { node_id: SGIP_NODE_ID, timestamp: SGIP_TIMESTAMP, number: seq_num };
+    SgipAdapter.encode(&submit, seq).expect("encode submit")
 }
 
 async fn start_server(

@@ -90,12 +90,15 @@ impl Decodable for BindReceiver {
 impl Encodable for BindReceiverResp {
     fn encode(&self, buf: &mut BytesMut) -> Result<(), CodecError> {
         encode_cstring(buf, &self.system_id, MAX_SYSTEM_ID_LENGTH)?;
+        // sc_interface_version 是 SMPP 可选参数 TLV(0x0210, len 1)，不是裸字节（见 bind_transceiver 同修）。
+        buf.put_u16(0x0210);
+        buf.put_u16(1);
         buf.put_u8(self.sc_interface_version);
         Ok(())
     }
 
     fn encoded_size(&self) -> usize {
-        MAX_SYSTEM_ID_LENGTH + 1
+        MAX_SYSTEM_ID_LENGTH + 5
     }
 }
 
@@ -108,7 +111,14 @@ impl Decodable for BindReceiverResp {
             });
         }
         let system_id = decode_cstring(buf, MAX_SYSTEM_ID_LENGTH, "system_id")?;
-        let sc_interface_version = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        // sc_interface_version 作为可选 TLV(0x0210, len 1) 解析；对端可省略，省略则默认 0。
+        let sc_interface_version = if buf.remaining() >= 5 {
+            let _tag = buf.try_get_u16().map_err(|_| CodecError::Incomplete)?;
+            let _len = buf.try_get_u16().map_err(|_| CodecError::Incomplete)?;
+            buf.try_get_u8().map_err(|_| CodecError::Incomplete)?
+        } else {
+            0
+        };
         Ok(Self {
             system_id,
             sc_interface_version,

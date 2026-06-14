@@ -1,5 +1,43 @@
 //! 统一模型的语义类型：编码、投递状态、地址、分片、消息 ID、TLV、协议扩展。
 
+/// 帧序列号（encode 方向用）。多数协议头序列是单个 u32（CMPP/SMGP/SMPP）；
+/// SGIP 的序列是 12 字节复合 `node_id+timestamp+number`，且响应帧必须回显请求序列，
+/// 单个 u32 装不下，故抽象为枚举由各 adapter 自行解释。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sequence {
+    /// CMPP/SMGP/SMPP：头部单字段序列号。
+    Plain(u32),
+    /// SGIP：复合序列（node_id + timestamp(MMddHHmmss) + number）。
+    Sgip { node_id: u32, timestamp: u32, number: u32 },
+}
+
+impl Sequence {
+    /// 取「主序列号」：Plain 即其值；Sgip 取 number 分量。
+    /// 供 CMPP/SMGP/SMPP adapter 从任意 Sequence 退化到 u32 使用。
+    pub fn as_u32(self) -> u32 {
+        match self {
+            Sequence::Plain(n) => n,
+            Sequence::Sgip { number, .. } => number,
+        }
+    }
+}
+
+impl From<u32> for Sequence {
+    fn from(n: u32) -> Self {
+        Sequence::Plain(n)
+    }
+}
+
+/// 认证 bind 模式。SMPP 有收发/只发/只收三态（DUPLEX 端点须 Transceiver）；
+/// CMPP/SMGP/SGIP 为单一 bind 语义，取默认 `Transceiver` 即可（其 encode 忽略此字段）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BindMode {
+    #[default]
+    Transceiver,
+    Transmitter,
+    Receiver,
+}
+
 /// 短信编码语义（协议魔数由各 adapter 翻译，不上浮到此层）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {

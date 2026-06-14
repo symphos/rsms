@@ -1,5 +1,12 @@
 use rsms_core::Result;
-use rsms_codec_cmpp::{Pdu, Connect, Submit, ConnectResp, SubmitResp};
+// 窄腰统一模型：Connect/Submit 构造改走 CmppAdapter.encode(UnifiedMessage::{Bind,Submit})。
+// ConnectResp/SubmitResp 仅作为本桩的返回结构保留（read_*_resp 是纯字节级 wire 读取，见下方注释）。
+use rsms_codec_cmpp::adapter::CmppAdapter;
+use rsms_codec_cmpp::{ConnectResp, SubmitResp};
+use rsms_model::{
+    Address, CmppExtra, Encoding, ProtocolAdapter, ProtocolExtra, Sequence, UnifiedBind,
+    UnifiedMessage, UnifiedSubmit,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -26,53 +33,49 @@ impl TestClient {
     pub async fn send_connect(&mut self, source_addr: &str, password: &str) -> Result<ConnectResp> {
         let seq_id = self.next_seq_id() as u32;
         
-        let connect = Connect {
-            source_addr: source_addr.to_string(),
-            version: 0x30,
-            authenticator_source: compute_authenticator(source_addr, password, seq_id),
+        // 统一 Bind：authenticator 由测试桩 compute_authenticator 算出（非真 MD5，保留桩逻辑），
+        // 放入 UnifiedBind.authenticator；adapter 原样回填，不重算。CMPP 无 system_type/login_mode。
+        let bind = UnifiedMessage::Bind(UnifiedBind {
+            client_id: source_addr.to_string(),
+            authenticator: compute_authenticator(source_addr, password, seq_id).to_vec(),
             timestamp: 0,
-        };
-        
-        let pdu: Pdu = connect.into();
-        let encoded = pdu.to_pdu_bytes(seq_id);
-        
-        self.send_pdu(encoded.as_slice()).await?;
+            version: 0x30,
+            system_type: None,
+            mode: rsms_model::BindMode::default(),
+            login_mode: None,
+        });
+        let encoded = CmppAdapter.encode(&bind, Sequence::Plain(seq_id))?;
+
+        self.send_pdu(&encoded).await?;
         self.read_connect_resp().await
     }
 
     pub async fn send_submit(&mut self, src_id: &str, dest_id: &str, content: &str) -> Result<SubmitResp> {
         let seq_id = self.next_seq_id() as u32;
         
-        let submit = Submit {
-            msg_id: [0u8; 8],
-            pk_total: 1,
-            pk_number: 1,
-            registered_delivery: 1,
-            msg_level: 1,
-            service_id: "SMS".to_string(),
-            fee_user_type: 0,
-            fee_terminal_id: "".to_string(),
-            fee_terminal_type: 0,
-            tppid: 0,
-            tpudhi: 0,
-            msg_fmt: 15,
-            msg_src: "".to_string(),
-            fee_type: "01".to_string(),
-            fee_code: "005".to_string(),
-            valid_time: "".to_string(),
-            at_time: "".to_string(),
-            src_id: src_id.to_string(),
-            dest_usr_tl: 1,
-            dest_terminal_ids: vec![dest_id.to_string()],
-            dest_terminal_type: 0,
-            msg_content: content.as_bytes().to_vec(),
-            link_id: "".to_string(),
-        };
-        
-        let pdu: Pdu = submit.into();
-        let encoded = pdu.to_pdu_bytes(seq_id);
-        
-        self.send_pdu(encoded.as_slice()).await?;
+        // 统一 Submit：want_report=true 对应 registered_delivery=1；encoding=Gbk 对应 msg_fmt=15；
+        // CMPP 方言（pk_total/pk_number/msg_level/service_id/fee_*）落 ProtocolExtra::Cmpp。
+        let submit = UnifiedMessage::Submit(UnifiedSubmit {
+            src: Address::plain(src_id),
+            dests: vec![Address::plain(dest_id)],
+            content: content.as_bytes().to_vec(),
+            encoding: Encoding::Gbk,
+            want_report: true,
+            concat: None,
+            extra: ProtocolExtra::Cmpp(CmppExtra {
+                pk_total: 1,
+                pk_number: 1,
+                msg_level: 1,
+                service_id: "SMS".to_string(),
+                fee_type: "01".to_string(),
+                fee_code: "005".to_string(),
+                ..Default::default()
+            }),
+            tlvs: vec![],
+        });
+        let encoded = CmppAdapter.encode(&submit, Sequence::Plain(seq_id))?;
+
+        self.send_pdu(&encoded).await?;
         self.read_submit_resp().await
     }
 

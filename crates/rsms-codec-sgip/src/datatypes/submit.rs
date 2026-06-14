@@ -267,12 +267,15 @@ pub struct SubmitResp {
 }
 
 impl SubmitResp {
-    pub const BODY_SIZE: usize = 4;
+    // SGIP 1.2 Submit_Resp body = Result(1B) + Reserve(8B) = 9B。
+    // 旧版误用 Result=u32(4B) 且无 Reserve，导致第三方(cmos)解码越界（读 1B result 后只剩 3B 无法读 8B reserve）。
+    pub const BODY_SIZE: usize = 1 + 8;
 }
 
 impl Encodable for SubmitResp {
     fn encode(&self, buf: &mut BytesMut) -> Result<(), CodecError> {
-        buf.put_u32(self.result);
+        buf.put_u8(self.result as u8); // Result 1 字节（SGIP 结果码 0=成功）
+        buf.put_slice(&[0u8; 8]); // Reserve 8 字节
         Ok(())
     }
 
@@ -286,7 +289,9 @@ impl Decodable for SubmitResp {
         if buf.remaining() < Self::BODY_SIZE {
             return Err(CodecError::Incomplete);
         }
-        let result = buf.try_get_u32().map_err(|_| CodecError::Incomplete)?;
+        let result = buf.try_get_u8().map_err(|_| CodecError::Incomplete)? as u32;
+        let mut reserve = [0u8; 8];
+        buf.try_copy_to_slice(&mut reserve).map_err(|_| CodecError::Incomplete)?;
         Ok(SubmitResp { result })
     }
 

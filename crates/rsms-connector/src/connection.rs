@@ -176,6 +176,16 @@ impl Connection {
         ctx.mark_authenticated(account).unwrap_or_default();
     }
 
+    /// 把会话状态机推进到 Connecting（服务端连接 accept 后调用）。
+    /// 状态机要求 Disconnected→Connecting→Authenticated；服务端此前从不调本方法，
+    /// 导致认证时 transition_to_authenticated 因缺前驱态失败（错误被吞）、session_state 永不到 Logined，
+    /// 进而 fetch_available_connection（要求 Logined）找不到连接、**服务端 MessageSource 的 MO/回执从不下发**。
+    /// 联调（cmos 客户端连 rsms server）实测此 bug。
+    pub async fn mark_connected(&self) {
+        let ctx = self.ctx.lock().await;
+        let _ = ctx.mark_connected();
+    }
+
     pub async fn touch(&self) {
         let mut last = self.last_active.lock().await;
         *last = Instant::now();
@@ -545,7 +555,7 @@ fn encode_close_packet(protocol: Protocol) -> Option<Vec<u8>> {
 fn close_packet(protocol: Protocol) -> Option<Vec<u8>> {
     use rsms_model::ProtocolAdapter as _;
     crate::adapter_registry::adapter_for(protocol)
-        .encode(&rsms_model::UnifiedMessage::Unbind, 0)
+        .encode(&rsms_model::UnifiedMessage::Unbind, rsms_model::Sequence::Plain(0))
         .ok()
         .or_else(|| encode_close_packet(protocol))
 }
@@ -554,13 +564,13 @@ fn close_packet(protocol: Protocol) -> Option<Vec<u8>> {
 mod converge_close_gating {
     use super::*;
     use crate::adapter_registry::adapter_for;
-    use rsms_model::{ProtocolAdapter as _, UnifiedMessage};
+    use rsms_model::{ProtocolAdapter as _, Sequence, UnifiedMessage};
 
     /// 锁定全协议收敛：close_packet 对四协议均产出 adapter 字节。
     #[test]
     fn close_packet_uses_adapter_for_all_protocols() {
         for p in [Protocol::Cmpp, Protocol::Smgp, Protocol::Sgip, Protocol::Smpp] {
-            let via = adapter_for(p).encode(&UnifiedMessage::Unbind, 0).ok();
+            let via = adapter_for(p).encode(&UnifiedMessage::Unbind, Sequence::Plain(0)).ok();
             assert_eq!(close_packet(p), via, "{p:?} close 应走 adapter 字节");
         }
     }

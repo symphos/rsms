@@ -3,8 +3,13 @@ use rsms_connector::client::{ClientContext, ClientHandler};
 use rsms_connector::transaction::{MessageCallback, SubmitInfo, ReportInfo, MoInfo};
 use rsms_connector::{ClientBuilder, CmppDecoder, AccountConnections, AccountConfig};
 use rsms_core::{ConnectionInfo, EndpointConfig, Protocol, Frame, Result};
-use rsms_codec_cmpp::{Pdu, Connect, CommandId};
+// 窄腰统一模型：编解码经 CmppAdapter；compute_connect_auth 是 MD5 鉴权工具，保留。
+use rsms_codec_cmpp::adapter::CmppAdapter;
 use rsms_codec_cmpp::auth::compute_connect_auth;
+use rsms_model::{
+    Address, MessageId, ProtocolAdapter, ProtocolExtra, Sequence, UnifiedBind, UnifiedMessage,
+    UnifiedSubmit, UnifiedSubmitResp,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,24 +53,30 @@ impl ClientHandler for TransactionTestHandler {
     }
 
     async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        let pdu = frame.data_as_slice();
-        let cmd_id = frame.command_id;
+        // 统一模型分支：BindResp(status=0) 置 connected；SubmitResp 取 msg_id/status 驱动事务匹配。
+        let unified = match CmppAdapter.decode(frame) {
+            Ok(m) => m,
+            Err(_) => return Ok(()),
+        };
 
-        if cmd_id == CommandId::ConnectResp as u32 && pdu.len() >= 13 && pdu[12] == 0 {
-            self.connected.store(true, Ordering::Relaxed);
-        } else if cmd_id == CommandId::SubmitResp as u32 && pdu.len() >= 24 {
-            let result = u32::from_be_bytes([pdu[20], pdu[21], pdu[22], pdu[23]]);
-            let msg_id = format!(
-                "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                pdu[12], pdu[13], pdu[14], pdu[15], pdu[16], pdu[17], pdu[18], pdu[19]
-            );
-
-            if let Some(tm) = ctx.conn.transaction_manager().await {
-                let pending = self.pending_seq.lock().await.take();
-                if let Some(pending_seq) = pending {
-                    tm.on_submit_resp(pending_seq, Some(msg_id), result).await;
+        match unified {
+            UnifiedMessage::BindResp(resp) if resp.status == 0 => {
+                self.connected.store(true, Ordering::Relaxed);
+            }
+            UnifiedMessage::SubmitResp(resp) => {
+                // 事务匹配仍用 8 字节二进制 MsgId 的 hex 串（与原断言一致）。
+                let msg_id = match &resp.msg_id {
+                    MessageId::Binary(b) => b.iter().map(|x| format!("{:02x}", x)).collect(),
+                    MessageId::Text(t) => t.clone(),
+                };
+                if let Some(tm) = ctx.conn.transaction_manager().await {
+                    let pending = self.pending_seq.lock().await.take();
+                    if let Some(pending_seq) = pending {
+                        tm.on_submit_resp(pending_seq, Some(msg_id), resp.status).await;
+                    }
                 }
             }
+            _ => {}
         }
 
         Ok(())
@@ -143,28 +154,15 @@ impl BusinessHandler for TestBusinessHandler {
     }
 
     async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        if let Ok(msg) = rsms_codec_cmpp::decode_message(frame.data_as_slice()) {
-            match msg {
-                rsms_codec_cmpp::CmppMessage::SubmitV30 { submit: _s, .. } => {
-                    let result = if ctx.conn.authenticated_account().await.is_some() { 0 } else { 3 };
-                    let resp = rsms_codec_cmpp::SubmitResp {
-                        msg_id: [0u8; 8],
-                        result,
-                    };
-                    let resp_pdu: Pdu = resp.into();
-                    ctx.conn.write_frame(resp_pdu.to_pdu_bytes(frame.sequence_id).as_slice()).await?;
-                }
-                rsms_codec_cmpp::CmppMessage::SubmitV20 { submit: _s, .. } => {
-                    let result = if ctx.conn.authenticated_account().await.is_some() { 0 } else { 3 };
-                    let resp = rsms_codec_cmpp::SubmitResp {
-                        msg_id: [0u8; 8],
-                        result,
-                    };
-                    let resp_pdu: Pdu = resp.into();
-                    ctx.conn.write_frame(resp_pdu.to_pdu_bytes(frame.sequence_id).as_slice()).await?;
-                }
-                _ => {}
-            }
+        // 统一模型：收到 Submit 即回 SubmitResp（已认证 status=0，否则 3）。msg_id 置全 0（与原一致）。
+        if let Ok(UnifiedMessage::Submit(_)) = CmppAdapter.decode(frame) {
+            let status = if ctx.conn.authenticated_account().await.is_some() { 0 } else { 3 };
+            let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                msg_id: MessageId::Binary(vec![0u8; 8]),
+                status,
+            });
+            let resp_bytes = CmppAdapter.encode(&resp, CmppAdapter.sequence_of(frame))?;
+            ctx.conn.write_frame(&resp_bytes).await?;
         }
         Ok(())
     }
@@ -268,15 +266,18 @@ async fn test_pending_requests_fail_immediately_on_disconnect() {
         .unwrap();
 
     // 发一个请求，server 永不回复 → 进入 pending_responses 等待。
-    let connect = Connect {
-        source_addr: TEST_ACCOUNT.to_string(),
-        authenticator_source: [0u8; 16],
-        version: 0x30,
+    let connect = UnifiedMessage::Bind(UnifiedBind {
+        client_id: TEST_ACCOUNT.to_string(),
+        authenticator: vec![0u8; 16],
         timestamp: 0,
-    };
-    let connect_pdu: Pdu = connect.into();
+        version: 0x30,
+        system_type: None,
+        mode: rsms_model::BindMode::default(),
+        login_mode: None,
+    });
+    let connect_bytes = CmppAdapter.encode(&connect, Sequence::Plain(1)).unwrap();
     let fut = conn
-        .send_request(connect_pdu.to_pdu_bytes(1))
+        .send_request(rsms_core::RawPdu::from_vec(connect_bytes))
         .await
         .expect("send_request 应成功入队");
 
@@ -323,15 +324,17 @@ async fn test_transaction_manager_integration() {
 
     let timestamp = 0u32;
     let authenticator = compute_connect_auth(TEST_ACCOUNT, TEST_PASSWORD, timestamp);
-    let connect = Connect {
-        source_addr: TEST_ACCOUNT.to_string(),
-        authenticator_source: authenticator,
-        version: 0x30,
+    let connect = UnifiedMessage::Bind(UnifiedBind {
+        client_id: TEST_ACCOUNT.to_string(),
+        authenticator: authenticator.to_vec(),
         timestamp,
-    };
-    let connect_pdu: Pdu = connect.into();
-    let connect_bytes = connect_pdu.to_pdu_bytes(handler.next_seq());
-    conn.send_request(connect_bytes).await.unwrap();
+        version: 0x30,
+        system_type: None,
+        mode: rsms_model::BindMode::default(),
+        login_mode: None,
+    });
+    let connect_bytes = CmppAdapter.encode(&connect, Sequence::Plain(handler.next_seq())).unwrap();
+    conn.send_request(rsms_core::RawPdu::from_vec(connect_bytes)).await.unwrap();
 
     for _ in 0..20 {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -344,19 +347,23 @@ async fn test_transaction_manager_integration() {
     let seq = handler.next_seq();
     *handler.pending_seq.lock().await = Some(seq);
 
-    let mut submit = rsms_codec_cmpp::datatypes::Submit::new();
-    submit.src_id = TEST_ACCOUNT.to_string();
-    submit.dest_usr_tl = 1;
-    submit.dest_terminal_ids = vec!["13800138000".to_string()];
-    submit.msg_content = b"Test Transaction".to_vec();
-    submit.registered_delivery = 1;
-    let submit_pdu: Pdu = submit.into();
-    let submit_bytes = submit_pdu.to_pdu_bytes(seq);
-    
+    // 统一 Submit（want_report=true 对应 registered_delivery=1）。
+    let submit = UnifiedMessage::Submit(UnifiedSubmit {
+        src: Address::plain(TEST_ACCOUNT),
+        dests: vec![Address::plain("13800138000")],
+        content: b"Test Transaction".to_vec(),
+        encoding: rsms_model::Encoding::Ascii,
+        want_report: true,
+        concat: None,
+        extra: ProtocolExtra::Cmpp(Default::default()),
+        tlvs: vec![],
+    });
+    let submit_bytes = CmppAdapter.encode(&submit, Sequence::Plain(seq)).unwrap();
+
     let info = SubmitInfo::new(seq, "13800138000".to_string(), TEST_ACCOUNT.to_string(), b"Test Transaction".to_vec(), "CMPP");
     tm.add_submit_transaction(info).await;
-    
-    conn.send_request(submit_bytes).await.unwrap();
+
+    conn.send_request(rsms_core::RawPdu::from_vec(submit_bytes)).await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -399,15 +406,17 @@ async fn test_transaction_manager_multiple_submits() {
 
     let timestamp = 0u32;
     let authenticator = compute_connect_auth(TEST_ACCOUNT, TEST_PASSWORD, timestamp);
-    let connect = Connect {
-        source_addr: TEST_ACCOUNT.to_string(),
-        authenticator_source: authenticator,
-        version: 0x30,
+    let connect = UnifiedMessage::Bind(UnifiedBind {
+        client_id: TEST_ACCOUNT.to_string(),
+        authenticator: authenticator.to_vec(),
         timestamp,
-    };
-    let connect_pdu: Pdu = connect.into();
-    let connect_bytes = connect_pdu.to_pdu_bytes(handler.next_seq());
-    conn.send_request(connect_bytes).await.unwrap();
+        version: 0x30,
+        system_type: None,
+        mode: rsms_model::BindMode::default(),
+        login_mode: None,
+    });
+    let connect_bytes = CmppAdapter.encode(&connect, Sequence::Plain(handler.next_seq())).unwrap();
+    conn.send_request(rsms_core::RawPdu::from_vec(connect_bytes)).await.unwrap();
 
     for _ in 0..20 {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -421,19 +430,22 @@ async fn test_transaction_manager_multiple_submits() {
         let seq = handler.next_seq();
         *handler.pending_seq.lock().await = Some(seq);
 
-        let mut submit = rsms_codec_cmpp::datatypes::Submit::new();
-        submit.src_id = TEST_ACCOUNT.to_string();
-        submit.dest_usr_tl = 1;
-        submit.dest_terminal_ids = vec![format!("138{:08}", i)];
-        submit.msg_content = format!("Test {}", i).into_bytes();
-        submit.registered_delivery = 1;
-        let submit_pdu: Pdu = submit.into();
-        let submit_bytes = submit_pdu.to_pdu_bytes(seq);
-        
+        let submit = UnifiedMessage::Submit(UnifiedSubmit {
+            src: Address::plain(TEST_ACCOUNT),
+            dests: vec![Address::plain(format!("138{:08}", i))],
+            content: format!("Test {}", i).into_bytes(),
+            encoding: rsms_model::Encoding::Ascii,
+            want_report: true,
+            concat: None,
+            extra: ProtocolExtra::Cmpp(Default::default()),
+            tlvs: vec![],
+        });
+        let submit_bytes = CmppAdapter.encode(&submit, Sequence::Plain(seq)).unwrap();
+
         let info = SubmitInfo::new(seq, format!("138{:08}", i), TEST_ACCOUNT.to_string(), format!("Test {}", i).into_bytes(), "CMPP");
         tm.add_submit_transaction(info).await;
-        
-        conn.send_request(submit_bytes).await.unwrap();
+
+        conn.send_request(rsms_core::RawPdu::from_vec(submit_bytes)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 

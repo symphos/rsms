@@ -772,6 +772,18 @@ async fn run_client_read_loop(
                 );
             }
             
+            // 影子比对（客户端收包方向）：unified-shadow feature 开启时，对每帧经 registry
+            // 做统一模型解码并打日志。只观测、不接管，错误隔离不影响旧路径。
+            #[cfg(feature = "unified-shadow")]
+            {
+                use rsms_model::ProtocolAdapter as _;
+                let protocol = conn.endpoint.protocol;
+                match crate::adapter_registry::adapter_for(protocol).decode(&frame) {
+                    Ok(unified) => tracing::debug!(conn_id = conn.id, proto = protocol.as_str(), cmd_id = frame.command_id, ?unified, "shadow decode ok"),
+                    Err(e) => tracing::warn!(conn_id = conn.id, proto = protocol.as_str(), cmd_id = frame.command_id, "shadow decode err: {e}"),
+                }
+            }
+
             if let Err(e) = client_handler.on_inbound(&ctx, &frame).await {
                 error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "client handler error: {}", e);
             }
@@ -887,13 +899,13 @@ async fn send_keepalive_packet(conn: &Arc<ClientConnection>, protocol: Protocol)
     // SGIP 无专用心跳（用 Trace）、adapter 无 Ping，保留旧实现。
     let pdu = match protocol {
         Protocol::Cmpp => crate::adapter_registry::adapter_for(protocol)
-            .encode(&rsms_model::UnifiedMessage::Ping, 1)
+            .encode(&rsms_model::UnifiedMessage::Ping, rsms_model::Sequence::Plain(1))
             .unwrap_or_else(|_| build_cmpp_active_test_pdu()),
         Protocol::Smpp => crate::adapter_registry::adapter_for(protocol)
-            .encode(&rsms_model::UnifiedMessage::Ping, 1)
+            .encode(&rsms_model::UnifiedMessage::Ping, rsms_model::Sequence::Plain(1))
             .unwrap_or_else(|_| build_smpp_enquire_link_pdu()),
         Protocol::Smgp => crate::adapter_registry::adapter_for(protocol)
-            .encode(&rsms_model::UnifiedMessage::Ping, 1)
+            .encode(&rsms_model::UnifiedMessage::Ping, rsms_model::Sequence::Plain(1))
             .unwrap_or_else(|_| build_smgp_active_test_pdu()),
         Protocol::Sgip => build_sgip_keepalive_pdu(),
     };
@@ -961,18 +973,18 @@ mod converge_keepalive_gating {
     use super::*;
     use crate::adapter_registry::adapter_for;
     use rsms_core::Protocol;
-    use rsms_model::{ProtocolAdapter as _, UnifiedMessage};
+    use rsms_model::{ProtocolAdapter as _, Sequence, UnifiedMessage};
 
     /// 锁定收敛：CMPP/SMPP 的 adapter Ping(seq=1) 仍与旧构造器字节一致。
     #[test]
     fn converged_keepalive_arms_byte_identical() {
         assert_eq!(
-            adapter_for(Protocol::Cmpp).encode(&UnifiedMessage::Ping, 1).ok(),
+            adapter_for(Protocol::Cmpp).encode(&UnifiedMessage::Ping, Sequence::Plain(1)).ok(),
             Some(build_cmpp_active_test_pdu()),
             "CMPP keepalive 字节一致"
         );
         assert_eq!(
-            adapter_for(Protocol::Smpp).encode(&UnifiedMessage::Ping, 1).ok(),
+            adapter_for(Protocol::Smpp).encode(&UnifiedMessage::Ping, Sequence::Plain(1)).ok(),
             Some(build_smpp_enquire_link_pdu()),
             "SMPP keepalive 字节一致"
         );
@@ -981,11 +993,11 @@ mod converge_keepalive_gating {
     /// 记录修复：SMGP 心跳现为合规 12B（adapter，ActiveTest body 空），不再是旧构造器的 13B；SGIP 无 Ping。
     #[test]
     fn smgp_keepalive_fixed_sgip_no_ping() {
-        let smgp = adapter_for(Protocol::Smgp).encode(&UnifiedMessage::Ping, 1).expect("smgp ping");
+        let smgp = adapter_for(Protocol::Smgp).encode(&UnifiedMessage::Ping, Sequence::Plain(1)).expect("smgp ping");
         assert_eq!(smgp.len(), 12, "SMGP 心跳应为合规 12B");
         assert_ne!(smgp, build_smgp_active_test_pdu(), "应脱离旧 13B 构造器");
         assert!(
-            adapter_for(Protocol::Sgip).encode(&UnifiedMessage::Ping, 1).is_err(),
+            adapter_for(Protocol::Sgip).encode(&UnifiedMessage::Ping, Sequence::Plain(1)).is_err(),
             "SGIP 无心跳，adapter Ping 应报错"
         );
     }

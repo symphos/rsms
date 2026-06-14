@@ -6,8 +6,11 @@ use rsms_connector::{
 };
 use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler, ClientConnection};
 use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Frame, Result};
-use rsms_codec_smpp::{
-    Pdu, CommandId, BindTransmitter, SubmitSm,
+// 窄腰统一模型：构造/解码全程走 SmppAdapter，不再裸 codec。
+use rsms_codec_smpp::adapter::SmppAdapter;
+use rsms_model::{
+    Address, BindMode, Encoding, ProtocolAdapter, ProtocolExtra, Sequence, SmppExtra, UnifiedBind,
+    UnifiedMessage, UnifiedSubmit,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -79,31 +82,45 @@ impl TestClientHandler {
 impl ClientHandler for TestClientHandler {
     fn name(&self) -> &'static str { "test-client" }
     async fn on_inbound(&self, _ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        if frame.command_id == CommandId::SUBMIT_SM_RESP as u32 {
+        // 消息类型经 SmppAdapter 识别，只统计 SubmitResp 数量。
+        if let Ok(UnifiedMessage::SubmitResp(_)) = SmppAdapter.decode(frame) {
             self.submit_resp_count.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
     }
 }
 
+/// BindTransmitter（统一模型）：SMPP 明文鉴权，口令明文字节进 authenticator。
 fn build_bind_pdu(system_id: &str, password: &str) -> RawPdu {
-    let bind = BindTransmitter::new(system_id, password, "CMT", 0x34);
-    let pdu: Pdu = bind.into();
-    pdu.to_pdu_bytes(1)
+    let bind = UnifiedMessage::Bind(UnifiedBind {
+        client_id: system_id.to_string(),
+        authenticator: password.as_bytes().to_vec(),
+        timestamp: 0,
+        version: 0x34,
+        system_type: Some("CMT".to_string()),
+        mode: BindMode::Transmitter,
+        login_mode: None,
+    });
+    RawPdu::from(SmppAdapter.encode(&bind, Sequence::Plain(1)).expect("encode bind"))
 }
 
+/// SubmitSm（统一模型）：registered_delivery=1 落 SmppExtra；data_coding=0x03→Encoding::Other(0x03)。
 fn build_submit_sm_pdu(src: &str, dst: &str, content: &str, seq: u32) -> RawPdu {
-    let mut submit = SubmitSm::new();
-    submit.source_addr = src.to_string();
-    submit.dest_addr_ton = 1;
-    submit.dest_addr_npi = 1;
-    submit.destination_addr = dst.to_string();
-    submit.esm_class = 0;
-    submit.registered_delivery = 1;
-    submit.data_coding = 0x03;
-    submit.short_message = content.as_bytes().to_vec();
-    let pdu: Pdu = submit.into();
-    pdu.to_pdu_bytes(seq)
+    let submit = UnifiedMessage::Submit(UnifiedSubmit {
+        src: Address::plain(src),
+        dests: vec![Address { number: dst.to_string(), ton: Some(1), npi: Some(1) }],
+        content: content.as_bytes().to_vec(),
+        encoding: Encoding::Other(0x03),
+        want_report: true,
+        concat: None,
+        extra: ProtocolExtra::Smpp(SmppExtra {
+            esm_class: 0,
+            registered_delivery: 1,
+            ..Default::default()
+        }),
+        tlvs: vec![],
+    });
+    RawPdu::from(SmppAdapter.encode(&submit, Sequence::Plain(seq)).expect("encode submit"))
 }
 
 async fn start_server(

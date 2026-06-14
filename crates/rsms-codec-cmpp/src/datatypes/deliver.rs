@@ -190,10 +190,13 @@ impl Decodable for DeliverResp {
     }
 }
 
-/// CMPP 状态报告（从 Deliver 的 msg_content 解析）
+/// CMPP 状态报告（从 Deliver 的 msg_content 二进制解析）
+///
+/// CMPP 状态报告是**固定二进制结构**（非文本 key:value）：
+/// Msg_Id(8, 二进制) + Stat(7) + Submit_time(10) + Done_time(10) + Dest_terminal_Id(21) + SMSC_sequence(4, 二进制)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CmppReport {
-    pub msg_id: String,
+    pub msg_id: [u8; 8],
     pub stat: String,
     pub submit_time: String,
     pub done_time: String,
@@ -202,34 +205,40 @@ pub struct CmppReport {
 }
 
 impl CmppReport {
-    pub fn parse(report_str: &str) -> Option<Self> {
-        let parts: Vec<&str> = report_str.split_whitespace().collect();
-        if parts.len() < 6 {
+    /// 解析 CMPP 状态报告（Deliver.msg_content 的原始字节）。
+    ///
+    /// 旧实现把整段当文本 `MsgId:.. Stat:..` 解析，与真实 CMPP 网关（如 lihuanghe/SMSGate）
+    /// 的定长二进制报告不兼容——Msg_Id 是 8 字节二进制（含非 UTF-8 字节），整段 from_utf8 即失败。
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        // 至少需到 Done_time（8+7+10+10=35）
+        if data.len() < 35 {
             return None;
         }
+        let mut msg_id = [0u8; 8];
+        msg_id.copy_from_slice(&data[0..8]);
 
-        let mut msg_id = String::new();
-        let mut stat = String::new();
-        let mut submit_time = String::new();
-        let mut done_time = String::new();
-        let mut dest_terminal_id = String::new();
-        let mut smsc_sequence = 0u32;
+        let take = |slice: &[u8]| {
+            String::from_utf8_lossy(slice)
+                .trim_end_matches('\0')
+                .trim()
+                .to_string()
+        };
+        let stat = take(&data[8..15]);
+        let submit_time = take(&data[15..25]);
+        let done_time = take(&data[25..35]);
+        // Dest_terminal_Id 21 字节（CMPP3.0），SMSC_sequence 4 字节；长度不足时尽力取。
+        let dest_terminal_id = if data.len() >= 56 {
+            take(&data[35..56])
+        } else {
+            take(&data[35..])
+        };
+        let smsc_sequence = if data.len() >= 60 {
+            u32::from_be_bytes([data[56], data[57], data[58], data[59]])
+        } else {
+            0
+        };
 
-        for part in &parts {
-            if let Some((key, value)) = part.split_once(':') {
-                match key {
-                    "MsgId" => msg_id = value.to_string(),
-                    "Stat" => stat = value.to_string(),
-                    "SubmitTime" => submit_time = value.to_string(),
-                    "DoneTime" => done_time = value.to_string(),
-                    "DestTerminalId" => dest_terminal_id = value.to_string(),
-                    "SMSCSequence" => smsc_sequence = value.parse().ok()?,
-                    _ => {}
-                }
-            }
-        }
-
-        if msg_id.is_empty() || stat.is_empty() {
+        if stat.is_empty() {
             return None;
         }
 
@@ -311,16 +320,28 @@ mod tests {
 
     #[test]
     fn deliver_status_report_parse() {
-        let report_str = "MsgId:12345678 Stat:DELIVRD SubmitTime:0405120000 DoneTime:0405120100 DestTerminalId:13800138000 SMSCSequence:42";
-        let report = CmppReport::parse(report_str).unwrap();
-        assert_eq!(report.msg_id, "12345678");
+        // CMPP 报告定长二进制：MsgId(8) Stat(7) Submit(10) Done(10) Dest(21) SMSC(4)=60。
+        // MsgId 含 0xf1 高位字节（旧 from_utf8 文本解析在此即失败）。
+        let mut data = Vec::new();
+        let msg_id = [0x67u8, 0x05, 0xf1, 0x03, 0x24, 0x66, 0x2f, 0x02];
+        data.extend_from_slice(&msg_id);
+        data.extend_from_slice(b"DELIVRD");
+        data.extend_from_slice(b"0405120000");
+        data.extend_from_slice(b"0405120100");
+        let mut dest = b"13800138000".to_vec();
+        dest.resize(21, 0);
+        data.extend_from_slice(&dest);
+        data.extend_from_slice(&42u32.to_be_bytes());
+        let report = CmppReport::parse(&data).unwrap();
+        assert_eq!(report.msg_id, msg_id);
         assert_eq!(report.stat, "DELIVRD");
+        assert_eq!(report.submit_time, "0405120000");
+        assert_eq!(report.dest_terminal_id, "13800138000");
         assert_eq!(report.smsc_sequence, 42);
     }
 
     #[test]
     fn deliver_status_report_invalid() {
-        let report_str = "invalid";
-        assert!(CmppReport::parse(report_str).is_none());
+        assert!(CmppReport::parse(b"short").is_none());
     }
 }
