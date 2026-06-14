@@ -14,3 +14,4 @@ rsms-connector = { path = "../../crates/rsms-connector" }
 rsms-business = { path = "../../crates/rsms-business" }
 rsms-codec-sgip = { path = "../../crates/rsms-codec-sgip" }
 rsms-longmsg = { path = "../../crates/rsms-longmsg" }
+rsms-model = { path = "../../crates/rsms-model" }

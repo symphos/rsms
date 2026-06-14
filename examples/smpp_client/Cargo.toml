@@ -3,6 +3,10 @@ name = "smpp-client-example"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# 联调用：开启后框架对每帧额外经窄腰 adapter 做统一模型解码并打日志（影子比对）
+unified-shadow = ["rsms-connector/unified-shadow"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tracing.workspace = true
@@ -11,5 +15,6 @@ async-trait.workspace = true
 bytes.workspace = true
 rsms-core = { path = "../../crates/rsms-core" }
 rsms-connector = { path = "../../crates/rsms-connector" }
+rsms-model = { path = "../../crates/rsms-model" }
 rsms-codec-smpp = { path = "../../crates/rsms-codec-smpp" }
 rsms-longmsg = { path = "../../crates/rsms-longmsg" }

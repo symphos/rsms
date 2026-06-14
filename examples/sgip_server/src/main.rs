@@ -1,42 +1,47 @@
 // ============================================================================
-// SGIP 服务端完整参考实现
+// SGIP 服务端完整参考实现（统一模型 / 窄腰架构版）
+//
+// 与旧版的根本区别：业务代码不再直接接触 SGIP 裸 codec 类型（Submit/Deliver/Report…），
+// 也不再手剥字节（data[8..20] 解 SgipSequence）。全程只用协议无关的
+// `rsms_model::UnifiedMessage` + `SgipAdapter`（实现 ProtocolAdapter）：
+//   - 收包：SgipAdapter.decode(frame) -> UnifiedMessage，业务按统一枚举分支处理
+//   - 回执/回包：构造 UnifiedMessage -> SgipAdapter.encode(msg, Sequence) -> 字节 -> write_frame
+//   - 序列：回复一律 SgipAdapter.sequence_of(frame)（自动解 12B 复合序列，回显请求序列）；
+//           server 主动发起的帧（Report/Deliver MO）用 Sequence::Sgip{node_id, timestamp, number}
 //
 // 功能：明文认证 + 限流 + MessageSource 队列 + 长短信合包 + 独立 Report 命令
 // 运行：cargo run
 // 配置：accounts.conf（账号密码）、messages.conf（模拟 MO 消息）
 //
-// SGIP 与 CMPP 的关键差异：
-//   1. 明文认证（Bind.login_name + Bind.login_password），无 MD5
-//   2. 20 字节 Header（12 字节 SgipSequence: node_id + timestamp + number）
-//   3. 独立 Report 命令（不通过 Deliver 承载）
-//   4. to_pdu_bytes(node_id, timestamp, number) 三个参数
-//   5. SubmitResp 只有 result 字段，没有 msg_id
-//
-// 核心流程：
-//   1. 从 accounts.conf 读取账号配置
-//   2. 客户端连接 → 框架自动完成 SGIP 协议握手（Bind/BindResp）
-//   3. 客户端发送 Submit → BusinessHandler.on_inbound() 收到
-//   4. 业务方解码 Submit、回 SubmitResp、处理业务（含长短信合包）
-//   5. 通过 MessageSource 异步发送 Report（状态报告）和 Deliver（MO 上行）
+// SGIP 与 CMPP 的关键差异（统一模型已吸收，业务方无需关心）：
+//   1. 明文认证（无 MD5）——AuthHandler 保持原样，只校验账密
+//   2. 20 字节 Header（12 字节复合 SgipSequence: node_id + timestamp + number）
+//   3. 独立 Report 命令（不通过 Deliver 承载）——统一模型映射为 UnifiedMessage::Report
+//   4. SubmitResp 只有 result 字段，没有 msg_id——统一模型 msg_id 置空 Text("")
 // ============================================================================
 
 use async_trait::async_trait;
 use rsms_business::BusinessHandler;
 use rsms_business::InboundContext;
-use rsms_codec_sgip::{
-    decode_message, Deliver, Encodable, Report, SgipMessage, SgipSequence, SubmitResp,
-};
+use rsms_codec_sgip::adapter::SgipAdapter;
 use rsms_connector::{
-    ServerBuilder, AccountConfig, AccountConfigProvider, AccountPoolConfig, AuthCredentials,
-    AuthHandler, AuthResult, MessageItem, MessageSource, ProtocolConnection, ServerEventHandler,
+    AccountConfig, AccountConfigProvider, AccountPoolConfig, AuthCredentials, AuthHandler,
+    AuthResult, MessageItem, MessageSource, ProtocolConnection, ServerBuilder, ServerEventHandler,
 };
-use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Protocol, Frame, RawPdu, Result};
+use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Frame, Protocol, RawPdu, Result};
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
+use rsms_model::{
+    Address, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra, Sequence,
+    SgipExtra, UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmitResp,
+};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+// SGIP 主动发起帧（Report/Deliver MO）使用的本机 SGIP 节点号（保留原 example 约定）。
+const NODE_ID: u32 = 1;
 
 // ============================================================================
 // 配置读取
@@ -108,22 +113,78 @@ fn detect_alphabet(content: &[u8]) -> SmsAlphabet {
     }
 }
 
-// ============================================================================
-// 从原始 PDU 字节中提取 SgipSequence（bytes 8-19）
-// ============================================================================
-
-fn extract_sgip_sequence(data: &[u8]) -> Option<SgipSequence> {
-    if data.len() < 20 {
-        return None;
+/// 检测字符串内容所需编码（含非 ASCII 字符则 UCS2，否则 ASCII）。
+fn detect_alphabet_str(content: &str) -> SmsAlphabet {
+    if content.is_ascii() {
+        SmsAlphabet::ASCII
+    } else {
+        SmsAlphabet::UCS2
     }
-    let node_id = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
-    let timestamp = u32::from_be_bytes([data[12], data[13], data[14], data[15]]);
-    let number = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
-    Some(SgipSequence::new(node_id, timestamp, number))
+}
+
+/// 把文本按目标编码转为 wire 字节：UCS2 须为 UTF-16BE（每字符 2 字节大端），
+/// 否则按原 UTF-8/ASCII 字节。
+/// LongMessageSplitter 只按字节分段、不转码，
+/// 若直接传 content.as_bytes()（UTF-8）却标 Encoding::Ucs2，
+/// 对端按 UTF-16BE 解 UTF-8 会全乱码。
+fn to_wire_bytes(content: &str, alphabet: SmsAlphabet) -> Vec<u8> {
+    match alphabet {
+        SmsAlphabet::UCS2 => content.encode_utf16().flat_map(|u| u.to_be_bytes()).collect(),
+        _ => content.as_bytes().to_vec(),
+    }
+}
+
+/// 按编码把 wire 字节解为可显示字符串：
+/// UCS2 按 UTF-16BE 解（`from_utf16_lossy`），否则按 UTF-8 宽容解。
+fn decode_text(content: &[u8], encoding: Encoding) -> String {
+    match encoding {
+        Encoding::Ucs2 => {
+            // UTF-16BE：每 2 字节一个 u16，不足对齐则截断
+            let u16s: Vec<u16> = content
+                .chunks(2)
+                .filter(|c| c.len() == 2)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16_lossy(&u16s)
+        }
+        _ => String::from_utf8_lossy(content).into_owned(),
+    }
+}
+
+/// 把 SmsAlphabet 翻译为统一模型 Encoding。
+fn encoding_of(alphabet: SmsAlphabet) -> Encoding {
+    match alphabet {
+        SmsAlphabet::GSM7 | SmsAlphabet::ASCII => Encoding::Ascii,
+        _ => Encoding::Ucs2,
+    }
+}
+
+/// SGIP 时间戳（MMDDHHMMSS 紧凑格式），保留原 example 实现。
+fn sgip_timestamp() -> u32 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let month = ((secs / 86400 / 30) % 12 + 1) as u32;
+    let day = ((secs / 86400) % 30 + 1) as u32;
+    let h = ((secs / 3600) % 24 + 8) % 24;
+    let m = (secs / 60) % 60;
+    let s = secs % 60;
+    month * 1000000 + day * 10000 + h as u32 * 100 + m as u32 * 10 + (s % 10) as u32
+}
+
+/// 把复合 SGIP 序列（node_id + timestamp + number）打包为 12 字节大端，装进 MessageId::Binary。
+/// 这是 Report.submit_sequence 在统一模型中的承载形式（adapter encode 时会反解还原）。
+fn seq_to_msg_id(node_id: u32, timestamp: u32, number: u32) -> MessageId {
+    let mut b = Vec::with_capacity(12);
+    b.extend_from_slice(&node_id.to_be_bytes());
+    b.extend_from_slice(&timestamp.to_be_bytes());
+    b.extend_from_slice(&number.to_be_bytes());
+    MessageId::Binary(b)
 }
 
 // ============================================================================
-// AuthHandler：SGIP 明文认证（无 MD5）
+// AuthHandler：SGIP 明文认证（无 MD5）——保持原样，只校验账密，不构造业务 PDU
 // ============================================================================
 
 struct SgipAuthHandler {
@@ -190,23 +251,34 @@ impl FileMessageSource {
         let messages = load_mo_messages(path);
         let mut splitter = LongMessageSplitter::new();
         for mo in messages {
-            let content_bytes = mo.content.as_bytes();
-            let alphabet = detect_alphabet(content_bytes);
+            // 检测编码并转为 wire 字节（UCS2 → UTF-16BE，ASCII → 原字节）。
+            // 必须先转 wire 再送 splitter，否则 splitter 按 UTF-8 字节分段
+            // 却标 UCS2，对端按 UTF-16BE 解会全乱码。
+            let alphabet = detect_alphabet_str(&mo.content);
+            let wire = to_wire_bytes(&mo.content, alphabet);
+            let encoding = encoding_of(alphabet);
             let single_max = match alphabet {
                 SmsAlphabet::GSM7 | SmsAlphabet::ASCII => 160,
                 _ => 70,
             };
 
-            if content_bytes.len() > single_max {
-                let frames = splitter.split(content_bytes, alphabet);
+            if wire.len() > single_max {
+                let frames = splitter.split(&wire, alphabet);
                 let mut items = Vec::new();
                 for frame in frames {
-                    let pdu = build_deliver_mo_with_udh(&mo.account, &mo.phone, &frame.content, frame.has_udhi);
+                    let pdu = build_deliver_mo_with_udh(
+                        &mo.account,
+                        &mo.phone,
+                        &frame.content,
+                        encoding,
+                        frame.has_udhi,
+                    );
                     items.push(Arc::new(pdu) as Arc<dyn EncodedPdu>);
                 }
                 source.push_group_sync(&mo.account, MessageItem::Group { items });
             } else {
-                let pdu = build_deliver_mo(&mo.account, &mo.phone, &mo.content);
+                // 单条：直接用 wire 字节构造 Deliver，不再用原始 UTF-8。
+                let pdu = build_deliver_mo_wire(&mo.account, &mo.phone, &wire, encoding);
                 source.push_sync(&mo.account, pdu);
             }
         }
@@ -261,7 +333,7 @@ impl MessageSource for FileMessageSource {
 }
 
 // ============================================================================
-// BusinessHandler：处理 Submit，回 SubmitResp，推送 Report，长短信合包
+// BusinessHandler：统一模型分支处理客户端上行的所有帧
 // ============================================================================
 
 struct SgipBusinessHandler {
@@ -276,8 +348,7 @@ impl BusinessHandler for SgipBusinessHandler {
     }
 
     async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        let data = frame.data_as_slice();
-        let msg = match decode_message(data) {
+        let unified = match SgipAdapter.decode(frame) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(conn_id = ctx.conn.id(), "消息解码失败: {}", e);
@@ -285,49 +356,46 @@ impl BusinessHandler for SgipBusinessHandler {
             }
         };
 
-        match msg {
-            SgipMessage::Submit(submit) => {
-                self.handle_submit(ctx, data, &submit).await?;
+        match unified {
+            UnifiedMessage::Submit(submit) => {
+                self.handle_submit(ctx, frame, submit).await?;
             }
-            SgipMessage::Report(report) => {
+            UnifiedMessage::Report(report) => {
                 tracing::info!(
                     conn_id = ctx.conn.id(),
-                    state = report.state,
-                    error_code = report.error_code,
+                    status = ?report.status,
+                    dest = %report.dest.number,
                     "收到 Report"
                 );
-
-                let seq = match extract_sgip_sequence(data) {
-                    Some(s) => s,
-                    None => return Ok(()),
+                // SGIP 独立 Report 须回 ReportResp；统一模型无 ReportResp 变体，
+                // 用 Unknown{command_id=ReportResp} 让 adapter 还原回 ReportResp 编码。
+                let resp = UnifiedMessage::Unknown {
+                    command_id: rsms_codec_sgip::CommandId::ReportResp as u32,
+                    raw: vec![],
                 };
-                let resp = rsms_codec_sgip::ReportResp { result: 0 };
-                ctx.conn
-                    .write_frame(&resp.to_pdu_bytes(seq.node_id, seq.timestamp, seq.number))
-                    .await?;
+                let bytes = SgipAdapter.encode(&resp, SgipAdapter.sequence_of(frame))?;
+                ctx.conn.write_frame(&bytes).await?;
             }
-            SgipMessage::Deliver(deliver) => {
-                let content = String::from_utf8_lossy(&deliver.message_content);
+            UnifiedMessage::Deliver(deliver) => {
+                // 按编码正确解码内容（UCS2 → UTF-16BE，否则 UTF-8 宽容解）。
+                let content = decode_text(&deliver.content, deliver.encoding);
                 tracing::info!(
                     conn_id = ctx.conn.id(),
-                    user_number = %deliver.user_number,
+                    user_number = %deliver.dest.number,
                     content = %content,
                     "收到 Deliver（MO 上行）"
                 );
-
-                let seq = match extract_sgip_sequence(data) {
-                    Some(s) => s,
-                    None => return Ok(()),
-                };
-                let resp = rsms_codec_sgip::DeliverResp { result: 0 };
-                ctx.conn
-                    .write_frame(&resp.to_pdu_bytes(seq.node_id, seq.timestamp, seq.number))
-                    .await?;
+                // MO-Deliver 的响应是 DeliverResp（语义不同于 ReportResp）。
+                let bytes =
+                    SgipAdapter.encode(&UnifiedMessage::DeliverResp, SgipAdapter.sequence_of(frame))?;
+                ctx.conn.write_frame(&bytes).await?;
             }
-            SgipMessage::Unbind(_) => {
+            UnifiedMessage::Unbind => {
                 tracing::debug!(conn_id = ctx.conn.id(), "收到 Unbind");
             }
-            _ => {}
+            other => {
+                tracing::debug!(conn_id = ctx.conn.id(), "收到未处理统一消息: {:?}", other);
+            }
         }
         Ok(())
     }
@@ -337,44 +405,49 @@ impl SgipBusinessHandler {
     async fn handle_submit(
         &self,
         ctx: &InboundContext,
-        data: &[u8],
-        submit: &rsms_codec_sgip::Submit,
+        frame: &Frame,
+        submit: rsms_model::UnifiedSubmit,
     ) -> Result<()> {
         let phone = submit
-            .user_numbers
+            .dests
             .first()
-            .map(|s| s.as_str())
-            .unwrap_or("unknown");
+            .map(|a| a.number.clone())
+            .unwrap_or_else(|| "unknown".to_string());
 
-        let seq = match extract_sgip_sequence(data) {
-            Some(s) => s,
-            None => return Ok(()),
+        // 回 SubmitResp（SGIP 无 msg_id，msg_id 给空 Text）；序列回显请求序列。
+        let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+            msg_id: MessageId::Text(String::new()),
+            status: 0,
+        });
+        let resp_bytes = SgipAdapter.encode(&resp, SgipAdapter.sequence_of(frame))?;
+        ctx.conn.write_frame(&resp_bytes).await?;
+
+        // 取 SGIP 方言字段（tpudhi 等）以判断长短信。
+        let tpudhi = match &submit.extra {
+            ProtocolExtra::Sgip(e) => e.tpudhi,
+            _ => 0,
         };
 
-        let resp = SubmitResp { result: 0 };
-        ctx.conn
-            .write_frame(&resp.to_pdu_bytes(seq.node_id, seq.timestamp, seq.number))
-            .await?;
-
-        if submit.tpudhi == 1 {
-            if let Some((udh, _)) = UdhParser::extract_udh(&submit.message_content) {
+        if tpudhi == 1 {
+            if let Some((udh, _)) = UdhParser::extract_udh(&submit.content) {
                 let seg_num = udh.segment_number;
                 let seg_total = udh.total_segments;
-                let frame = LongMessageFrame::new(
+                let frame_part = LongMessageFrame::new(
                     udh.reference_id,
                     seg_total,
                     seg_num,
-                    submit.message_content.clone(),
+                    submit.content.clone(),
                     true,
                     Some(udh),
                 );
                 let mut merger = self.merger.lock().unwrap();
-                match merger.add_frame(frame) {
+                match merger.add_frame(frame_part) {
                     Ok(Some(complete)) => {
-                        let content = String::from_utf8_lossy(&complete);
+                        // 长短信合包后按 submit.encoding 正确解码（UCS2 → UTF-16BE）。
+                        let content = decode_text(&complete, submit.encoding);
                         tracing::info!(
                             conn_id = ctx.conn.id(),
-                            phone = phone,
+                            phone = %phone,
                             content = %content,
                             "长短信合包完成"
                         );
@@ -382,7 +455,7 @@ impl SgipBusinessHandler {
                     Ok(None) => {
                         tracing::info!(
                             conn_id = ctx.conn.id(),
-                            phone = phone,
+                            phone = %phone,
                             seg = seg_num,
                             total = seg_total,
                             "长短信分段接收"
@@ -392,23 +465,28 @@ impl SgipBusinessHandler {
                 }
             }
         } else {
-            let content = String::from_utf8_lossy(&submit.message_content);
+            // 按 submit.encoding 正确解码内容（UCS2 → UTF-16BE，否则 UTF-8 宽容解）。
+            let content = decode_text(&submit.content, submit.encoding);
             tracing::info!(
                 conn_id = ctx.conn.id(),
-                sp_number = %submit.sp_number,
-                phone = phone,
+                sp_number = %submit.src.number,
+                phone = %phone,
                 content = %content,
                 "收到短信提交"
             );
         }
 
-        if submit.report_flag == 1 {
+        // 需要状态报告：取被报告 Submit 的复合序列（即请求序列）作为 Report.submit_sequence，
+        // 并用一个新的复合序列作为 Report 帧自身的头部序列。
+        if submit.want_report {
             if let Some(account) = ctx.conn.authenticated_account().await {
-                let report_number = ctx.id_generator
+                let submit_seq = SgipAdapter.sequence_of(frame);
+                let report_number = ctx
+                    .id_generator
                     .as_ref()
                     .map(|g| g.next_sequence_id())
                     .unwrap_or(1);
-                let report = build_report(&account, &seq, phone, report_number);
+                let report = build_report(&submit_seq, &phone, report_number);
                 self.msg_source.push(&account, report).await;
             }
         }
@@ -418,72 +496,85 @@ impl SgipBusinessHandler {
 }
 
 // ============================================================================
-// 辅助函数：构建 Report / Deliver PDU
+// 辅助函数：构建 Report / Deliver（统一模型 -> SgipAdapter.encode -> 字节）
 // ============================================================================
 
-fn build_report(
-    _account: &str,
-    submit_seq: &SgipSequence,
+/// 构建投递状态报告（SGIP 独立 Report 命令）。
+/// - msg_id：被报告 Submit 的复合序列（12B 大端打包），adapter encode 时反解为 Report.submit_sequence
+/// - status：Delivered（state=0）
+/// - dest：用户号；src：SGIP Report 无源地址字段，置空
+/// - raw：[report_type, state, error_code]（与 adapter decode 对称，state 由 status 反映射）
+/// - 头部序列：Sequence::Sgip{NODE_ID, sgip_timestamp(), report_number}（本机主动发起）
+fn build_report(submit_seq: &Sequence, phone: &str, report_number: u32) -> RawPdu {
+    // 把被报告 Submit 的复合序列打包进 msg_id。
+    let msg_id = match submit_seq {
+        Sequence::Sgip {
+            node_id,
+            timestamp,
+            number,
+        } => seq_to_msg_id(*node_id, *timestamp, *number),
+        Sequence::Plain(n) => seq_to_msg_id(0, 0, *n),
+    };
+
+    let report = UnifiedMessage::Report(UnifiedReport {
+        msg_id,
+        status: DeliveryStatus::Delivered,
+        src: Address::plain(String::new()),
+        dest: Address::plain(phone),
+        // [report_type=0, state=0(成功), error_code=0]
+        raw: vec![0, 0, 0],
+    });
+
+    let seq = Sequence::Sgip {
+        node_id: NODE_ID,
+        timestamp: sgip_timestamp(),
+        number: report_number,
+    };
+    let bytes = SgipAdapter
+        .encode(&report, seq)
+        .expect("encode SGIP report");
+    RawPdu::from(bytes)
+}
+
+/// 构建单条 MO 上行 Deliver（接受已转换的 wire 字节 + 编码）。
+/// 调用方须先用 `to_wire_bytes` 把文本转为正确的线路字节
+/// （UCS2 → UTF-16BE），再传入此函数，避免对端按 UTF-16BE 解 UTF-8 导致乱码。
+fn build_deliver_mo_wire(account: &str, phone: &str, wire: &[u8], encoding: Encoding) -> RawPdu {
+    build_deliver_mo_with_udh(account, phone, wire, encoding, false)
+}
+
+/// 构建 MO 上行 Deliver（可带 UDH，用于长短信分段）。
+/// - src=sp_number(account)，dest=user_number(phone)（与 adapter decode 对称）
+/// - tpudhi 经 SgipExtra 传递；头部序列 Sequence::Sgip{NODE_ID, sgip_timestamp(), 0}
+fn build_deliver_mo_with_udh(
+    account: &str,
     phone: &str,
-    report_number: u32,
+    content: &[u8],
+    encoding: Encoding,
+    has_udhi: bool,
 ) -> RawPdu {
-    let report = Report {
-        submit_sequence: *submit_seq,
-        report_type: 0,
-        user_number: phone.to_string(),
-        state: 0,
-        error_code: 0,
-        reserve: [0u8; 8],
+    let deliver = UnifiedMessage::Deliver(UnifiedDeliver {
+        src: Address::plain(account),
+        dest: Address::plain(phone),
+        content: content.to_vec(),
+        encoding,
+        concat: None,
+        extra: ProtocolExtra::Sgip(SgipExtra {
+            tpudhi: if has_udhi { 1 } else { 0 },
+            ..Default::default()
+        }),
+        tlvs: vec![],
+    });
+
+    let seq = Sequence::Sgip {
+        node_id: NODE_ID,
+        timestamp: sgip_timestamp(),
+        number: 0,
     };
-
-    let now_ts = sgip_timestamp();
-    report
-        .to_pdu_bytes(submit_seq.node_id, now_ts, report_number)
-        .to_vec()
-        .into()
-}
-
-fn build_deliver_mo(account: &str, phone: &str, content: &str) -> RawPdu {
-    let deliver = Deliver {
-        user_number: phone.to_string(),
-        sp_number: account.to_string(),
-        tppid: 0,
-        tpudhi: 0,
-        msg_fmt: 15,
-        message_content: content.as_bytes().to_vec(),
-        reserve: [0u8; 8],
-    };
-
-    let now_ts = sgip_timestamp();
-    deliver.to_pdu_bytes(1, now_ts, 0).to_vec().into()
-}
-
-fn build_deliver_mo_with_udh(account: &str, phone: &str, content: &[u8], has_udhi: bool) -> RawPdu {
-    let deliver = Deliver {
-        user_number: phone.to_string(),
-        sp_number: account.to_string(),
-        tppid: 0,
-        tpudhi: if has_udhi { 1 } else { 0 },
-        msg_fmt: 15,
-        message_content: content.to_vec(),
-        reserve: [0u8; 8],
-    };
-
-    let now_ts = sgip_timestamp();
-    deliver.to_pdu_bytes(1, now_ts, 0).to_vec().into()
-}
-
-fn sgip_timestamp() -> u32 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-    let month = ((secs / 86400 / 30) % 12 + 1) as u32;
-    let day = ((secs / 86400) % 30 + 1) as u32;
-    let h = ((secs / 3600) % 24 + 8) % 24;
-    let m = (secs / 60) % 60;
-    let s = secs % 60;
-    month * 1000000 + day * 10000 + h as u32 * 100 + m as u32 * 10 + (s % 10) as u32
+    let bytes = SgipAdapter
+        .encode(&deliver, seq)
+        .expect("encode SGIP deliver(MO)");
+    RawPdu::from(bytes)
 }
 
 // ============================================================================
@@ -545,11 +636,7 @@ async fn main() -> Result<()> {
             .with_log_level(tracing::Level::INFO),
     );
 
-    tracing::info!(
-        "SGIP 网关启动于 {}:{}",
-        config.host,
-        config.port
-    );
+    tracing::info!("SGIP 网关启动于 {}:{}", config.host, config.port);
 
     let server = ServerBuilder::new(config)
         .handlers(vec![Arc::new(SgipBusinessHandler {

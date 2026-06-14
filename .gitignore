@@ -23,3 +23,6 @@ openspec/
 # === Local ===
 test_endpoints.sh
 /src/
+
+# 联调/OMC 临时状态与脚手架
+.omc/

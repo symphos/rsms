@@ -1,18 +1,41 @@
+// ============================================================================
+// SMGP 服务端参考实现（统一模型 / 窄腰架构版）
+//
+// 与旧版的根本区别：业务代码不再直接接触 SMGP 裸 codec 消息类型
+// （decode_message / SmgpMessage / Submit / Deliver / Pdu / SubmitResp …），
+// 全程只用协议无关的 `rsms_model::UnifiedMessage` + `SmgpAdapter`（实现 ProtocolAdapter）：
+//   - 收包：SmgpAdapter.decode(frame) -> UnifiedMessage，业务按统一枚举分支处理
+//   - 发包/回执：构造 UnifiedMessage -> SmgpAdapter.encode(msg, Sequence) -> 字节
+// SMGP 方言字段（msg_type/service_id/fee/charge_term_id …）经 ProtocolExtra::Smgp 携带。
+//
+// 保留的业务语义：
+//   - AuthHandler 明文校验（SMGP server 握手范畴，原样不动）
+//   - 收 Submit 立即回 SubmitResp（msg_id 为 10 字节二进制），need_report 时异步入队回执
+//   - 长短信合包（inbound）/拆分（MO outbound）逻辑不变，仅编解码切到 adapter
+//   - FileMessageSource 队列模型不变
+//
+// 已知边界（统一模型当前限制，见文末注释）：
+//   - SMGP 报告的 recv_time/msg_fmt 不进统一模型，经 adapter.encode 时取 Deliver::new() 默认
+//   - 长短信 MO 的 SMGP optional_params（TP_UDHI/PK_TOTAL/PK_NUMBER）当前 adapter 不透出；
+//     分段并发信息由 content 内嵌 UDH 头携带（接收端 UdhParser 即据此合包）
+// ============================================================================
+
 use async_trait::async_trait;
 use rsms_business::BusinessHandler;
 use rsms_business::InboundContext;
-use rsms_codec_smgp::{
-    decode_message,
-    datatypes::{tlv_tags, OptionalParameters, SmgpReport, Tlv},
-    Deliver, Pdu, SmgpMessage, SmgpMsgId, SubmitResp,
-};
+use rsms_codec_smgp::adapter::SmgpAdapter;
+use rsms_codec_smgp::datatypes::{SmgpMsgId, SmgpReport};
 use rsms_connector::{
-    ServerBuilder, AccountConfig, AccountConfigProvider, AccountPoolConfig, AuthCredentials,
-    AuthHandler, AuthResult, MessageItem, MessageSource, ProtocolConnection, ServerEventHandler,
+    AccountConfig, AccountConfigProvider, AccountPoolConfig, AuthCredentials, AuthHandler,
+    AuthResult, MessageItem, MessageSource, ProtocolConnection, ServerBuilder, ServerEventHandler,
 };
-use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Protocol, Frame, RawPdu, Result};
+use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Frame, Protocol, RawPdu, Result};
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
+use rsms_model::{
+    Address, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra, Sequence,
+    UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmitResp,
+};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
@@ -84,6 +107,43 @@ fn detect_alphabet(content: &[u8]) -> SmsAlphabet {
     }
 }
 
+/// 把文本按目标编码转为 wire 字节：UCS2 须为 UTF-16BE（每字符 2 字节大端），
+/// 否则按 ASCII/GBK 原字节。
+/// **关键**：LongMessageSplitter 只按字节分段，不转码；
+/// 若以 UTF-8 字节传入却标 msg_fmt=8(UCS2)，对端会按 UTF-16BE 解析 → 乱码。
+fn to_wire_bytes(content: &str, alphabet: SmsAlphabet) -> Vec<u8> {
+    match alphabet {
+        SmsAlphabet::UCS2 => content.encode_utf16().flat_map(|u| u.to_be_bytes()).collect(),
+        _ => content.as_bytes().to_vec(),
+    }
+}
+
+/// 按编码解码短信内容字节为可读文本：UCS2 用 UTF-16BE 解，其余用 UTF-8/GBK 宽容解。
+fn decode_text(content: &[u8], encoding: Encoding) -> String {
+    match encoding {
+        Encoding::Ucs2 => {
+            // content 为 UTF-16BE 字节流，每 2 字节一个 u16
+            let u16s: Vec<u16> = content
+                .chunks(2)
+                .map(|c| {
+                    if c.len() == 2 {
+                        u16::from_be_bytes([c[0], c[1]])
+                    } else {
+                        // 最后一个奇数字节用 0 补齐，保持健壮
+                        u16::from_be_bytes([c[0], 0])
+                    }
+                })
+                .collect();
+            String::from_utf16_lossy(&u16s)
+        }
+        _ => String::from_utf8_lossy(content).into_owned(),
+    }
+}
+
+// ============================================================================
+// AuthHandler：SMGP server 明文凭据校验（握手范畴，统一模型重构不动它）
+// ============================================================================
+
 struct SmgpAuthHandler {
     accounts: HashMap<String, String>,
 }
@@ -125,6 +185,10 @@ impl AuthHandler for SmgpAuthHandler {
     }
 }
 
+// ============================================================================
+// FileMessageSource：每账号一个待下发队列（MO/回执），编码为 SMGP 字节经 SmgpAdapter.encode
+// ============================================================================
+
 struct FileMessageSource {
     queues: Mutex<HashMap<String, VecDeque<MessageItem>>>,
 }
@@ -143,23 +207,26 @@ impl FileMessageSource {
 
         for mo in messages {
             let alphabet = detect_alphabet(mo.content.as_bytes());
+            // UCS2 时须先转为 UTF-16BE wire 字节，再按字节数判断是否需要拆分
+            let wire = to_wire_bytes(&mo.content, alphabet);
             let single_max = match alphabet {
                 SmsAlphabet::ASCII | SmsAlphabet::GSM7 => 160,
-                SmsAlphabet::UCS2 => 70,
+                SmsAlphabet::UCS2 => 140, // UCS2 wire 字节：70 字符 × 2B = 140B
                 SmsAlphabet::Binary => 140,
             };
 
-            if mo.content.len() > single_max {
-                let frames = splitter.split(mo.content.as_bytes(), alphabet);
+            if wire.len() > single_max {
+                // 长短信 MO：对 wire 字节拆段，每段内嵌 UDH 头，整组顺序下发
+                let frames = splitter.split(&wire, alphabet);
                 let mut items = Vec::new();
                 for frame in frames {
-                    let pdu =
-                        build_deliver_mo_with_udh(&mo.account, &mo.phone, &frame.content, frame.has_udhi, frame.total_segments, frame.segment_number);
+                    let pdu = build_deliver_mo_with_udh(&mo.account, &mo.phone, &frame.content);
                     items.push(Arc::new(pdu) as Arc<dyn EncodedPdu>);
                 }
                 source.push_sync(&mo.account, MessageItem::Group { items });
             } else {
-                let pdu = build_deliver_mo(&mo.account, &mo.phone, &mo.content);
+                // 单条 MO：直接传 wire 字节（UCS2 已是 UTF-16BE，GBK 原样）
+                let pdu = build_deliver_mo(&mo.account, &mo.phone, &wire);
                 source.push_sync(
                     &mo.account,
                     MessageItem::Single(Arc::new(pdu) as Arc<dyn EncodedPdu>),
@@ -207,6 +274,10 @@ impl MessageSource for FileMessageSource {
     }
 }
 
+// ============================================================================
+// BusinessHandler：统一模型分支处理客户端上行帧（Submit / ActiveTest …）
+// ============================================================================
+
 struct SmgpBusinessHandler {
     msg_source: Arc<FileMessageSource>,
     merger: Arc<std::sync::Mutex<LongMessageMerger>>,
@@ -219,7 +290,7 @@ impl BusinessHandler for SmgpBusinessHandler {
     }
 
     async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        let msg = match decode_message(frame.data_as_slice()) {
+        let unified = match SmgpAdapter.decode(frame) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(conn_id = ctx.conn.id(), "消息解码失败: {}", e);
@@ -227,14 +298,11 @@ impl BusinessHandler for SmgpBusinessHandler {
             }
         };
 
-        match msg {
-            SmgpMessage::Submit {
-                sequence_id,
-                submit,
-            } => {
-                self.handle_submit(ctx, sequence_id, &submit).await?;
+        match unified {
+            UnifiedMessage::Submit(submit) => {
+                self.handle_submit(ctx, frame, &submit).await?;
             }
-            SmgpMessage::ActiveTest { .. } => {
+            UnifiedMessage::Ping => {
                 tracing::debug!(conn_id = ctx.conn.id(), "收到 ActiveTest");
             }
             _ => {}
@@ -247,15 +315,16 @@ impl SmgpBusinessHandler {
     async fn handle_submit(
         &self,
         ctx: &InboundContext,
-        sequence_id: u32,
-        submit: &rsms_codec_smgp::Submit,
+        frame: &Frame,
+        submit: &rsms_model::UnifiedSubmit,
     ) -> Result<()> {
         let phone = submit
-            .dest_term_ids
+            .dests
             .first()
-            .map(|s| s.as_str())
+            .map(|a| a.number.as_str())
             .unwrap_or("unknown");
 
+        // 生成 10 字节二进制 MsgId（SMGP 报告/回执 id 字段为二进制，非文本）
         let msg_id = SmgpMsgId::from_u64(
             ctx.id_generator
                 .as_ref()
@@ -268,31 +337,32 @@ impl SmgpBusinessHandler {
                 }),
         );
 
-        let resp = SubmitResp {
-            msg_id,
+        // 立即回 SubmitResp：msg_id 用 MessageId::Binary(10B)，sequence_of 回显请求序列
+        let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+            msg_id: MessageId::Binary(msg_id.bytes.to_vec()),
             status: 0,
-        };
-        let resp_pdu: Pdu = resp.into();
-        ctx.conn
-            .write_frame(resp_pdu.to_pdu_bytes(sequence_id).as_bytes_ref())
-            .await?;
+        });
+        let resp_bytes = SmgpAdapter.encode(&resp, SmgpAdapter.sequence_of(frame))?;
+        ctx.conn.write_frame(&resp_bytes).await?;
 
-        if let Some((udh, _)) = UdhParser::extract_udh(&submit.msg_content) {
+        // 长短信合包：含 UDH 则交 merger 合并，否则直接呈现
+        if let Some((udh, _)) = UdhParser::extract_udh(&submit.content) {
             let ref_id = udh.reference_id;
             let total = udh.total_segments;
             let seg = udh.segment_number;
-            let frame = LongMessageFrame::new(
+            let lm_frame = LongMessageFrame::new(
                 udh.reference_id,
                 udh.total_segments,
                 udh.segment_number,
-                submit.msg_content.clone(),
+                submit.content.clone(),
                 true,
                 Some(udh),
             );
             let mut merger = self.merger.lock().unwrap();
-            match merger.add_frame(frame) {
+            match merger.add_frame(lm_frame) {
                 Ok(Some(complete)) => {
-                    let content = String::from_utf8_lossy(&complete);
+                    // 合包完成后按编码解码全文（UCS2 走 UTF-16BE，其余宽容 UTF-8）
+                    let content = decode_text(&complete, submit.encoding);
                     tracing::info!(
                         conn_id = ctx.conn.id(),
                         phone = phone,
@@ -314,7 +384,8 @@ impl SmgpBusinessHandler {
                 }
             }
         } else {
-            let content = String::from_utf8_lossy(&submit.msg_content);
+            // 按编码解码：UCS2 走 UTF-16BE，GBK/ASCII 走 UTF-8 宽容解
+            let content = decode_text(&submit.content, submit.encoding);
             tracing::info!(
                 conn_id = ctx.conn.id(),
                 phone = phone,
@@ -323,7 +394,8 @@ impl SmgpBusinessHandler {
             );
         }
 
-        if submit.need_report == 1 {
+        // need_report 时异步入队下发状态报告
+        if submit.want_report {
             if let Some(account) = ctx.conn.authenticated_account().await {
                 let report = build_deliver_report(&account, &msg_id, phone);
                 self.msg_source
@@ -339,11 +411,15 @@ impl SmgpBusinessHandler {
     }
 }
 
+/// 构造下行状态报告：SMGP 报告是 is_report=1 的 Deliver，msg_content 为固定 122B 报告文本。
+/// 经统一模型 `UnifiedMessage::Report` → SmgpAdapter.encode 产字节；msg_id 用 10 字节二进制。
+/// （SMGP 方言：报告 msg_id 是 10 字节二进制，故用 `MessageId::Binary(10B)`。）
 fn build_deliver_report(account: &str, msg_id: &SmgpMsgId, phone: &str) -> RawPdu {
     let now = chrono_now_str();
 
+    // 报告正文仍由 SmgpReport 序列化（这是 SMGP 报告 payload 的格式化助手，非裸 PDU 消息类型）
     let report = SmgpReport {
-        msg_id: msg_id.bytes, // 10 字节二进制 MsgId（SMGP 报告 id 字段为二进制，非文本）
+        msg_id: msg_id.bytes,
         sub: "001".to_string(),
         dlvrd: "001".to_string(),
         submit_time: now.clone(),
@@ -353,60 +429,59 @@ fn build_deliver_report(account: &str, msg_id: &SmgpMsgId, phone: &str) -> RawPd
         txt: String::new(),
     };
 
-    let deliver = Deliver {
-        msg_id: msg_id.clone(),
-        is_report: 1,
-        msg_fmt: 0,
-        recv_time: chrono_now_str_short(),
-        src_term_id: phone.to_string(),
-        dest_term_id: account.to_string(),
-        msg_content: report.to_bytes(),
-        reserve: [0u8; 8],
-        optional_params: OptionalParameters::new(),
-    };
+    let unified = UnifiedMessage::Report(UnifiedReport {
+        msg_id: MessageId::Binary(msg_id.bytes.to_vec()),
+        status: DeliveryStatus::Delivered,
+        // 报告 Deliver：src=终端号、dest=企业账号（与旧实现一致）
+        src: Address::plain(phone),
+        dest: Address::plain(account),
+        raw: report.to_bytes(),
+    });
 
-    let pdu: Pdu = deliver.into();
-    pdu.to_pdu_bytes(0)
+    // 报告为单向下发（无需匹配序列），序列号取 0；MessageSource 路径不走窗口。
+    let bytes = SmgpAdapter
+        .encode(&unified, Sequence::Plain(0))
+        .expect("encode SMGP report");
+    RawPdu::from(bytes)
 }
 
-fn build_deliver_mo(account: &str, phone: &str, content: &str) -> RawPdu {
-    let deliver = Deliver {
-        msg_id: SmgpMsgId::default(),
-        is_report: 0,
-        msg_fmt: 15,
-        recv_time: chrono_now_str_short(),
-        src_term_id: phone.to_string(),
-        dest_term_id: account.to_string(),
-        msg_content: content.as_bytes().to_vec(),
-        reserve: [0u8; 8],
-        optional_params: OptionalParameters::new(),
-    };
-
-    let pdu: Pdu = deliver.into();
-    pdu.to_pdu_bytes(0)
+/// 构造下行单条 MO：is_report=0 的 Deliver，正文为已转码的 wire 字节。
+/// 旧实现 msg_fmt=15(GBK)，保持 `Encoding::Gbk`；若调用方传入 UTF-16BE wire 字节
+/// 并将 encoding 改为 Ucs2，对端按 msg_fmt=8 解析即正确。当前保持 GBK 不变。
+fn build_deliver_mo(account: &str, phone: &str, wire_content: &[u8]) -> RawPdu {
+    let unified = UnifiedMessage::Deliver(UnifiedDeliver {
+        src: Address::plain(phone),
+        dest: Address::plain(account),
+        content: wire_content.to_vec(),
+        encoding: Encoding::Gbk,
+        concat: None,
+        extra: ProtocolExtra::None,
+        tlvs: vec![],
+    });
+    let bytes = SmgpAdapter
+        .encode(&unified, Sequence::Plain(0))
+        .expect("encode SMGP MO");
+    RawPdu::from(bytes)
 }
 
-fn build_deliver_mo_with_udh(account: &str, phone: &str, content_with_udh: &[u8], has_udhi: bool, pk_total: u8, pk_number: u8) -> RawPdu {
-    let mut optional_params = OptionalParameters::new();
-    if has_udhi {
-        optional_params.add(Tlv::Byte { tag: tlv_tags::TP_UDHI, value: 1 });
-        optional_params.add(Tlv::Byte { tag: tlv_tags::PK_TOTAL, value: pk_total });
-        optional_params.add(Tlv::Byte { tag: tlv_tags::PK_NUMBER, value: pk_number });
-    }
-    let deliver = Deliver {
-        msg_id: SmgpMsgId::default(),
-        is_report: 0,
-        msg_fmt: 15,
-        recv_time: chrono_now_str_short(),
-        src_term_id: phone.to_string(),
-        dest_term_id: account.to_string(),
-        msg_content: content_with_udh.to_vec(),
-        reserve: [0u8; 8],
-        optional_params,
-    };
-
-    let pdu: Pdu = deliver.into();
-    pdu.to_pdu_bytes(0)
+/// 构造下行长短信 MO 分段：content_with_udh 已内嵌 UDH 头（接收端据此合包）。
+/// 注：SMGP optional_params（TP_UDHI/PK_TOTAL/PK_NUMBER）当前 adapter 不透出，
+/// 分段并发信息全部由内嵌 UDH 头携带——这是统一模型当前已知边界。
+fn build_deliver_mo_with_udh(account: &str, phone: &str, content_with_udh: &[u8]) -> RawPdu {
+    let unified = UnifiedMessage::Deliver(UnifiedDeliver {
+        src: Address::plain(phone),
+        dest: Address::plain(account),
+        content: content_with_udh.to_vec(),
+        encoding: Encoding::Gbk,
+        concat: None,
+        extra: ProtocolExtra::None,
+        // 长短信段须带 TP_UDHI=1（SMGP 经可选参数 TLV 承载），否则对端不重组、把 UDH 当正文。
+        tlvs: vec![rsms_model::Tlv { tag: 0x0002, value: vec![1] }],
+    });
+    let bytes = SmgpAdapter
+        .encode(&unified, Sequence::Plain(0))
+        .expect("encode SMGP MO segment");
+    RawPdu::from(bytes)
 }
 
 fn chrono_now_str() -> String {
@@ -419,20 +494,6 @@ fn chrono_now_str() -> String {
     let day = ((secs / 86400) % 30 + 1) as u8;
     let h = ((secs / 3600) % 24 + 8) % 24;
     format!("{:04}{:02}{:02}{:02}", y, month, day, h)
-}
-
-fn chrono_now_str_short() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-    let y = 1970 + (secs / 31536000);
-    let month = ((secs / 86400 / 30) % 12 + 1) as u8;
-    let day = ((secs / 86400) % 30 + 1) as u8;
-    let h = ((secs / 3600) % 24 + 8) % 24;
-    let m = (secs / 60) % 60;
-    let s = secs % 60;
-    format!("{:04}{:02}{:02}{:02}{:02}{:02}", y, month, day, h, m, s)
 }
 
 struct SimpleAccountConfigProvider;
@@ -483,11 +544,7 @@ async fn main() -> Result<()> {
             .with_log_level(tracing::Level::INFO),
     );
 
-    tracing::info!(
-        "SMGP 网关启动于 {}:{}",
-        config.host,
-        config.port
-    );
+    tracing::info!("SMGP 网关启动于 {}:{}", config.host, config.port);
 
     let server = ServerBuilder::new(config)
         .handlers(vec![Arc::new(SmgpBusinessHandler {
