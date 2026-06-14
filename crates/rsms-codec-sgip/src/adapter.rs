@@ -41,12 +41,17 @@ fn fmt_from_encoding(enc: Encoding) -> u8 {
     }
 }
 
-/// SGIP 状态码 → 统一 DeliveryStatus（state: 0=成功投递；其余取值——等待/投递中/已删除等——
-/// 完整映射待后续，本轮非 0 一律归 Unknown）。
+/// SGIP Report State → 统一 DeliveryStatus。
+/// 0=成功送达→Delivered；1=未送达→Undeliverable；2=超时→Expired；
+/// 其余未知数字**保真**为 Other(数字串)（不再一律 Unknown，便于业务按自家网关解释）。
+/// 注：非 0 子码语义随厂商/规范版本略有出入，此为 SGIP 1.2 常见解释；如对接网关定义不同，
+/// 改本函数即可（与 `state_from_status` 保持对称）。
 fn status_from_state(state: u8) -> DeliveryStatus {
     match state {
         0 => DeliveryStatus::Delivered,
-        _ => DeliveryStatus::Unknown,
+        1 => DeliveryStatus::Undeliverable,
+        2 => DeliveryStatus::Expired,
+        other => DeliveryStatus::Other(other.to_string()),
     }
 }
 
@@ -167,11 +172,15 @@ fn seq_parts(seq: Sequence) -> (u32, u32, u32) {
     }
 }
 
-/// SGIP state(投递状态) 反映射：Delivered→0；其余统一归 1（投递失败/未知，取合理默认非 0）。
-/// 与正向 `status_from_state`（仅区分 0/非 0）对称，有损但语义稳定。
+/// SGIP state(投递状态) 反映射，与正向 `status_from_state` 对称：
+/// Delivered→0、Undeliverable→1、Expired→2、Other(数字串)→解析回原数字；
+/// 其它状态（Accepted/Rejected/Unknown，SGIP 正常不产生）默认 1（投递失败）。
 fn state_from_status(status: &DeliveryStatus) -> u8 {
     match status {
         DeliveryStatus::Delivered => 0,
+        DeliveryStatus::Undeliverable => 1,
+        DeliveryStatus::Expired => 2,
+        DeliveryStatus::Other(s) => s.parse::<u8>().unwrap_or(1),
         _ => 1,
     }
 }
@@ -444,5 +453,24 @@ mod tests {
         }
         let reencoded = SgipAdapter.encode(&unified, Sequence::Plain(8)).unwrap();
         assert_eq!(reencoded, original, "SGIP ReportResp 经统一模型往返后字节应无损一致");
+    }
+
+    #[test]
+    fn status_from_state_enriched_mapping() {
+        // 非 0 state 不再一律 Unknown：1=未送达→Undeliverable，2=超时→Expired，
+        // 其余未知数字保真为 Other(数字串)。
+        assert_eq!(status_from_state(0), DeliveryStatus::Delivered);
+        assert_eq!(status_from_state(1), DeliveryStatus::Undeliverable);
+        assert_eq!(status_from_state(2), DeliveryStatus::Expired);
+        assert_eq!(status_from_state(5), DeliveryStatus::Other("5".to_string()));
+    }
+
+    #[test]
+    fn state_from_status_is_symmetric() {
+        // 反向映射与 status_from_state 对称，保证 Report 往返 state 不变。
+        assert_eq!(state_from_status(&DeliveryStatus::Delivered), 0);
+        assert_eq!(state_from_status(&DeliveryStatus::Undeliverable), 1);
+        assert_eq!(state_from_status(&DeliveryStatus::Expired), 2);
+        assert_eq!(state_from_status(&DeliveryStatus::Other("5".to_string())), 5);
     }
 }
