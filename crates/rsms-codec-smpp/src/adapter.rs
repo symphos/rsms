@@ -156,7 +156,8 @@ fn smpp_to_unified(msg: SmppMessage) -> UnifiedMessage {
         SmppMessage::SubmitSm(s) => UnifiedMessage::Submit(submit_to_unified(s)),
         SmppMessage::SubmitSmResp(r) => UnifiedMessage::SubmitResp(UnifiedSubmitResp {
             msg_id: MessageId::Text(r.message_id),
-            status: 0,
+            // SMPP 结果码在头部 command_status，经 decode 透传到统一模型 status。
+            status: r.command_status,
         }),
         SmppMessage::DeliverSm(d) => deliver_to_unified(d),
         SmppMessage::DeliverSmResp(_) => UnifiedMessage::DeliverResp,
@@ -181,12 +182,16 @@ fn smpp_to_unified(msg: SmppMessage) -> UnifiedMessage {
             b.interface_version,
             BindMode::Transceiver,
         )),
-        // SMPP BindResp 的结果码在 PDU command_status，decode_message 读后丢弃、未透出；
-        // 本轮 BindResp.status 暂填 0（不可用 sc_interface_version 充当 status——它是服务端协议版本，非结果码）。
-        SmppMessage::BindTransmitterResp(_)
-        | SmppMessage::BindReceiverResp(_)
-        | SmppMessage::BindTransceiverResp(_) => {
-            UnifiedMessage::BindResp(rsms_model::UnifiedBindResp { status: 0 })
+        // SMPP BindResp 的结果码在 PDU command_status，经 decode 透传到统一模型 status
+        // （sc_interface_version 是服务端协议版本、非结果码，不可充当 status）。
+        SmppMessage::BindTransmitterResp(r) => {
+            UnifiedMessage::BindResp(rsms_model::UnifiedBindResp { status: r.command_status })
+        }
+        SmppMessage::BindReceiverResp(r) => {
+            UnifiedMessage::BindResp(rsms_model::UnifiedBindResp { status: r.command_status })
+        }
+        SmppMessage::BindTransceiverResp(r) => {
+            UnifiedMessage::BindResp(rsms_model::UnifiedBindResp { status: r.command_status })
         }
         SmppMessage::EnquireLink(_) => UnifiedMessage::Ping,
         SmppMessage::EnquireLinkResp(_) => UnifiedMessage::PingResp,
@@ -240,7 +245,8 @@ fn unified_to_smpp_bytes(msg: &UnifiedMessage, seq: Sequence) -> Result<Vec<u8>>
                 MessageId::Text(t) => t.clone(),
                 MessageId::Binary(b) => String::from_utf8_lossy(b).into_owned(),
             };
-            Pdu::from(SubmitSmResp { message_id })
+            // 统一模型 status 写回 SubmitSmResp.command_status → to_pdu_bytes 写进头部。
+            Pdu::from(SubmitSmResp { message_id, command_status: r.status })
         }
         UnifiedMessage::DeliverResp => Pdu::from(DeliverSmResp { message_id: String::new() }),
         UnifiedMessage::Bind(b) => {
@@ -262,11 +268,14 @@ fn unified_to_smpp_bytes(msg: &UnifiedMessage, seq: Sequence) -> Result<Vec<u8>>
                 }
             }
         }
-        UnifiedMessage::BindResp(_) => {
-            // best-effort：统一模型 BindResp 仅带 status，无法区分 transceiver/transmitter/receiver resp，
-            // 默认产出 BindTransceiverResp。结果码在头部 command_status，本 codec 路径不透传 status；
-            // example 不依赖此分支，框架 AuthHandler 走 codec 直接构造响应。
-            Pdu::from(BindTransceiverResp { system_id: String::new(), sc_interface_version: 0 })
+        UnifiedMessage::BindResp(r) => {
+            // 统一模型 BindResp 仅带 status，无法区分 transceiver/transmitter/receiver resp，默认产出
+            // BindTransceiverResp；status 写回 command_status → to_pdu_bytes 写进头部（rsms 作 server 回失败）。
+            Pdu::from(BindTransceiverResp {
+                system_id: String::new(),
+                sc_interface_version: 0,
+                command_status: r.status,
+            })
         }
         UnifiedMessage::Deliver(d) => {
             // MO 上行 → DeliverSm（esm_class 非回执位）。
@@ -546,5 +555,67 @@ mod tests {
         let reencoded = SmppAdapter.encode(&unified1, Sequence::Plain(13)).unwrap();
         let unified2 = SmppAdapter.decode(&frame_of(reencoded)).unwrap();
         assert_eq!(unified1, unified2, "Report 经统一模型往返后语义应稳定");
+    }
+
+    // ── 结果码透出（#1）：SMPP 结果码在 16B 头的 command_status，需经 adapter 透到统一模型 ──
+
+    /// 把整包 PDU 的 command_status（字节 8..12）设为指定值（测试夹具）。
+    fn set_command_status(mut bytes: Vec<u8>, status: u32) -> Vec<u8> {
+        bytes[8..12].copy_from_slice(&status.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn decode_submit_resp_surfaces_command_status() {
+        // 非 0 command_status（ESME_RSUBMITFAIL=0x45）应透出到 UnifiedSubmitResp.status。
+        let bytes = Pdu::from(SubmitSmResp { message_id: "9".to_string(), command_status: 0 })
+            .to_pdu_bytes(7)
+            .to_vec();
+        let bytes = set_command_status(bytes, 0x0000_0045);
+        match SmppAdapter.decode(&frame_of(bytes)).unwrap() {
+            UnifiedMessage::SubmitResp(r) => {
+                assert_eq!(r.status, 0x45, "command_status 应透出到 status，而非恒 0");
+            }
+            other => panic!("expected SubmitResp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_bind_resp_surfaces_command_status() {
+        // 非 0 command_status（ESME_RBINDFAIL=0x0D）应透出到 UnifiedBindResp.status。
+        let bytes = Pdu::from(BindTransceiverResp {
+            system_id: "900001".to_string(),
+            sc_interface_version: 0x34,
+            command_status: 0,
+        })
+        .to_pdu_bytes(11)
+        .to_vec();
+        let bytes = set_command_status(bytes, 0x0000_000D);
+        match SmppAdapter.decode(&frame_of(bytes)).unwrap() {
+            UnifiedMessage::BindResp(r) => {
+                assert_eq!(r.status, 0x0D, "bind command_status 应透出到 status");
+            }
+            other => panic!("expected BindResp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_submit_resp_writes_command_status() {
+        // UnifiedSubmitResp.status 应写进 PDU 头部 command_status（rsms 作 server 回失败）。
+        let msg = UnifiedMessage::SubmitResp(rsms_model::UnifiedSubmitResp {
+            msg_id: MessageId::Text("9".to_string()),
+            status: 0x58, // ESME_RTHROTTLED
+        });
+        let bytes = SmppAdapter.encode(&msg, Sequence::Plain(1)).unwrap();
+        let cs = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        assert_eq!(cs, 0x58, "status 应写入 command_status，而非恒 0");
+    }
+
+    #[test]
+    fn encode_bind_resp_writes_command_status() {
+        let msg = UnifiedMessage::BindResp(rsms_model::UnifiedBindResp { status: 0x0D });
+        let bytes = SmppAdapter.encode(&msg, Sequence::Plain(1)).unwrap();
+        let cs = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        assert_eq!(cs, 0x0D, "bind status 应写入 command_status");
     }
 }

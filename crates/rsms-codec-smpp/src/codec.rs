@@ -249,6 +249,18 @@ impl Pdu {
             Pdu::Unknown => CommandId::GENERIC_NACK,
         }
     }
+
+    /// 响应 PDU 的头部 command_status（操作结果码，0=ESME_ROK）。
+    /// 请求/无状态 PDU 恒为 0。供 `to_pdu_bytes` 写入头部。
+    pub fn command_status(&self) -> u32 {
+        match self {
+            Pdu::SubmitSmResp(p) => p.command_status,
+            Pdu::BindTransmitterResp(p) => p.command_status,
+            Pdu::BindReceiverResp(p) => p.command_status,
+            Pdu::BindTransceiverResp(p) => p.command_status,
+            _ => 0,
+        }
+    }
 }
 
 impl Encodable for Pdu {
@@ -317,7 +329,7 @@ impl Pdu {
         let total_len = buf.len() as u32;
         buf[0..4].copy_from_slice(&total_len.to_be_bytes());
         buf[4..8].copy_from_slice(&(self.command_id() as u32).to_be_bytes());
-        buf[8..12].copy_from_slice(&0u32.to_be_bytes()); // command_status = 0
+        buf[8..12].copy_from_slice(&self.command_status().to_be_bytes()); // 响应 PDU 写回结果码,其余恒 0
         buf[12..16].copy_from_slice(&sequence_number.to_be_bytes());
 
         RawPdu::new(buf.freeze())

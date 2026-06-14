@@ -254,25 +254,23 @@ impl ClientHandler for TestClientHandler {
             return Ok(());
         }
 
-        // 消息类型识别经 SmppAdapter 解为统一消息；失败码（command_status）adapter 不透传，
-        // 故 BindResp/SubmitResp 的 status 仍裸读 PDU bytes 8..12（规则3：wire 断言保留裸读）。
-        let status = u32::from_be_bytes([pdu[8], pdu[9], pdu[10], pdu[11]]);
+        // 消息类型与结果码（command_status）均经 SmppAdapter 透出到统一模型，
+        // BindResp/SubmitResp 的 status 直接取自 UnifiedMessage（不再裸读 PDU 头部）。
         let unified = match SmppAdapter.decode(frame) {
             Ok(m) => m,
             Err(_) => return Ok(()),
         };
 
         match unified {
-            // adapter 把 BindTransmitterResp/BindTransceiverResp 统一归为 BindResp，
-            // 类型识别由它完成，status 取裸读的 command_status。
-            UnifiedMessage::BindResp(_) => {
-                *self.bind_resp_status.lock().unwrap() = Some(status);
-                if status == 0 {
+            // adapter 把 BindTransmitter/Transceiver Resp 统一归为 BindResp，status=command_status。
+            UnifiedMessage::BindResp(r) => {
+                *self.bind_resp_status.lock().unwrap() = Some(r.status);
+                if r.status == 0 {
                     self.connected.store(true, Ordering::Relaxed);
                 }
             }
-            UnifiedMessage::SubmitResp(_) => {
-                *self.submit_resp_status.lock().unwrap() = Some(status);
+            UnifiedMessage::SubmitResp(r) => {
+                *self.submit_resp_status.lock().unwrap() = Some(r.status);
             }
             // DeliverSm（MO 或回执）→ 统一模型 Deliver/Report，均回 DeliverResp（sequence_of 回显请求序列）。
             UnifiedMessage::Deliver(_) | UnifiedMessage::Report(_) => {

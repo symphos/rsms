@@ -205,21 +205,20 @@ impl ClientHandler for LongMsgClientHandler {
             return Ok(());
         }
 
-        // 消息类型经 SmppAdapter 识别；command_status 不透传，裸读 bytes 8..12（规则3）。
-        let status = u32::from_be_bytes([pdu[8], pdu[9], pdu[10], pdu[11]]);
+        // 消息类型与结果码均经 SmppAdapter 透出到统一模型（command_status → status）。
         let unified = match SmppAdapter.decode(frame) {
             Ok(m) => m,
             Err(_) => return Ok(()),
         };
 
         match unified {
-            UnifiedMessage::BindResp(_) => {
-                if status == 0 {
+            UnifiedMessage::BindResp(r) => {
+                if r.status == 0 {
                     self.connected.store(true, Ordering::Relaxed);
                 }
             }
-            UnifiedMessage::SubmitResp(_) => {
-                if status == 0 {
+            UnifiedMessage::SubmitResp(r) => {
+                if r.status == 0 {
                     self.submit_resp_count.fetch_add(1, Ordering::Relaxed);
                 }
             }

@@ -121,6 +121,9 @@ impl crate::protocol::ProtocolHandler for SmppHandler {
             let resp = BindTransmitterResp {
                 system_id: "SERVER".to_string(),
                 sc_interface_version: info.interface_version,
+                // 头部 command_status 由下方 encode_smpp_pdu_header(status) 写入；
+                // 此字段保持与 status 一致以自洽（body 编码不含它）。
+                command_status: status,
             };
             let mut body = BytesMut::new();
             resp.encode(&mut body)
