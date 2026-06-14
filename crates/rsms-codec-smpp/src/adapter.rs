@@ -13,9 +13,9 @@ use crate::datatypes::{
 use crate::message::{decode_message, SmppMessage};
 use rsms_core::{Frame, Protocol, Result, RsmsError};
 use rsms_model::{
-    Address, BindMode, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra, Sequence,
-    SmppExtra, Tlv as UTlv, UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmit,
-    UnifiedSubmitResp,
+    Address, BindMode, Concat, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra,
+    Sequence, SmppExtra, Tlv as UTlv, UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedReport,
+    UnifiedSubmit, UnifiedSubmitResp,
 };
 
 /// SMPP 协议适配器。
@@ -54,7 +54,33 @@ fn tlvs_from_unified(tlvs: &[UTlv]) -> Vec<Tlv> {
     tlvs.iter().map(|t| Tlv::new(t.tag, t.value.clone())).collect()
 }
 
+/// 解码侧：esm_class 置 UDHI(0x40) 且正文以级联 UDH 开头时，剥离 UDH → (Some(concat), payload)；
+/// 否则 (None, 原正文)。
+fn split_udh(esm_class: u8, content: Vec<u8>) -> (Option<Concat>, Vec<u8>) {
+    if esm_class & 0x40 != 0 {
+        if let Some((c, off)) = Concat::from_udh(&content) {
+            return (Some(c), content[off..].to_vec());
+        }
+    }
+    (None, content)
+}
+
+/// 编码侧：有 concat 则前置级联 UDH 到正文并在 esm_class 置 UDHI(0x40)；否则原样。
+fn join_udh(concat: &Option<Concat>, content: &[u8], esm_class: u8) -> (Vec<u8>, u8) {
+    match concat {
+        Some(c) => {
+            let mut body = c.to_udh_prefix();
+            body.extend_from_slice(content);
+            (body, esm_class | 0x40)
+        }
+        None => (content.to_vec(), esm_class),
+    }
+}
+
 fn submit_to_unified(s: SubmitSm) -> UnifiedSubmit {
+    // 级联长短信：esm_class bit6(0x40)=UDHI 表示正文以 UDH 开头。剥离 UDH → concat 承载分段信息、
+    // content 为纯 payload；非 UDHI 或无有效级联 UDH 时 concat=None、content 原样。
+    let (concat, content) = split_udh(s.esm_class, s.short_message);
     UnifiedSubmit {
         src: Address {
             number: s.source_addr,
@@ -66,10 +92,10 @@ fn submit_to_unified(s: SubmitSm) -> UnifiedSubmit {
             ton: Some(s.dest_addr_ton),
             npi: Some(s.dest_addr_npi),
         }],
-        content: s.short_message,
+        content,
         encoding: encoding_from_dcs(s.data_coding),
         want_report: s.registered_delivery & 0x01 != 0,
-        concat: None,
+        concat,
         extra: ProtocolExtra::Smpp(SmppExtra {
             service_type: s.service_type,
             esm_class: s.esm_class,
@@ -115,6 +141,8 @@ fn deliver_to_unified(d: DeliverSm) -> UnifiedMessage {
             raw: d.short_message,
         })
     } else {
+        // MO 长短信分段：同 Submit，按 UDHI 剥离级联 UDH → concat。
+        let (concat, content) = split_udh(d.esm_class, d.short_message);
         UnifiedMessage::Deliver(UnifiedDeliver {
             src: Address {
                 number: d.source_addr,
@@ -122,9 +150,9 @@ fn deliver_to_unified(d: DeliverSm) -> UnifiedMessage {
                 npi: Some(d.source_addr_npi),
             },
             dest,
-            content: d.short_message,
+            content,
             encoding: encoding_from_dcs(d.data_coding),
-            concat: None,
+            concat,
             extra: ProtocolExtra::None,
             tlvs: tlvs_to_unified(&d.tlvs),
         })
@@ -227,7 +255,9 @@ fn unified_to_smpp_bytes(msg: &UnifiedMessage, seq: Sequence) -> Result<Vec<u8>>
             sm.dest_addr_ton = dest.ton.unwrap_or(0);
             sm.dest_addr_npi = dest.npi.unwrap_or(0);
             sm.destination_addr = dest.number;
-            sm.esm_class = extra.esm_class;
+            // 有 concat 则前置级联 UDH 并置 esm_class UDHI(0x40)。
+            let (udh_body, esm_class) = join_udh(&s.concat, &s.content, extra.esm_class);
+            sm.esm_class = esm_class;
             sm.protocol_id = extra.protocol_id;
             sm.priority_flag = extra.priority_flag;
             sm.schedule_delivery_time = extra.schedule_delivery_time;
@@ -236,7 +266,7 @@ fn unified_to_smpp_bytes(msg: &UnifiedMessage, seq: Sequence) -> Result<Vec<u8>>
             sm.replace_if_present_flag = extra.replace_if_present_flag;
             sm.data_coding = dcs_from_encoding(s.encoding);
             sm.sm_default_msg_id = extra.sm_default_msg_id;
-            sm.short_message = s.content.clone();
+            sm.short_message = udh_body;
             sm.tlvs = tlvs_from_unified(&s.tlvs);
             Pdu::from(sm)
         }
@@ -283,6 +313,8 @@ fn unified_to_smpp_bytes(msg: &UnifiedMessage, seq: Sequence) -> Result<Vec<u8>>
                 ProtocolExtra::Smpp(e) => e.clone(),
                 _ => SmppExtra::default(),
             };
+            // 有 concat 则前置级联 UDH 并置 esm_class UDHI(0x40)。
+            let (udh_body, esm_class) = join_udh(&d.concat, &d.content, extra.esm_class);
             let mut sm = DeliverSm {
                 service_type: extra.service_type,
                 source_addr_ton: d.src.ton.unwrap_or(0),
@@ -291,7 +323,7 @@ fn unified_to_smpp_bytes(msg: &UnifiedMessage, seq: Sequence) -> Result<Vec<u8>>
                 dest_addr_ton: d.dest.ton.unwrap_or(0),
                 dest_addr_npi: d.dest.npi.unwrap_or(0),
                 destination_addr: d.dest.number.clone(),
-                esm_class: extra.esm_class,
+                esm_class,
                 protocol_id: extra.protocol_id,
                 priority_flag: extra.priority_flag,
                 schedule_delivery_time: extra.schedule_delivery_time,
@@ -300,10 +332,10 @@ fn unified_to_smpp_bytes(msg: &UnifiedMessage, seq: Sequence) -> Result<Vec<u8>>
                 replace_if_present_flag: extra.replace_if_present_flag,
                 data_coding: dcs_from_encoding(d.encoding),
                 sm_default_msg_id: extra.sm_default_msg_id,
-                short_message: d.content.clone(),
+                short_message: udh_body,
                 tlvs: tlvs_from_unified(&d.tlvs),
             };
-            // ProtocolExtra::None 时 esm_class 已为 0；MO 不应置回执位，保持 extra 提供的值。
+            // MO 不应置回执位（保留 UDHI 等其它位）。
             sm.esm_class &= !0x04;
             Pdu::from(sm)
         }
@@ -649,5 +681,29 @@ mod tests {
             }
             other => panic!("expected Report, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn submit_concat_udh_roundtrip_via_unified() {
+        // esm_class 0x40(UDHI) + 8-bit 级联 UDH(05 00 03 ref total seq) + payload。
+        let mut s = SubmitSm::new();
+        s.source_addr = "10086".to_string();
+        s.destination_addr = "13800138000".to_string();
+        s.esm_class = 0x40;
+        s.data_coding = 0;
+        s.short_message = vec![0x05, 0x00, 0x03, 7, 2, 1, b'A', b'B'];
+        let original = Pdu::from(s).to_pdu_bytes(30).to_vec();
+
+        let unified = SmppAdapter.decode(&frame_of(original.clone())).unwrap();
+        match &unified {
+            UnifiedMessage::Submit(u) => {
+                assert_eq!(u.concat, Some(Concat { reference: 7, total: 2, sequence: 1 }));
+                assert_eq!(u.content, b"AB", "content 应为剥离 UDH 后的纯 payload");
+            }
+            other => panic!("expected Submit, got {other:?}"),
+        }
+        // encode 重建 UDH + 置 esm_class 0x40 → 字节与原始无损一致。
+        let reencoded = SmppAdapter.encode(&unified, Sequence::Plain(30)).unwrap();
+        assert_eq!(reencoded, original, "级联 Submit 经统一模型往返字节应无损一致");
     }
 }

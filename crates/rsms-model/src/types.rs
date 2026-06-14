@@ -119,6 +119,62 @@ pub struct Concat {
     pub sequence: u8,
 }
 
+impl Concat {
+    /// 构造级联短信 UDH 前缀字节（含 UDHL 前缀）。`reference<=255` 用 8-bit IE(0x00)、
+    /// 否则用 16-bit IE(0x08)。供 encode 时前置到正文。遵循 GSM 03.40 UDH 格式。
+    pub fn to_udh_prefix(&self) -> Vec<u8> {
+        if self.reference <= 255 {
+            // UDHL=5: IEI(0x00) IEDL(3) ref(1) total seq
+            vec![0x05, 0x00, 0x03, self.reference as u8, self.total, self.sequence]
+        } else {
+            // UDHL=6: IEI(0x08) IEDL(4) ref_hi ref_lo total seq
+            vec![
+                0x06,
+                0x08,
+                0x04,
+                (self.reference >> 8) as u8,
+                self.reference as u8,
+                self.total,
+                self.sequence,
+            ]
+        }
+    }
+
+    /// 从正文开头解析级联 UDH。返回 `Some((concat, payload_offset))`——`payload_offset` 为
+    /// UDH 占用的总字节数（含 UDHL 前缀），调用方据此切出纯 payload。
+    /// 非级联 UDH / 长度不足 / 空内容返回 `None`。
+    pub fn from_udh(content: &[u8]) -> Option<(Concat, usize)> {
+        if content.is_empty() {
+            return None;
+        }
+        let udhl = content[0] as usize;
+        if udhl == 0 || content.len() < 1 + udhl {
+            return None;
+        }
+        let udh = &content[1..1 + udhl];
+        // 仅识别级联 IE：8-bit(0x00)/16-bit(0x08)。
+        match udh.first().copied()? {
+            0x08 if udh.len() >= 6 => Some((
+                Concat {
+                    reference: u16::from_be_bytes([udh[2], udh[3]]),
+                    total: udh[4],
+                    sequence: udh[5],
+                },
+                1 + udhl,
+            )),
+            0x00 if udh.len() >= 5 => Some((
+                Concat {
+                    reference: udh[2] as u16,
+                    total: udh[3],
+                    sequence: udh[4],
+                },
+                1 + udhl,
+            )),
+            _ => None,
+        }
+    }
+}
+
 /// 统一消息 ID，吸收各协议形态（CMPP [u8;8]/SMGP 10B/SGIP Sequence/SMPP String）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessageId {
@@ -278,5 +334,33 @@ mod tests {
         assert_eq!(DeliveryStatus::from_receipt_text(text), DeliveryStatus::Delivered);
         // 无 stat: 段 → Unknown
         assert_eq!(DeliveryStatus::from_receipt_text(b"no stat here"), DeliveryStatus::Unknown);
+    }
+
+    #[test]
+    fn concat_udh_8bit_roundtrip() {
+        // reference<=255 → 8-bit UDH：UDHL=5, [05 00 03 ref total seq]。
+        let c = Concat { reference: 42, total: 3, sequence: 2 };
+        assert_eq!(c.to_udh_prefix(), vec![0x05, 0x00, 0x03, 42, 3, 2]);
+        let mut content = c.to_udh_prefix();
+        content.extend_from_slice(b"payload");
+        let (parsed, off) = Concat::from_udh(&content).unwrap();
+        assert_eq!(parsed, c);
+        assert_eq!(&content[off..], b"payload");
+    }
+
+    #[test]
+    fn concat_udh_16bit_roundtrip() {
+        // reference>255 → 16-bit UDH：UDHL=6, [06 08 04 ref_hi ref_lo total seq]。
+        let c = Concat { reference: 300, total: 4, sequence: 1 }; // 300=0x012C
+        assert_eq!(c.to_udh_prefix(), vec![0x06, 0x08, 0x04, 0x01, 0x2C, 4, 1]);
+        let (parsed, off) = Concat::from_udh(&c.to_udh_prefix()).unwrap();
+        assert_eq!(parsed, c);
+        assert_eq!(off, 7);
+    }
+
+    #[test]
+    fn concat_from_udh_none_when_absent() {
+        assert!(Concat::from_udh(b"hello").is_none());
+        assert!(Concat::from_udh(b"").is_none());
     }
 }

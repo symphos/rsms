@@ -9,11 +9,39 @@ use rsms_connector::{
 };
 use rsms_core::{ConnectionInfo, EndpointConfig, Protocol, Frame, RawPdu, Result};
 use rsms_model::{
-    Address, BindMode, Encoding, MessageId, ProtocolAdapter, ProtocolExtra, Sequence, SmppExtra,
-    UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedSubmit, UnifiedSubmitResp,
+    Address, BindMode, Concat, Encoding, MessageId, ProtocolAdapter, ProtocolExtra, Sequence,
+    SmppExtra, UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedSubmit, UnifiedSubmitResp,
 };
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
+
+/// 把 splitter 的分段帧转为窄腰模型的 (concat, 纯载荷)：has_udhi 段剥掉 UDH、concat 承载分段信息。
+fn frame_to_concat(f: &LongMessageFrame) -> (Option<Concat>, Vec<u8>) {
+    if f.has_udhi {
+        (
+            Some(Concat {
+                reference: f.reference_id,
+                total: f.total_segments,
+                sequence: f.segment_number,
+            }),
+            UdhParser::strip_udh(&f.content),
+        )
+    } else {
+        (None, f.content.clone())
+    }
+}
+
+/// 消费侧：把窄腰 (concat, 纯载荷) 重建为含 UDH 的分段字节，供既有 merge_segments/has_udhi 断言复用。
+fn seg_with_udh(concat: &Option<Concat>, content: &[u8]) -> Vec<u8> {
+    match concat {
+        Some(c) => {
+            let mut v = c.to_udh_prefix();
+            v.extend_from_slice(content);
+            v
+        }
+        None => content.to_vec(),
+    }
+}
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -101,11 +129,12 @@ impl BusinessHandler for LongMsgBizHandler {
         if let Ok(msg) = SmppAdapter.decode(frame) {
             match msg {
                 UnifiedMessage::Submit(s) => {
-                    // 存分段内容（含 UDH）用于后续合包断言。统一模型里 short_message 即 content。
+                    // 窄腰：adapter 已把 UDH 剥成 s.concat、s.content 为纯载荷。
+                    // 这里据 concat 重建含 UDH 的分段字节，供后续 merge_segments 合包断言复用。
                     self.received_segments
                         .lock()
                         .unwrap()
-                        .push(s.content.clone());
+                        .push(seg_with_udh(&s.concat, &s.content));
 
                     // 回 SubmitResp（msg_id 空），sequence_of 回显请求序列。
                     let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
@@ -173,15 +202,16 @@ impl LongMsgClientHandler {
         frames
             .iter()
             .map(|frame| {
+                // 窄腰：传 concat + 纯载荷，由 adapter 重建 UDH 并置 esm_class UDHI(0x40)。
+                let (concat, payload) = frame_to_concat(frame);
                 let submit = UnifiedMessage::Submit(UnifiedSubmit {
                     src: Address::plain("106900"),
                     dests: vec![Address { number: "13800138000".to_string(), ton: Some(1), npi: Some(1) }],
-                    content: frame.content.clone(),
+                    content: payload,
                     encoding,
                     want_report: false,
-                    concat: None,
+                    concat,
                     extra: ProtocolExtra::Smpp(SmppExtra {
-                        esm_class: if frame.has_udhi { 0x40 } else { 0 },
                         registered_delivery: 0,
                         ..Default::default()
                     }),
@@ -222,14 +252,17 @@ impl ClientHandler for LongMsgClientHandler {
                     self.submit_resp_count.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            // MO 长短信分段（esm_class=0x40，含 UDH，非回执）→ 统一模型 Deliver，存 content 供合包。
+            // MO 长短信分段 → 统一模型 Deliver；据 concat 重建含 UDH 段供合包断言复用。
             UnifiedMessage::Deliver(d) => {
-                self.deliver_segments.lock().unwrap().push(d.content.clone());
+                self.deliver_segments
+                    .lock()
+                    .unwrap()
+                    .push(seg_with_udh(&d.concat, &d.content));
                 let resp_bytes =
                     SmppAdapter.encode(&UnifiedMessage::DeliverResp, SmppAdapter.sequence_of(frame))?;
                 ctx.conn.write_frame(&resp_bytes).await?;
             }
-            // 万一收到回执位分段（esm_class&0x04），raw 即分段内容，同样入合包并回 DeliverResp。
+            // 万一收到回执位分段，raw 即分段内容（报告无 concat），同样入合包并回 DeliverResp。
             UnifiedMessage::Report(r) => {
                 self.deliver_segments.lock().unwrap().push(r.raw.clone());
                 let resp_bytes =
@@ -249,17 +282,18 @@ fn build_deliver_mo_pdu(
     src: &str,
     dest: &str,
     data_coding: u8,
-    esm_class: u8,
-    short_message: Vec<u8>,
+    concat: Option<Concat>,
+    payload: Vec<u8>,
 ) -> RawPdu {
     let encoding = if data_coding == 8 { Encoding::Ucs2 } else { Encoding::Other(data_coding) };
+    // 窄腰：传 concat + 纯载荷，由 adapter 重建 UDH 并置 esm_class UDHI(0x40)。
     let deliver = UnifiedMessage::Deliver(UnifiedDeliver {
         src: Address { number: src.to_string(), ton: Some(1), npi: Some(1) },
         dest: Address { number: dest.to_string(), ton: Some(0), npi: Some(0) },
-        content: short_message,
+        content: payload,
         encoding,
-        concat: None,
-        extra: ProtocolExtra::Smpp(SmppExtra { esm_class, ..Default::default() }),
+        concat,
+        extra: ProtocolExtra::None,
         tlvs: vec![],
     });
     RawPdu::from(SmppAdapter.encode(&deliver, Sequence::Plain(seq)).expect("encode deliver mo"))
@@ -479,10 +513,8 @@ async fn test_longmsg_v34_mo_deliver_sm() {
 
     let server_conn = pool.first().await.expect("应有一个服务端连接");
     for (i, frame) in frames.iter().enumerate() {
-        let pdu = build_deliver_mo_pdu(
-            (100 + i) as u32, "13800138000", "106900", 8,
-            if frame.has_udhi { 0x40 } else { 0 }, frame.content.clone(),
-        );
+        let (concat, payload) = frame_to_concat(frame);
+        let pdu = build_deliver_mo_pdu((100 + i) as u32, "13800138000", "106900", 8, concat, payload);
         server_conn.write_frame(pdu.as_slice()).await.expect("发送 DeliverSm");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -530,10 +562,8 @@ async fn test_longmsg_v34_mt_and_mo_roundtrip() {
 
     let srv = pool.first().await.expect("服务端连接");
     for (i, f) in dframes.iter().enumerate() {
-        let p = build_deliver_mo_pdu(
-            (200 + i) as u32, "13800138000", "106900", 8,
-            if f.has_udhi { 0x40 } else { 0 }, f.content.clone(),
-        );
+        let (concat, payload) = frame_to_concat(f);
+        let p = build_deliver_mo_pdu((200 + i) as u32, "13800138000", "106900", 8, concat, payload);
         srv.write_frame(p.as_slice()).await.expect("发送 DeliverSm");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -633,10 +663,8 @@ async fn test_longmsg_v50_mo_deliver_sm() {
 
     let server_conn = pool.first().await.expect("应有一个服务端连接");
     for (i, frame) in frames.iter().enumerate() {
-        let pdu = build_deliver_mo_pdu(
-            (300 + i) as u32, "13800138000", "106900", 8,
-            if frame.has_udhi { 0x40 } else { 0 }, frame.content.clone(),
-        );
+        let (concat, payload) = frame_to_concat(frame);
+        let pdu = build_deliver_mo_pdu((300 + i) as u32, "13800138000", "106900", 8, concat, payload);
         server_conn.write_frame(pdu.as_slice()).await.expect("发送 DeliverSm");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -684,10 +712,8 @@ async fn test_longmsg_v50_mt_and_mo_roundtrip() {
 
     let srv = pool.first().await.expect("服务端连接");
     for (i, f) in dframes.iter().enumerate() {
-        let p = build_deliver_mo_pdu(
-            (400 + i) as u32, "13800138000", "106900", 8,
-            if f.has_udhi { 0x40 } else { 0 }, f.content.clone(),
-        );
+        let (concat, payload) = frame_to_concat(f);
+        let p = build_deliver_mo_pdu((400 + i) as u32, "13800138000", "106900", 8, concat, payload);
         srv.write_frame(p.as_slice()).await.expect("发送 DeliverSm");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
