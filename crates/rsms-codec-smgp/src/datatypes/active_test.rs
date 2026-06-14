@@ -113,18 +113,19 @@ impl Decodable for Exit {
     }
 }
 
+/// SMGP 3.0.3 Exit_Resp：body 为空（与 Exit 对称，总长 12B）。
+/// 权威参考实现 cmos(lihuanghe/SMSGate) 发的 Exit_Resp 即 12B；旧版误加 1 字节 reserved
+/// （BODY_SIZE=1、总长 13B）导致解码 cmos 的 12B Exit_Resp 报 `Invalid PDU length:12, must be 13-13`、
+/// 关闭握手时静默吞掉对端 Exit_Resp——现纠正为 0 字节体（联调发现，2026-06-14）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExitResp {
-    pub reserved: u8,
-}
+pub struct ExitResp;
 
 impl ExitResp {
-    pub const BODY_SIZE: usize = 1;
+    pub const BODY_SIZE: usize = 0;
 }
 
 impl Encodable for ExitResp {
-    fn encode(&self, buf: &mut BytesMut) -> Result<(), CodecError> {
-        buf.put_u8(self.reserved);
+    fn encode(&self, _buf: &mut BytesMut) -> Result<(), CodecError> {
         Ok(())
     }
 
@@ -134,7 +135,7 @@ impl Encodable for ExitResp {
 }
 
 impl Decodable for ExitResp {
-    fn decode(header: PduHeader, buf: &mut Cursor<&[u8]>) -> Result<Self, CodecError> {
+    fn decode(header: PduHeader, _buf: &mut Cursor<&[u8]>) -> Result<Self, CodecError> {
         if header.total_length != (PduHeader::SIZE + Self::BODY_SIZE) as u32 {
             return Err(CodecError::InvalidPduLength {
                 length: header.total_length,
@@ -142,11 +143,7 @@ impl Decodable for ExitResp {
                 max: (PduHeader::SIZE + Self::BODY_SIZE) as u32,
             });
         }
-        if !buf.has_remaining() {
-            return Err(CodecError::Incomplete);
-        }
-        let reserved = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
-        Ok(ExitResp { reserved })
+        Ok(ExitResp)
     }
 
     fn command_id() -> CommandId {
@@ -191,9 +188,10 @@ mod tests {
 
     #[test]
     fn exit_resp_roundtrip() {
-        let resp = ExitResp { reserved: 5 };
-        let bytes = Pdu::from(resp.clone()).to_pdu_bytes(1);
-        let decoded = decode_pdu::<ExitResp>(&bytes.as_slice()).unwrap();
-        assert_eq!(decoded.reserved, resp.reserved);
+        let resp = ExitResp;
+        let bytes = Pdu::from(resp).to_pdu_bytes(1);
+        // 总长应为 12B（PduHeader 12 + body 0），与 cmos 一致
+        assert_eq!(bytes.as_slice().len(), 12);
+        let _decoded = decode_pdu::<ExitResp>(bytes.as_slice()).unwrap();
     }
 }

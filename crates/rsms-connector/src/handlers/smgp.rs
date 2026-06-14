@@ -139,7 +139,7 @@ impl crate::protocol::ProtocolHandler for SmgpHandler {
             SmgpMessage::Exit { sequence_id } => {
                 tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "收到SMGP退出请求: seq_id={}", sequence_id);
                 
-                let resp = rsms_codec_smgp::ExitResp { reserved: 0 };
+                let resp = rsms_codec_smgp::ExitResp;
                 let mut body = BytesMut::new();
                 resp.encode(&mut body)
                     .map_err(|e| rsms_core::RsmsError::Codec(e.to_string()))?;
