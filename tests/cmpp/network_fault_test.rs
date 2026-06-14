@@ -7,8 +7,10 @@
 //! 覆盖：高延迟链路下仍能认证；链路中途突断后服务端正确注销（4A.1）。
 
 use async_trait::async_trait;
+// 窄腰统一模型：Connect 构造经 CmppAdapter。compute_connect_auth 为鉴权工具，保留。
+use rsms_codec_cmpp::adapter::CmppAdapter;
 use rsms_codec_cmpp::auth::compute_connect_auth;
-use rsms_codec_cmpp::{Connect, Pdu};
+use rsms_model::{ProtocolAdapter, Sequence, UnifiedBind, UnifiedMessage};
 use rsms_connector::{
     AccountConfig, AccountConfigProvider, AccountPool, AuthCredentials, AuthHandler, AuthResult,
     Protocol, ServerBuilder,
@@ -147,14 +149,16 @@ impl AccountConfigProvider for FixedConfig {
 
 fn build_connect_pdu(seq: u32) -> Vec<u8> {
     let ts = 0u32;
-    let connect = Connect {
-        source_addr: TEST_ACCOUNT.to_string(),
-        authenticator_source: compute_connect_auth(TEST_ACCOUNT, TEST_PASSWORD, ts),
-        version: CMPP_VERSION,
+    let bind = UnifiedMessage::Bind(UnifiedBind {
+        client_id: TEST_ACCOUNT.to_string(),
+        authenticator: compute_connect_auth(TEST_ACCOUNT, TEST_PASSWORD, ts).to_vec(),
         timestamp: ts,
-    };
-    let pdu: Pdu = connect.into();
-    pdu.to_pdu_bytes(seq).to_vec()
+        version: CMPP_VERSION,
+        system_type: None,
+        mode: rsms_model::BindMode::default(),
+        login_mode: None,
+    });
+    CmppAdapter.encode(&bind, Sequence::Plain(seq)).expect("encode bind")
 }
 
 async fn start_server() -> (u16, Arc<AccountPool>, tokio::task::JoinHandle<()>) {

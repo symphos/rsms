@@ -7,12 +7,17 @@ use rsms_connector::{
 };
 use rsms_connector::client::{ClientContext, ClientConfig};
 use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Frame, Result};
-use rsms_codec_cmpp::{
-    decode_message_with_version, CmppMessage, Pdu, Connect, DeliverResp, 
-    CommandId, Submit,
-};
+// 窄腰统一模型：连接/提交构造与客户端收包分支经 CmppAdapter。
+// 但 V2.0 wire 级解码测试（decode_message_with_version + SubmitV20 + encoded_size_v20）adapter 无法
+// 表达（adapter 仅 V3.0），故那部分保留裸 codec（见各测试内 use + 注释）。compute_connect_auth 保留。
+use rsms_codec_cmpp::adapter::CmppAdapter;
+use rsms_codec_cmpp::{decode_message_with_version, CmppMessage, Pdu};
 use rsms_codec_cmpp::codec::PduHeader;
 use rsms_codec_cmpp::auth::compute_connect_auth;
+use rsms_model::{
+    Address, Encoding, ProtocolAdapter, ProtocolExtra, Sequence, UnifiedBind, UnifiedMessage,
+    UnifiedSubmit,
+};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -103,28 +108,34 @@ impl TestClientHandler {
     pub fn build_connect_pdu_v2(&self, account: &str, password: &str) -> RawPdu {
         let timestamp = 0u32;
         let auth = compute_connect_auth(account, password, timestamp);
-
-        let connect = Connect {
-            source_addr: account.to_string(),
-            authenticator_source: auth,
-            version: self.version,
+        // 统一 Bind：version 字段承载握手版本（0x20/0x30/0x50 等），Connect PDU 字节结构与版本无关。
+        let bind = UnifiedMessage::Bind(UnifiedBind {
+            client_id: account.to_string(),
+            authenticator: auth.to_vec(),
             timestamp,
-        };
-
-        let pdu: Pdu = connect.into();
-        pdu.to_pdu_bytes(self.next_seq())
+            version: self.version,
+            system_type: None,
+            mode: rsms_model::BindMode::default(),
+            login_mode: None,
+        });
+        let bytes = CmppAdapter.encode(&bind, Sequence::Plain(self.next_seq())).expect("encode bind");
+        RawPdu::from_vec(bytes)
     }
 
     pub fn build_submit_pdu_v2(&self, src: &str, dst: &str, content: &str) -> RawPdu {
-        let mut submit = Submit::new();
-        submit.src_id = src.to_string();
-        submit.dest_usr_tl = 1;
-        submit.dest_terminal_ids = vec![dst.to_string()];
-        submit.msg_content = content.as_bytes().to_vec();
-        submit.registered_delivery = 0;
-
-        let pdu: Pdu = submit.into();
-        pdu.to_pdu_bytes(self.next_seq())
+        // 统一 Submit（want_report=false 对应 registered_delivery=0）。
+        let submit = UnifiedMessage::Submit(UnifiedSubmit {
+            src: Address::plain(src),
+            dests: vec![Address::plain(dst)],
+            content: content.as_bytes().to_vec(),
+            encoding: Encoding::Ascii,
+            want_report: false,
+            concat: None,
+            extra: ProtocolExtra::Cmpp(Default::default()),
+            tlvs: vec![],
+        });
+        let bytes = CmppAdapter.encode(&submit, Sequence::Plain(self.next_seq())).expect("encode submit");
+        RawPdu::from_vec(bytes)
     }
 
     pub fn is_connected(&self) -> bool {
@@ -153,29 +164,27 @@ impl ClientHandler for TestClientHandler {
     }
 
     async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        let pdu = frame.data_as_slice();
-        if pdu.len() < 12 {
-            return Ok(());
-        }
+        // 统一模型分支：BindResp/SubmitResp/(Deliver|Report 回 DeliverResp)。
+        let unified = match CmppAdapter.decode(frame) {
+            Ok(m) => m,
+            Err(_) => return Ok(()),
+        };
 
-        let cmd_id = u32::from_be_bytes([pdu[4], pdu[5], pdu[6], pdu[7]]);
-
-        if cmd_id == CommandId::ConnectResp as u32 && pdu.len() >= 25 {
-            let status = u32::from_be_bytes([pdu[12], pdu[13], pdu[14], pdu[15]]);
-            *self.connect_resp_status.lock().unwrap() = Some(status);
-            if status == 0 {
-                self.connected.store(true, Ordering::Relaxed);
+        match unified {
+            UnifiedMessage::BindResp(resp) => {
+                *self.connect_resp_status.lock().unwrap() = Some(resp.status);
+                if resp.status == 0 {
+                    self.connected.store(true, Ordering::Relaxed);
+                }
             }
-        } else if cmd_id == CommandId::SubmitResp as u32 && pdu.len() >= 20 {
-            let result = u32::from_be_bytes([pdu[20], pdu[21], pdu[22], pdu[23]]);
-            *self.submit_resp_status.lock().unwrap() = Some(result);
-        } else if cmd_id == CommandId::Deliver as u32 {
-            let resp = DeliverResp {
-                msg_id: [0u8; 8],
-                result: 0,
-            };
-            let resp_pdu: Pdu = resp.into();
-            ctx.conn.write_frame(resp_pdu.to_pdu_bytes(frame.sequence_id).as_slice()).await?;
+            UnifiedMessage::SubmitResp(resp) => {
+                *self.submit_resp_status.lock().unwrap() = Some(resp.status);
+            }
+            UnifiedMessage::Deliver(_) | UnifiedMessage::Report(_) => {
+                let resp_bytes = CmppAdapter.encode(&UnifiedMessage::DeliverResp, CmppAdapter.sequence_of(frame))?;
+                ctx.conn.write_frame(&resp_bytes).await?;
+            }
+            _ => {}
         }
 
         Ok(())

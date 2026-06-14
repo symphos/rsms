@@ -1,9 +1,13 @@
 use async_trait::async_trait;
 use rsms_business::{BusinessHandler, InboundContext};
-use rsms_codec_smgp::{
-    decode_message, SmgpMessage, CommandId, Login, Pdu, Submit, SubmitResp,
-    Deliver, DeliverResp, SmgpMsgId, auth::compute_login_auth,
-    datatypes::tlv::{Tlv, tlv_tags},
+// 窄腰统一模型：编解码统一走 SmgpAdapter + UnifiedMessage。
+// 长短信分段元数据（TP_UDHI/PK_TOTAL/PK_NUMBER）经 rsms_model::Tlv 承载，tag 复用 SMGP 常量。
+use rsms_codec_smgp::adapter::SmgpAdapter;
+use rsms_codec_smgp::auth::compute_login_auth;
+use rsms_codec_smgp::datatypes::tlv::tlv_tags;
+use rsms_model::{
+    Address, BindMode, Encoding, MessageId, ProtocolAdapter, ProtocolExtra, Sequence, Tlv,
+    UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedSubmit, UnifiedSubmitResp,
 };
 use rsms_connector::{
     ClientBuilder, ServerBuilder, AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler,
@@ -19,6 +23,13 @@ use tokio::time::Duration;
 
 const TEST_ACCOUNT: &str = "106900";
 const TEST_PASSWORD: &str = "password123";
+
+/// 从统一模型 tlvs 里取某 tag 的单字节值（长度为 1 的 TLV）。
+fn tlv_byte(tlvs: &[Tlv], tag: u16) -> Option<u8> {
+    tlvs.iter()
+        .find(|t| t.tag == tag)
+        .and_then(|t| t.value.first().copied())
+}
 
 struct PasswordAuthHandler;
 
@@ -78,24 +89,25 @@ impl BusinessHandler for LongMsgBizHandler {
     }
 
     async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        if let Ok(msg) = decode_message(frame.data_as_slice()) {
+        if let Ok(msg) = SmgpAdapter.decode(frame) {
             match msg {
-                SmgpMessage::Submit { submit: s, .. } => {
-                    let tpudhi = s.optional_params.get_byte(tlv_tags::TP_UDHI).unwrap_or(0);
-                    let pk_total = s.optional_params.get_byte(tlv_tags::PK_TOTAL).unwrap_or(1);
-                    let pk_number = s.optional_params.get_byte(tlv_tags::PK_NUMBER).unwrap_or(1);
+                UnifiedMessage::Submit(s) => {
+                    // 长短信分段元数据现经统一模型 tlvs 携带（tag 复用 SMGP 可选参数常量）。
+                    let tpudhi = tlv_byte(&s.tlvs, tlv_tags::TP_UDHI).unwrap_or(0);
+                    let pk_total = tlv_byte(&s.tlvs, tlv_tags::PK_TOTAL).unwrap_or(1);
+                    let pk_number = tlv_byte(&s.tlvs, tlv_tags::PK_NUMBER).unwrap_or(1);
                     self.received_segments.lock().unwrap().push(LongMsgSegment {
                         pk_total,
                         pk_number,
                         tpudhi,
-                        msg_content: s.msg_content.clone(),
+                        msg_content: s.content.clone(),
                     });
-                    let resp = SubmitResp {
-                        msg_id: SmgpMsgId::default(),
+                    let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                        msg_id: MessageId::Binary(vec![0u8; 10]),
                         status: 0,
-                    };
-                    let resp_pdu: Pdu = resp.into();
-                    ctx.conn.write_frame(resp_pdu.to_pdu_bytes(frame.sequence_id).as_slice()).await?;
+                    });
+                    let resp_bytes = SmgpAdapter.encode(&resp, SmgpAdapter.sequence_of(frame))?;
+                    ctx.conn.write_frame(&resp_bytes).await?;
                 }
                 _ => {}
             }
@@ -127,16 +139,19 @@ impl LongMsgClientHandler {
 
     fn build_login_pdu(&self) -> RawPdu {
         let timestamp = 0u32;
-        let auth = compute_login_auth(TEST_ACCOUNT, TEST_PASSWORD, timestamp);
-        let login = Login {
+        // compute_login_auth 保留：鉴权 MD5 非 codec 范畴。
+        let auth = compute_login_auth(TEST_ACCOUNT, TEST_PASSWORD, timestamp).to_vec();
+        let bind = UnifiedMessage::Bind(UnifiedBind {
             client_id: TEST_ACCOUNT.to_string(),
             authenticator: auth,
-            login_mode: 0,
             timestamp,
             version: 0x30,
-        };
-        let pdu: Pdu = login.into();
-        pdu.to_pdu_bytes(self.next_seq())
+            system_type: None,
+            mode: BindMode::default(),
+            login_mode: Some(0),
+        });
+        let bytes = SmgpAdapter.encode(&bind, Sequence::Plain(self.next_seq())).expect("encode login");
+        RawPdu::from(bytes)
     }
 
     fn build_long_submit_pdus(&self, content: &[u8], msg_fmt: u8) -> Vec<RawPdu> {
@@ -144,24 +159,34 @@ impl LongMsgClientHandler {
             8 => SmsAlphabet::UCS2,
             _ => SmsAlphabet::ASCII,
         };
+        let encoding = match msg_fmt {
+            8 => Encoding::Ucs2,
+            _ => Encoding::Ascii,
+        };
         let mut splitter = LongMessageSplitter::new();
         let frames = splitter.split(content, alphabet);
 
         frames.iter().map(|frame| {
-            let mut submit = Submit::new();
-            submit.src_term_id = "106900".to_string();
-            submit.dest_term_id_count = 1;
-            submit.dest_term_ids = vec!["13800138000".to_string()];
-            submit.msg_fmt = msg_fmt;
-            submit.msg_content = frame.content.clone();
-            submit.need_report = 0;
+            // 分段元数据经统一模型 tlvs：TP_UDHI（长短信段）+ PK_TOTAL/PK_NUMBER。
+            let mut tlvs = Vec::new();
             if frame.has_udhi {
-                submit.optional_params.add(Tlv::Byte { tag: tlv_tags::TP_UDHI, value: 1 });
+                tlvs.push(Tlv { tag: tlv_tags::TP_UDHI, value: vec![1] });
             }
-            submit.optional_params.add(Tlv::Byte { tag: tlv_tags::PK_TOTAL, value: frame.total_segments });
-            submit.optional_params.add(Tlv::Byte { tag: tlv_tags::PK_NUMBER, value: frame.segment_number });
-            let pdu: Pdu = submit.into();
-            pdu.to_pdu_bytes(self.next_seq())
+            tlvs.push(Tlv { tag: tlv_tags::PK_TOTAL, value: vec![frame.total_segments] });
+            tlvs.push(Tlv { tag: tlv_tags::PK_NUMBER, value: vec![frame.segment_number] });
+
+            let submit = UnifiedMessage::Submit(UnifiedSubmit {
+                src: Address::plain("106900"),
+                dests: vec![Address::plain("13800138000")],
+                content: frame.content.clone(),
+                encoding,
+                want_report: false,
+                concat: None,
+                extra: ProtocolExtra::None,
+                tlvs,
+            });
+            let bytes = SmgpAdapter.encode(&submit, Sequence::Plain(self.next_seq())).expect("encode submit");
+            RawPdu::from(bytes)
         }).collect()
     }
 }
@@ -173,33 +198,27 @@ impl ClientHandler for LongMsgClientHandler {
     }
 
     async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        let pdu = frame.data_as_slice();
-        if pdu.len() < 12 {
-            return Ok(());
-        }
-        let cmd_id = u32::from_be_bytes([pdu[4], pdu[5], pdu[6], pdu[7]]);
+        let unified = match SmgpAdapter.decode(frame) {
+            Ok(m) => m,
+            Err(_) => return Ok(()),
+        };
 
-        if cmd_id == CommandId::LoginResp as u32 && pdu.len() >= 33 {
-            let status = u32::from_be_bytes([pdu[12], pdu[13], pdu[14], pdu[15]]);
-            if status == 0 {
-                self.connected.store(true, Ordering::Relaxed);
-            }
-        } else if cmd_id == CommandId::SubmitResp as u32 {
-            self.submit_resp_count.fetch_add(1, Ordering::Relaxed);
-        } else if cmd_id == CommandId::Deliver as u32 {
-            if let Ok(msg) = decode_message(pdu) {
-                match msg {
-                    SmgpMessage::Deliver { deliver: d, .. } => {
-                        if d.is_report == 0 {
-                            self.deliver_segments.lock().unwrap().push(d.msg_content.clone());
-                        }
-                        let resp = DeliverResp { msg_id: d.msg_id.clone(), status: 0 };
-                        let resp_pdu: Pdu = resp.into();
-                        ctx.conn.write_frame(resp_pdu.to_pdu_bytes(frame.sequence_id).as_slice()).await?;
-                    }
-                    _ => {}
+        match unified {
+            UnifiedMessage::BindResp(resp) => {
+                if resp.status == 0 {
+                    self.connected.store(true, Ordering::Relaxed);
                 }
             }
+            UnifiedMessage::SubmitResp(_) => {
+                self.submit_resp_count.fetch_add(1, Ordering::Relaxed);
+            }
+            // is_report=0 的 MO 分段：收集内容并回 DeliverResp。
+            UnifiedMessage::Deliver(d) => {
+                self.deliver_segments.lock().unwrap().push(d.content.clone());
+                let resp_bytes = SmgpAdapter.encode(&UnifiedMessage::DeliverResp, SmgpAdapter.sequence_of(frame))?;
+                ctx.conn.write_frame(&resp_bytes).await?;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -238,18 +257,29 @@ async fn connect_client(port: u16) -> Result<(Arc<LongMsgClientHandler>, Arc<Cli
 }
 
 fn build_deliver_mo_pdu(seq_id: u32, src: &str, dest: &str, msg_fmt: u8, tpudhi: u8, msg_content: Vec<u8>) -> RawPdu {
-    let mut deliver = Deliver::new();
-    deliver.msg_id = SmgpMsgId::default();
-    deliver.src_term_id = src.to_string();
-    deliver.dest_term_id = dest.to_string();
-    deliver.msg_fmt = msg_fmt;
-    deliver.is_report = 0;
-    deliver.msg_content = msg_content;
-    if tpudhi > 0 {
-        deliver.optional_params.add(Tlv::Byte { tag: tlv_tags::TP_UDHI, value: 1 });
-    }
-    let pdu: Pdu = deliver.into();
-    pdu.to_pdu_bytes(seq_id)
+    let encoding = match msg_fmt {
+        8 => Encoding::Ucs2,
+        0 => Encoding::Ascii,
+        15 => Encoding::Gbk,
+        other => Encoding::Other(other),
+    };
+    // 长短信段须带 TP_UDHI=1（SMGP 经可选参数 TLV 承载）。
+    let tlvs = if tpudhi > 0 {
+        vec![Tlv { tag: tlv_tags::TP_UDHI, value: vec![1] }]
+    } else {
+        vec![]
+    };
+    let unified = UnifiedMessage::Deliver(UnifiedDeliver {
+        src: Address::plain(src),
+        dest: Address::plain(dest),
+        content: msg_content,
+        encoding,
+        concat: None,
+        extra: ProtocolExtra::None,
+        tlvs,
+    });
+    let bytes = SmgpAdapter.encode(&unified, Sequence::Plain(seq_id)).expect("encode MO");
+    RawPdu::from(bytes)
 }
 
 fn merge_deliver_segments(segments: &[Vec<u8>]) -> Vec<u8> {

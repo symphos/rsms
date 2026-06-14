@@ -7,12 +7,15 @@ use rsms_connector::{
 };
 use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler};
 use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Protocol, Frame, Result};
-use rsms_codec_smgp::{
-    decode_message, SmgpMessage, Pdu,
-    CommandId, Login, SmgpMsgId, Submit, SubmitResp, Deliver, DeliverResp,
-    compute_login_auth,
+// 窄腰统一模型：编解码统一走 SmgpAdapter + UnifiedMessage。
+// SmgpMsgId 为 payload 格式化助手（非裸 PDU 消息类型），保留用于报告 id 匹配。
+use rsms_codec_smgp::adapter::SmgpAdapter;
+use rsms_codec_smgp::{SmgpMsgId, compute_login_auth};
+use rsms_model::{
+    Address, BindMode, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra,
+    Sequence, UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmit,
+    UnifiedSubmitResp,
 };
-use rsms_codec_smgp::datatypes::tlv::OptionalParameters;
 use rsms_test_common::{
     TestStats, StressMockMessageSource, MockAccountConfigProvider,
     rand_u32, format_timestamp, print_stress_results, StressTestResults,
@@ -78,6 +81,23 @@ struct ClientAccount {
     password: String,
 }
 
+/// 把统一模型 MessageId 转回 SMGP 10 字节 MsgId 助手（adapter decode 出 Binary，回填定长数组）。
+fn msg_id_to_smgp(id: &MessageId) -> SmgpMsgId {
+    let mut arr = [0u8; 10];
+    match id {
+        MessageId::Binary(b) => {
+            let n = b.len().min(10);
+            arr[..n].copy_from_slice(&b[..n]);
+        }
+        MessageId::Text(t) => {
+            let tb = t.as_bytes();
+            let n = tb.len().min(10);
+            arr[..n].copy_from_slice(&tb[..n]);
+        }
+    }
+    SmgpMsgId::new(arr)
+}
+
 struct ClientState {
     connected: AtomicBool,
     login_status: Mutex<Option<u32>>,
@@ -107,16 +127,19 @@ impl ClientState {
 
     pub fn build_login_pdu(&self) -> RawPdu {
         let timestamp = 0u32;
-        let authenticator = compute_login_auth(&self.account.client_id, &self.account.password, timestamp);
-        let login = Login {
+        // compute_login_auth 保留：鉴权 MD5 非 codec 范畴。
+        let authenticator = compute_login_auth(&self.account.client_id, &self.account.password, timestamp).to_vec();
+        let bind = UnifiedMessage::Bind(UnifiedBind {
             client_id: self.account.client_id.clone(),
             authenticator,
-            login_mode: 0,
             timestamp,
             version: 0x30,
-        };
-        let pdu: Pdu = login.into();
-        pdu.to_pdu_bytes(self.next_seq())
+            system_type: None,
+            mode: BindMode::default(),
+            login_mode: Some(0),
+        });
+        let bytes = SmgpAdapter.encode(&bind, Sequence::Plain(self.next_seq())).expect("encode login");
+        RawPdu::from(bytes)
     }
 
     fn is_connected(&self) -> bool {
@@ -131,59 +154,54 @@ impl ClientHandler for ClientState {
     }
 
     async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        let pdu = frame.data_as_slice();
-        if pdu.len() < 12 {
-            return Ok(());
-        }
+        let unified = match SmgpAdapter.decode(frame) {
+            Ok(m) => m,
+            Err(_) => return Ok(()),
+        };
 
-        let cmd_id = u32::from_be_bytes([pdu[4], pdu[5], pdu[6], pdu[7]]);
-
-        if cmd_id == CommandId::LoginResp as u32 && pdu.len() >= 33 {
-            let status = u32::from_be_bytes([pdu[12], pdu[13], pdu[14], pdu[15]]);
-            *self.login_status.lock().unwrap() = Some(status);
-            if status == 0 {
-                self.connected.store(true, Ordering::Relaxed);
-            }
-        } else if cmd_id == CommandId::SubmitResp as u32 && pdu.len() >= 26 {
-            let status = u32::from_be_bytes([pdu[22], pdu[23], pdu[24], pdu[25]]);
-            self.stats.submit_resp_received.fetch_add(1, Ordering::Relaxed);
-            if status == 0 {
-                let msg_id_bytes: [u8; 10] = [
-                    pdu[12], pdu[13], pdu[14], pdu[15], pdu[16],
-                    pdu[17], pdu[18], pdu[19], pdu[20], pdu[21],
-                ];
-                let msg_id = SmgpMsgId::new(msg_id_bytes);
-                self.msg_ids.write().unwrap().push_back(msg_id);
-            } else {
-                self.stats.submit_errors.fetch_add(1, Ordering::Relaxed);
-            }
-        } else if cmd_id == CommandId::Deliver as u32 {
-            if let Ok(msg) = decode_message(pdu) {
-                if let SmgpMessage::Deliver { deliver: d, .. } = msg {
-                    if d.is_report == 1 {
-                        let content = String::from_utf8_lossy(&d.msg_content).to_string();
-                        if let Some(report_msg_id) = Self::parse_msg_id_from_report(&content) {
-                            self.stats.report_received.fetch_add(1, Ordering::Relaxed);
-                            let matched = self.matched_msg_ids.lock().unwrap();
-                            if matched.contains(&report_msg_id) {
-                                return Ok(());
-                            }
-                            drop(matched);
-                            let mut pending = self.msg_ids.write().unwrap();
-                            if let Some(pos) = pending.iter().position(|&id| id == report_msg_id) {
-                                pending.remove(pos);
-                                self.matched_msg_ids.lock().unwrap().insert(report_msg_id);
-                                self.stats.report_matched.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    } else {
-                        self.stats.mo_received.fetch_add(1, Ordering::Relaxed);
-                    }
+        match unified {
+            UnifiedMessage::BindResp(resp) => {
+                *self.login_status.lock().unwrap() = Some(resp.status);
+                if resp.status == 0 {
+                    self.connected.store(true, Ordering::Relaxed);
                 }
             }
-            let resp = DeliverResp { msg_id: SmgpMsgId::default(), status: 0 };
-            let resp_pdu: Pdu = resp.into();
-            ctx.conn.write_frame(resp_pdu.to_pdu_bytes(frame.sequence_id).as_slice()).await?;
+            UnifiedMessage::SubmitResp(resp) => {
+                self.stats.submit_resp_received.fetch_add(1, Ordering::Relaxed);
+                if resp.status == 0 {
+                    let msg_id = msg_id_to_smgp(&resp.msg_id);
+                    self.msg_ids.write().unwrap().push_back(msg_id);
+                } else {
+                    self.stats.submit_errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            // is_report=1→Report：报告匹配靠正文 id:N。
+            UnifiedMessage::Report(r) => {
+                let content = String::from_utf8_lossy(&r.raw).to_string();
+                if let Some(report_msg_id) = Self::parse_msg_id_from_report(&content) {
+                    self.stats.report_received.fetch_add(1, Ordering::Relaxed);
+                    let matched = self.matched_msg_ids.lock().unwrap();
+                    if matched.contains(&report_msg_id) {
+                        return Ok(());
+                    }
+                    drop(matched);
+                    let mut pending = self.msg_ids.write().unwrap();
+                    if let Some(pos) = pending.iter().position(|&id| id == report_msg_id) {
+                        pending.remove(pos);
+                        self.matched_msg_ids.lock().unwrap().insert(report_msg_id);
+                        self.stats.report_matched.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                let resp_bytes = SmgpAdapter.encode(&UnifiedMessage::DeliverResp, SmgpAdapter.sequence_of(frame))?;
+                ctx.conn.write_frame(&resp_bytes).await?;
+            }
+            // is_report=0→Deliver（MO）。
+            UnifiedMessage::Deliver(_) => {
+                self.stats.mo_received.fetch_add(1, Ordering::Relaxed);
+                let resp_bytes = SmgpAdapter.encode(&UnifiedMessage::DeliverResp, SmgpAdapter.sequence_of(frame))?;
+                ctx.conn.write_frame(&resp_bytes).await?;
+            }
+            _ => {}
         }
 
         Ok(())
@@ -225,17 +243,20 @@ impl rsms_business::BusinessHandler for ServerHandler {
 
     async fn on_inbound(&self, ctx: &rsms_business::InboundContext, frame: &Frame) -> Result<()> {
         let account = ctx.conn.authenticated_account().await.unwrap_or_else(|| "unknown".to_string());
-        if let Ok(msg) = decode_message(frame.data_as_slice()) {
+        if let Ok(msg) = SmgpAdapter.decode(frame) {
             match msg {
-                SmgpMessage::Submit { submit: s, .. } => {
+                UnifiedMessage::Submit(s) => {
                     let count = self.submit_count.fetch_add(1, Ordering::Relaxed);
                     let msg_id = SmgpMsgId::from_u64(count);
 
-                    let resp = SubmitResp { msg_id, status: 0 };
-                    let resp_pdu: Pdu = resp.into();
-                    ctx.conn.write_frame(resp_pdu.to_pdu_bytes(frame.sequence_id).as_slice()).await?;
+                    let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                        msg_id: MessageId::Binary(msg_id.bytes.to_vec()),
+                        status: 0,
+                    });
+                    let resp_bytes = SmgpAdapter.encode(&resp, SmgpAdapter.sequence_of(frame))?;
+                    ctx.conn.write_frame(&resp_bytes).await?;
 
-                    let dest_id = s.dest_term_ids.first().cloned().unwrap_or_default();
+                    let dest_id = s.dests.first().map(|a| a.number.clone()).unwrap_or_default();
                     let item = ReportItem {
                         msg_id: msg_id.to_bytes(),
                         conn_id: ctx.conn.id(),
@@ -243,7 +264,7 @@ impl rsms_business::BusinessHandler for ServerHandler {
                     };
                     self.msg_source.push_item(&account, item.to_bytes()).await;
                 }
-                SmgpMessage::DeliverResp { .. } => {}
+                UnifiedMessage::DeliverResp => {}
                 _ => {}
             }
         }
@@ -335,25 +356,24 @@ async fn report_generator_task(
                     let now = format_timestamp(true);
                     let msg_id_value = SmgpMsgId::new(item.msg_id).to_u64();
                     let date_part = &now[..10];
+                    // 报告正文须保持 `id:N ...` 文本（客户端按它匹配 SubmitResp 的 msg_id）。
                     let report_content = format!(
                         "id:{} sub:001 dlvrd:001 submit date:{} done date:{} stat:DELIVRD err:000 text:Hello",
                         msg_id_value, date_part, date_part
                     );
-                    let deliver = Deliver {
-                        msg_id: SmgpMsgId::default(),
-                        is_report: 1,
-                        msg_fmt: 15,
-                        recv_time: now,
-                        src_term_id: "13800138000".to_string(),
-                        dest_term_id: item.dest_id,
-                        msg_content: report_content.as_bytes().to_vec(),
-                        reserve: [0u8; 8],
-                        optional_params: OptionalParameters::new(),
-                    };
-                    let pdu: Pdu = deliver.into();
+                    // is_report=1 经 UnifiedMessage::Report → adapter；msg_id 头取默认全零。
+                    let unified = UnifiedMessage::Report(UnifiedReport {
+                        msg_id: MessageId::Binary(vec![0u8; 10]),
+                        status: DeliveryStatus::Delivered,
+                        src: Address::plain("13800138000"),
+                        dest: Address::plain(item.dest_id),
+                        raw: report_content.into_bytes(),
+                    });
                     let seq = rand_u32();
-                    if conn.write_frame(pdu.to_pdu_bytes(seq).as_slice()).await.is_ok() {
-                        report_sent.fetch_add(1, Ordering::Relaxed);
+                    if let Ok(bytes) = SmgpAdapter.encode(&unified, Sequence::Plain(seq)) {
+                        if conn.write_frame(&bytes).await.is_ok() {
+                            report_sent.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -377,24 +397,22 @@ async fn mo_generator_task(
             if let Some(conn) = acc.first_connection().await {
                 let src = src_numbers[rand_u32() as usize % src_numbers.len()];
                 let content = format!("MO Test #{}", mo_sent.load(Ordering::Relaxed) + 1);
-                let now = format_timestamp(true);
-                let mo_count = mo_sent.load(Ordering::Relaxed);
 
-                let deliver = Deliver {
-                    msg_id: SmgpMsgId::from_u64(mo_count + 1000000),
-                    is_report: 0,
-                    msg_fmt: 15,
-                    recv_time: now,
-                    src_term_id: src.to_string(),
-                    dest_term_id: account.clone(),
-                    msg_content: content.as_bytes().to_vec(),
-                    reserve: [0u8; 8],
-                    optional_params: OptionalParameters::new(),
-                };
-                let pdu: Pdu = deliver.into();
+                // is_report=0 的 MO：原 msg_fmt=15→Encoding::Gbk；msg_id/recv_time 头字段走 adapter 默认（语义无关）。
+                let unified = UnifiedMessage::Deliver(UnifiedDeliver {
+                    src: Address::plain(src),
+                    dest: Address::plain(account.clone()),
+                    content: content.as_bytes().to_vec(),
+                    encoding: Encoding::Gbk,
+                    concat: None,
+                    extra: ProtocolExtra::None,
+                    tlvs: vec![],
+                });
                 let seq = rand_u32();
-                if conn.write_frame(pdu.to_pdu_bytes(seq).as_slice()).await.is_ok() {
-                    mo_sent.fetch_add(1, Ordering::Relaxed);
+                if let Ok(bytes) = SmgpAdapter.encode(&unified, Sequence::Plain(seq)) {
+                    if conn.write_frame(&bytes).await.is_ok() {
+                        mo_sent.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -402,20 +420,25 @@ async fn mo_generator_task(
 }
 
 fn build_smgp_submit_pdu(src: &str, dst: &str, content: &str, seq: u32) -> Vec<u8> {
-    let mut submit = Submit::new();
-    submit.need_report = 1;
-    submit.service_id = "SMS".to_string();
-    submit.fee_type = "02".to_string();
-    submit.fee_code = "000000".to_string();
-    submit.fixed_fee = "000000".to_string();
-    submit.msg_fmt = 15;
-    submit.src_term_id = src.to_string();
-    submit.charge_term_id = dst.to_string();
-    submit.dest_term_id_count = 1;
-    submit.dest_term_ids = vec![dst.to_string()];
-    submit.msg_content = content.as_bytes().to_vec();
-    let pdu: Pdu = submit.into();
-    pdu.to_pdu_bytes(seq).as_slice().to_vec()
+    // 原 msg_fmt=15(GBK)→Encoding::Gbk；service_id/fee 等方言字段走 ProtocolExtra::Smgp。
+    let submit = UnifiedMessage::Submit(UnifiedSubmit {
+        src: Address::plain(src),
+        dests: vec![Address::plain(dst)],
+        content: content.as_bytes().to_vec(),
+        encoding: Encoding::Gbk,
+        want_report: true,
+        concat: None,
+        extra: ProtocolExtra::Smgp(rsms_model::SmgpExtra {
+            service_id: "SMS".to_string(),
+            fee_type: "02".to_string(),
+            fee_code: "000000".to_string(),
+            fixed_fee: "000000".to_string(),
+            charge_term_id: dst.to_string(),
+            ..Default::default()
+        }),
+        tlvs: vec![],
+    });
+    SmgpAdapter.encode(&submit, Sequence::Plain(seq)).expect("encode submit")
 }
 
 async fn mt_producer_task(

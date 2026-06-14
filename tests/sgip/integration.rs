@@ -5,12 +5,21 @@ use rsms_test_common::{TestEventHandler, TestClientEventHandler, MockAccountConf
 use rsms_business::BusinessHandler;
 use rsms_business::InboundContext;
 use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Frame, Result};
-use rsms_codec_sgip::Encodable;
+// 窄腰统一模型：业务/客户端不再直接接触 SGIP 裸 codec，统一走 SgipAdapter + UnifiedMessage。
+use rsms_codec_sgip::adapter::SgipAdapter;
+use rsms_model::{
+    Address, MessageId, ProtocolAdapter, ProtocolExtra, Sequence, SgipExtra,
+    UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedSubmit, UnifiedSubmitResp,
+};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use tokio::time::Duration;
 use std::collections::HashMap;
+
+// SGIP 复合序列分量：发起方固定 node_id/timestamp，number 自增（保留原测试约定）。
+const SGIP_NODE_ID: u32 = 1;
+const SGIP_TIMESTAMP: u32 = 0x04051200;
 
 #[allow(dead_code)]
 fn get_test_port() -> u16 {
@@ -120,41 +129,30 @@ impl BusinessHandler for TestBusinessHandler {
     }
 
     async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        if let Ok(msg) = rsms_codec_sgip::decode_message(frame.data_as_slice()) {
-            match msg {
-                rsms_codec_sgip::SgipMessage::Submit(s) => {
+        // 统一模型解码：裸 decode_message + 手剥字节全部由 SgipAdapter 吸收。
+        if let Ok(unified) = SgipAdapter.decode(frame) {
+            match unified {
+                UnifiedMessage::Submit(s) => {
                     self.submit_count.fetch_add(1, Ordering::Relaxed);
-                    let content = String::from_utf8_lossy(&s.message_content).to_string();
+                    let content = String::from_utf8_lossy(&s.content).to_string();
                     self.messages.lock().unwrap().push(content);
 
-                    let resp = rsms_codec_sgip::SubmitResp { result: 0 };
-                    let body_bytes = {
-                        let mut buf = bytes::BytesMut::new();
-                        resp.encode(&mut buf).unwrap();
-                        buf.to_vec()
-                    };
-                    let total_len = (20 + body_bytes.len()) as u32;
-                    let pdu_bytes = frame.data_as_slice();
-                    let mut resp_pdu = Vec::new();
-                    resp_pdu.extend_from_slice(&total_len.to_be_bytes());
-                    resp_pdu.extend_from_slice(&(rsms_codec_sgip::CommandId::SubmitResp as u32).to_be_bytes());
-                    if pdu_bytes.len() >= 20 {
-                        resp_pdu.extend_from_slice(&pdu_bytes[8..20]);
-                    } else {
-                        resp_pdu.extend_from_slice(&1u32.to_be_bytes());
-                        resp_pdu.extend_from_slice(&0x04051200u32.to_be_bytes());
-                        resp_pdu.extend_from_slice(&1u32.to_be_bytes());
-                    }
-                    resp_pdu.extend(body_bytes);
-                    ctx.conn.write_frame(resp_pdu.as_slice()).await?;
+                    // 回 SubmitResp：SGIP 无 msg_id，msg_id 给空 Text；序列用 sequence_of 回显请求复合序列。
+                    let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                        msg_id: MessageId::Text(String::new()),
+                        status: 0,
+                    });
+                    let resp_bytes = SgipAdapter.encode(&resp, SgipAdapter.sequence_of(frame))?;
+                    ctx.conn.write_frame(resp_bytes.as_slice()).await?;
                 }
-                rsms_codec_sgip::SgipMessage::Deliver(d) => {
-                    if d.message_content.len() > 20 && String::from_utf8_lossy(&d.message_content).contains("id:") {
-                        self.reports.lock().unwrap().push(String::from_utf8_lossy(&d.message_content).to_string());
+                UnifiedMessage::Deliver(d) => {
+                    // 状态报告（旧版以 "id:" 文本承载在 Deliver 里）与普通 MO 区分语义保持不变。
+                    if d.content.len() > 20 && String::from_utf8_lossy(&d.content).contains("id:") {
+                        self.reports.lock().unwrap().push(String::from_utf8_lossy(&d.content).to_string());
                     } else {
                         self.mo_messages.lock().unwrap().push((
-                            d.user_number.clone(),
-                            String::from_utf8_lossy(&d.message_content).to_string(),
+                            d.dest.number.clone(),
+                            String::from_utf8_lossy(&d.content).to_string(),
                         ));
                     }
                 }
@@ -192,99 +190,59 @@ impl TestClientHandler {
         self.seq.fetch_add(1, Ordering::Relaxed) as u32
     }
 
+    // 复合序列工厂：node_id/timestamp 固定，number 走原 next_seq 自增。
+    fn next_sgip_seq(&self) -> Sequence {
+        Sequence::Sgip {
+            node_id: SGIP_NODE_ID,
+            timestamp: SGIP_TIMESTAMP,
+            number: self.next_seq(),
+        }
+    }
+
     pub fn build_bind_pdu(&self, login_name: &str, login_password: &str) -> RawPdu {
-        let bind = rsms_codec_sgip::Bind {
-            login_type: 1,
-            login_name: login_name.to_string(),
-            login_password: login_password.to_string(),
-            reserve: [0u8; 8],
-        };
-
-        let body_bytes = {
-            let mut buf = bytes::BytesMut::new();
-            bind.encode(&mut buf).unwrap();
-            buf.to_vec()
-        };
-
-        let total_len = (20 + body_bytes.len()) as u32;
-        let seq_num = self.next_seq();
-
-        let mut pdu = Vec::new();
-        pdu.extend_from_slice(&total_len.to_be_bytes());
-        pdu.extend_from_slice(&(rsms_codec_sgip::CommandId::Bind as u32).to_be_bytes());
-        pdu.extend_from_slice(&1u32.to_be_bytes());
-        pdu.extend_from_slice(&0x04051200u32.to_be_bytes());
-        pdu.extend_from_slice(&seq_num.to_be_bytes());
-        pdu.extend(body_bytes);
-
-        pdu.into()
+        // 明文认证：authenticator 直接装口令字节（无 MD5）；version 承载 login_type=1。
+        let bind = UnifiedMessage::Bind(UnifiedBind {
+            client_id: login_name.to_string(),
+            authenticator: login_password.as_bytes().to_vec(),
+            timestamp: 0,
+            version: 1,
+            system_type: None,
+            mode: rsms_model::BindMode::default(),
+            login_mode: None,
+        });
+        let bytes = SgipAdapter.encode(&bind, self.next_sgip_seq()).expect("encode bind");
+        RawPdu::from(bytes)
     }
 
     pub fn build_submit_pdu(&self, sp_number: &str, dest_number: &str, content: &str) -> RawPdu {
-        let mut submit = rsms_codec_sgip::Submit::new();
-        submit.sp_number = sp_number.to_string();
-        submit.charge_number = sp_number.to_string();
-        submit.user_count = 1;
-        submit.user_numbers = vec![dest_number.to_string()];
-        submit.corp_id = "".to_string();
-        submit.service_type = "SMS".to_string();
-        submit.fee_type = 2;
-        submit.fee_value = "000000".to_string();
-        submit.given_value = "000000".to_string();
-        submit.agent_flag = 0;
-        submit.morelate_to_mt_flag = 0;
-        submit.priority = 0;
-        submit.expire_time = "".to_string();
-        submit.schedule_time = "".to_string();
-        submit.report_flag = 1;
-        submit.tppid = 0;
-        submit.tpudhi = 0;
-        submit.msg_fmt = 15;
-        submit.message_type = 0;
-        submit.message_content = content.as_bytes().to_vec();
-        submit.reserve = [0u8; 8];
-
-        let body_bytes = {
-            let mut buf = bytes::BytesMut::new();
-            submit.encode(&mut buf).unwrap();
-            buf.to_vec()
-        };
-
-        let total_len = (20 + body_bytes.len()) as u32;
-        let seq_num = self.next_seq();
-
-        let mut pdu = Vec::new();
-        pdu.extend_from_slice(&total_len.to_be_bytes());
-        pdu.extend_from_slice(&(rsms_codec_sgip::CommandId::Submit as u32).to_be_bytes());
-        pdu.extend_from_slice(&1u32.to_be_bytes());
-        pdu.extend_from_slice(&0x04051200u32.to_be_bytes());
-        pdu.extend_from_slice(&seq_num.to_be_bytes());
-        pdu.extend(body_bytes);
-
-        pdu.into()
+        // SGIP 方言字段（charge_number/service_type/fee_* 等）经 SgipExtra 传递。
+        let submit = UnifiedMessage::Submit(UnifiedSubmit {
+            src: Address::plain(sp_number),
+            dests: vec![Address::plain(dest_number)],
+            content: content.as_bytes().to_vec(),
+            // msg_fmt=15(GBK)：旧版用 GBK 发 ASCII 文本，内容仍是原始字节。
+            encoding: rsms_model::Encoding::Gbk,
+            want_report: true, // report_flag=1
+            concat: None,
+            extra: ProtocolExtra::Sgip(SgipExtra {
+                charge_number: sp_number.to_string(),
+                service_type: "SMS".to_string(),
+                fee_type: 2,
+                fee_value: "000000".to_string(),
+                given_value: "000000".to_string(),
+                ..Default::default()
+            }),
+            tlvs: vec![],
+        });
+        let bytes = SgipAdapter.encode(&submit, self.next_sgip_seq()).expect("encode submit");
+        RawPdu::from(bytes)
     }
 
     pub fn build_unbind_pdu(&self) -> RawPdu {
-        let unbind = rsms_codec_sgip::Unbind;
-
-        let body_bytes = {
-            let mut buf = bytes::BytesMut::new();
-            unbind.encode(&mut buf).unwrap();
-            buf.to_vec()
-        };
-
-        let total_len = (20 + body_bytes.len()) as u32;
-        let seq_num = self.next_seq();
-
-        let mut pdu = Vec::new();
-        pdu.extend_from_slice(&total_len.to_be_bytes());
-        pdu.extend_from_slice(&(rsms_codec_sgip::CommandId::Unbind as u32).to_be_bytes());
-        pdu.extend_from_slice(&1u32.to_be_bytes());
-        pdu.extend_from_slice(&0x04051200u32.to_be_bytes());
-        pdu.extend_from_slice(&seq_num.to_be_bytes());
-        pdu.extend(body_bytes);
-
-        pdu.into()
+        let bytes = SgipAdapter
+            .encode(&UnifiedMessage::Unbind, self.next_sgip_seq())
+            .expect("encode unbind");
+        RawPdu::from(bytes)
     }
 
     pub fn is_connected(&self) -> bool {
@@ -315,52 +273,34 @@ impl ClientHandler for TestClientHandler {
     }
 
     async fn on_inbound(&self, ctx: &rsms_connector::client::ClientContext<'_>, frame: &Frame) -> Result<()> {
-        let pdu = frame.data_as_slice();
-        if pdu.len() < 20 {
-            return Ok(());
-        }
+        let unified = match SgipAdapter.decode(frame) {
+            Ok(m) => m,
+            Err(_) => return Ok(()),
+        };
 
-        let cmd_id = frame.command_id;
-
-        match cmd_id {
-            x if x == rsms_codec_sgip::CommandId::BindResp as u32 => {
-                let result = u32::from_be_bytes([pdu[20], pdu[21], pdu[22], pdu[23]]);
-                *self.bind_resp_status.lock().unwrap() = Some(result);
-                if result == 0 {
+        match unified {
+            UnifiedMessage::BindResp(resp) => {
+                *self.bind_resp_status.lock().unwrap() = Some(resp.status);
+                if resp.status == 0 {
                     self.connected.store(true, Ordering::Relaxed);
                 }
             }
-            x if x == rsms_codec_sgip::CommandId::SubmitResp as u32 => {
-                let result = u32::from_be_bytes([pdu[20], pdu[21], pdu[22], pdu[23]]);
-                *self.submit_resp_status.lock().unwrap() = Some(result);
+            UnifiedMessage::SubmitResp(resp) => {
+                *self.submit_resp_status.lock().unwrap() = Some(resp.status);
             }
-            x if x == rsms_codec_sgip::CommandId::Deliver as u32 => {
+            UnifiedMessage::Deliver(d) => {
                 self.deliver_count.fetch_add(1, Ordering::Relaxed);
-                if let Ok(msg) = rsms_codec_sgip::decode_message(pdu) {
-                    if let rsms_codec_sgip::SgipMessage::Deliver(d) = msg {
-                        let content = String::from_utf8_lossy(&d.message_content);
-                        if content.contains("id:") {
-                            self.report_count.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
+                // 旧版状态报告以 "id:" 文本承载在 Deliver 内容里，语义保持不变。
+                let content = String::from_utf8_lossy(&d.content);
+                if content.contains("id:") {
+                    self.report_count.fetch_add(1, Ordering::Relaxed);
                 }
-                let resp = rsms_codec_sgip::DeliverResp { result: 0 };
-                let body_bytes = {
-                    let mut buf = bytes::BytesMut::new();
-                    resp.encode(&mut buf).unwrap();
-                    buf.to_vec()
-                };
-                let total_len = (20 + body_bytes.len()) as u32;
-                let mut resp_pdu = Vec::new();
-                resp_pdu.extend_from_slice(&total_len.to_be_bytes());
-                resp_pdu.extend_from_slice(&(rsms_codec_sgip::CommandId::DeliverResp as u32).to_be_bytes());
-                resp_pdu.extend_from_slice(&1u32.to_be_bytes());
-                resp_pdu.extend_from_slice(&0x04051200u32.to_be_bytes());
-                resp_pdu.extend_from_slice(&frame.sequence_id.to_be_bytes());
-                resp_pdu.extend(body_bytes);
-                ctx.conn.write_frame(resp_pdu.as_slice()).await?;
+                // 回 DeliverResp：序列用 sequence_of 回显请求复合序列。
+                let bytes =
+                    SgipAdapter.encode(&UnifiedMessage::DeliverResp, SgipAdapter.sequence_of(frame))?;
+                ctx.conn.write_frame(bytes.as_slice()).await?;
             }
-            x if x == rsms_codec_sgip::CommandId::UnbindResp as u32 => {
+            UnifiedMessage::UnbindResp => {
                 self.unbind_resp_received.store(true, Ordering::Relaxed);
             }
             _ => {}
@@ -430,67 +370,42 @@ pub async fn start_test_server_with_pool(
     Ok((port, pool_clone, handle))
 }
 
+/// 构造 MO 上行 Deliver（统一模型）。decode 对称：src=sp_number, dest=user_number。
 pub fn build_deliver_mo(seq_id: u32, user_number: &str, sp_number: &str, content: &str) -> RawPdu {
-    let mut deliver = rsms_codec_sgip::Deliver::new();
-    deliver.user_number = user_number.to_string();
-    deliver.sp_number = sp_number.to_string();
-    deliver.tppid = 0;
-    deliver.tpudhi = 0;
-    deliver.msg_fmt = 15;
-    deliver.message_content = content.as_bytes().to_vec();
-    deliver.reserve = [0u8; 8];
-
-    let body_bytes = {
-        let mut buf = bytes::BytesMut::new();
-        deliver.encode(&mut buf).unwrap();
-        buf.to_vec()
-    };
-
-    let total_len = (20 + body_bytes.len()) as u32;
-
-    let mut pdu = Vec::new();
-    pdu.extend_from_slice(&total_len.to_be_bytes());
-    pdu.extend_from_slice(&(rsms_codec_sgip::CommandId::Deliver as u32).to_be_bytes());
-    pdu.extend_from_slice(&1u32.to_be_bytes());
-    pdu.extend_from_slice(&0x04051200u32.to_be_bytes());
-    pdu.extend_from_slice(&seq_id.to_be_bytes());
-    pdu.extend(body_bytes);
-
-    pdu.into()
+    let deliver = UnifiedMessage::Deliver(UnifiedDeliver {
+        src: Address::plain(sp_number),
+        dest: Address::plain(user_number),
+        content: content.as_bytes().to_vec(),
+        // msg_fmt=15(GBK)：内容是 ASCII 文本字节，用 GBK 保字节一致（与原测试相同）。
+        encoding: rsms_model::Encoding::Gbk,
+        concat: None,
+        extra: ProtocolExtra::Sgip(SgipExtra::default()),
+        tlvs: vec![],
+    });
+    let seq = Sequence::Sgip { node_id: SGIP_NODE_ID, timestamp: SGIP_TIMESTAMP, number: seq_id };
+    RawPdu::from(SgipAdapter.encode(&deliver, seq).expect("encode deliver(MO)"))
 }
 
-pub fn build_deliver_report(seq_id: u32, _submit_seq: &rsms_codec_sgip::SgipSequence, dest_id: &str) -> RawPdu {
+/// 构造「以 Deliver 承载的状态报告」（旧测试约定：内容含 "id:" 文本）。
+/// 注意：这并非 SGIP 独立 Report 命令，而是测试用文本约定，仍走 Deliver。
+/// （迁移后移除了原 `_submit_seq: &SgipSequence` 死参数——它从未被使用，且是最后一处裸 codec 引用。）
+pub fn build_deliver_report(seq_id: u32, dest_id: &str) -> RawPdu {
     let report_content = format!(
         "id:{:02x?}{:02x?}{:02x?}{:02x?}{:02x?}{:02x?}{:02x?}{:02x?} sub:001 dlvrd:001 submit date:26010100 done date:26010100 stat:DELIVRD err:000",
         0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 1u8
     );
 
-    let mut deliver = rsms_codec_sgip::Deliver::new();
-    deliver.user_number = "".to_string();
-    deliver.sp_number = dest_id.to_string();
-    deliver.tppid = 0;
-    deliver.tpudhi = 0;
-    deliver.msg_fmt = 15;
-    deliver.message_content = report_content.as_bytes().to_vec();
-    deliver.reserve = [0u8; 8];
-
-    let body_bytes = {
-        let mut buf = bytes::BytesMut::new();
-        deliver.encode(&mut buf).unwrap();
-        buf.to_vec()
-    };
-
-    let total_len = (20 + body_bytes.len()) as u32;
-
-    let mut pdu = Vec::new();
-    pdu.extend_from_slice(&total_len.to_be_bytes());
-    pdu.extend_from_slice(&(rsms_codec_sgip::CommandId::Deliver as u32).to_be_bytes());
-    pdu.extend_from_slice(&1u32.to_be_bytes());
-    pdu.extend_from_slice(&0x04051200u32.to_be_bytes());
-    pdu.extend_from_slice(&seq_id.to_be_bytes());
-    pdu.extend(body_bytes);
-
-    pdu.into()
+    let deliver = UnifiedMessage::Deliver(UnifiedDeliver {
+        src: Address::plain(dest_id),
+        dest: Address::plain(String::new()),
+        content: report_content.as_bytes().to_vec(),
+        encoding: rsms_model::Encoding::Gbk,
+        concat: None,
+        extra: ProtocolExtra::Sgip(SgipExtra::default()),
+        tlvs: vec![],
+    });
+    let seq = Sequence::Sgip { node_id: SGIP_NODE_ID, timestamp: SGIP_TIMESTAMP, number: seq_id };
+    RawPdu::from(SgipAdapter.encode(&deliver, seq).expect("encode deliver(report)"))
 }
 
 async fn get_conn_from_pool(pool: &Arc<rsms_connector::ConnectionPool>) -> Option<Arc<rsms_connector::Connection>> {
@@ -805,9 +720,8 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let submit_seq = rsms_codec_sgip::SgipSequence::new(1, 0x04051200, 1);
         if let Some(server_conn) = get_conn_from_pool(&pool).await {
-            let deliver_pdu = build_deliver_report(101, &submit_seq, account);
+            let deliver_pdu = build_deliver_report(101, account);
             server_conn.write_frame(deliver_pdu.as_bytes()).await.expect("send deliver report");
         }
 

@@ -6,9 +6,12 @@ use rsms_connector::{
 };
 use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler, ClientConnection};
 use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Frame, Result};
-use rsms_codec_smgp::{
-    decode_message, SmgpMessage, Pdu, CommandId, Login,
-    compute_login_auth,
+// 窄腰统一模型：编解码统一走 SmgpAdapter + UnifiedMessage。
+use rsms_codec_smgp::adapter::SmgpAdapter;
+use rsms_codec_smgp::compute_login_auth;
+use rsms_model::{
+    Address, BindMode, Encoding, ProtocolAdapter, ProtocolExtra, Sequence,
+    UnifiedBind, UnifiedMessage, UnifiedSubmit,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -81,7 +84,7 @@ impl TestClientHandler {
 impl ClientHandler for TestClientHandler {
     fn name(&self) -> &'static str { "test-client" }
     async fn on_inbound(&self, _ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        if frame.command_id == CommandId::SubmitResp as u32 {
+        if let Ok(UnifiedMessage::SubmitResp(_)) = SmgpAdapter.decode(frame) {
             self.submit_resp_count.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
@@ -90,40 +93,42 @@ impl ClientHandler for TestClientHandler {
 
 fn build_login_pdu(client_id: &str, password: &str) -> RawPdu {
     let timestamp = 0u32;
-    let authenticator = compute_login_auth(client_id, password, timestamp);
-    let login = Login {
+    // compute_login_auth 保留：鉴权 MD5 非 codec 范畴。
+    let authenticator = compute_login_auth(client_id, password, timestamp).to_vec();
+    let bind = UnifiedMessage::Bind(UnifiedBind {
         client_id: client_id.to_string(),
         authenticator,
-        login_mode: 0,
         timestamp,
         version: 0x30,
-    };
-    let pdu: Pdu = login.into();
-    pdu.to_pdu_bytes(1)
+        system_type: None,
+        mode: BindMode::default(),
+        login_mode: Some(0),
+    });
+    let bytes = SmgpAdapter.encode(&bind, Sequence::Plain(1)).expect("encode login");
+    RawPdu::from(bytes)
 }
 
 fn build_submit_pdu(src: &str, dst: &str, content: &str, seq: u32) -> RawPdu {
-    let submit = rsms_codec_smgp::Submit {
-        msg_type: 6,
-        need_report: 1,
-        priority: 0,
-        service_id: "SMS".to_string(),
-        fee_type: "01".to_string(),
-        fee_code: "0".to_string(),
-        fixed_fee: "0".to_string(),
-        msg_fmt: 15,
-        valid_time: "".to_string(),
-        at_time: "".to_string(),
-        src_term_id: src.to_string(),
-        charge_term_id: "".to_string(),
-        dest_term_id_count: 1,
-        dest_term_ids: vec![dst.to_string()],
-        msg_content: content.as_bytes().to_vec(),
-        reserve: [0u8; 8],
-        optional_params: rsms_codec_smgp::datatypes::tlv::OptionalParameters::new(),
-    };
-    let pdu: Pdu = submit.into();
-    pdu.to_pdu_bytes(seq)
+    // 原 msg_fmt=15(GBK)→Encoding::Gbk；msg_type/service_id/fee 等方言字段走 ProtocolExtra::Smgp。
+    let submit = UnifiedMessage::Submit(UnifiedSubmit {
+        src: Address::plain(src),
+        dests: vec![Address::plain(dst)],
+        content: content.as_bytes().to_vec(),
+        encoding: Encoding::Gbk,
+        want_report: true,
+        concat: None,
+        extra: ProtocolExtra::Smgp(rsms_model::SmgpExtra {
+            msg_type: 6,
+            service_id: "SMS".to_string(),
+            fee_type: "01".to_string(),
+            fee_code: "0".to_string(),
+            fixed_fee: "0".to_string(),
+            ..Default::default()
+        }),
+        tlvs: vec![],
+    });
+    let bytes = SmgpAdapter.encode(&submit, Sequence::Plain(seq)).expect("encode submit");
+    RawPdu::from(bytes)
 }
 
 async fn start_server(

@@ -6,8 +6,13 @@ use rsms_connector::{
 };
 use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler, ClientConnection};
 use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Frame, Result};
-use rsms_codec_cmpp::{Pdu, Connect, Submit, CommandId};
+// 窄腰统一模型：Connect/Submit 构造与客户端收包分支经 CmppAdapter。compute_connect_auth 保留。
+use rsms_codec_cmpp::adapter::CmppAdapter;
 use rsms_codec_cmpp::auth::compute_connect_auth;
+use rsms_model::{
+    Address, CmppExtra, Encoding, ProtocolAdapter, ProtocolExtra, Sequence, UnifiedBind,
+    UnifiedMessage, UnifiedSubmit,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::time::{Duration, Instant};
@@ -81,7 +86,8 @@ impl TestClientHandler {
 impl ClientHandler for TestClientHandler {
     fn name(&self) -> &'static str { "test-client" }
     async fn on_inbound(&self, _ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        if frame.command_id == CommandId::SubmitResp as u32 {
+        // 统一模型分支：仅统计 SubmitResp。
+        if let Ok(UnifiedMessage::SubmitResp(_)) = CmppAdapter.decode(frame) {
             self.submit_resp_count.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
@@ -95,44 +101,41 @@ fn build_connect_pdu(source_addr: &str, password: &str, version: u8) -> RawPdu {
         .as_secs();
     let timestamp = (now % 100000) as u32;
     let authenticator = compute_connect_auth(source_addr, password, timestamp);
-    let connect = Connect {
-        source_addr: source_addr.to_string(),
-        authenticator_source: authenticator,
-        version,
+    let bind = UnifiedMessage::Bind(UnifiedBind {
+        client_id: source_addr.to_string(),
+        authenticator: authenticator.to_vec(),
         timestamp,
-    };
-    let pdu: Pdu = connect.into();
-    RawPdu::from_vec(pdu.to_pdu_bytes(1).to_vec())
+        version,
+        system_type: None,
+        mode: rsms_model::BindMode::default(),
+        login_mode: None,
+    });
+    let bytes = CmppAdapter.encode(&bind, Sequence::Plain(1)).expect("encode bind");
+    RawPdu::from_vec(bytes)
 }
 
 fn build_submit_pdu(src_id: &str, dest_id: &str, content: &str, sequence_id: u32) -> RawPdu {
-    let submit = Submit {
-        msg_id: [0u8; 8],
-        pk_total: 1,
-        pk_number: 1,
-        registered_delivery: 1,
-        msg_level: 0,
-        service_id: "SMS".to_string(),
-        fee_user_type: 0,
-        fee_terminal_id: "".to_string(),
-        fee_terminal_type: 0,
-        tppid: 0,
-        tpudhi: 0,
-        msg_fmt: 15,
-        msg_src: "900001".to_string(),
-        fee_type: "01".to_string(),
-        fee_code: "0".to_string(),
-        valid_time: "".to_string(),
-        at_time: "".to_string(),
-        src_id: src_id.to_string(),
-        dest_usr_tl: 1,
-        dest_terminal_ids: vec![dest_id.to_string()],
-        dest_terminal_type: 0,
-        msg_content: content.as_bytes().to_vec(),
-        link_id: "".to_string(),
-    };
-    let pdu: Pdu = submit.into();
-    RawPdu::from_vec(pdu.to_pdu_bytes(sequence_id).to_vec())
+    // 统一 Submit（want_report=true 对应 registered_delivery=1，encoding=Gbk 对应 msg_fmt=15）。
+    let submit = UnifiedMessage::Submit(UnifiedSubmit {
+        src: Address::plain(src_id),
+        dests: vec![Address::plain(dest_id)],
+        content: content.as_bytes().to_vec(),
+        encoding: Encoding::Gbk,
+        want_report: true,
+        concat: None,
+        extra: ProtocolExtra::Cmpp(CmppExtra {
+            pk_total: 1,
+            pk_number: 1,
+            service_id: "SMS".to_string(),
+            msg_src: "900001".to_string(),
+            fee_type: "01".to_string(),
+            fee_code: "0".to_string(),
+            ..Default::default()
+        }),
+        tlvs: vec![],
+    });
+    let bytes = CmppAdapter.encode(&submit, Sequence::Plain(sequence_id)).expect("encode submit");
+    RawPdu::from_vec(bytes)
 }
 
 async fn start_server(
