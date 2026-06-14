@@ -6,8 +6,9 @@
 
 use crate::datatypes::{
     CmppVersion, CommandId, Connect, ConnectResp, Deliver, DeliverResp, Submit, SubmitResp,
+    SubmitV20,
 };
-use crate::message::{decode_message, encode_message, CmppMessage};
+use crate::message::{decode_message, decode_message_with_version, encode_message, CmppMessage};
 use rsms_core::{Frame, Protocol, Result, RsmsError};
 use rsms_model::{
     Address, CmppExtra, Concat, DeliveryStatus, Encoding, MessageId, ProtocolAdapter,
@@ -91,6 +92,40 @@ fn submit_v30_to_unified(s: Submit) -> UnifiedSubmit {
             at_time: s.at_time,
             dest_terminal_type: s.dest_terminal_type,
             link_id: s.link_id,
+            version: 0x30,
+        }),
+        tlvs: vec![],
+    }
+}
+
+/// V2.0 Submit → 统一模型。V2.0 比 V3.0 少 fee_terminal_type/dest_terminal_type/link_id；
+/// 这些字段在 CmppExtra 取默认。version 标记为 0x20，供 encode 回产 SubmitV20。
+fn submit_v20_to_unified(s: SubmitV20) -> UnifiedSubmit {
+    let (concat, content) = split_udh(s.tpudhi, s.msg_content);
+    UnifiedSubmit {
+        src: Address::plain(s.src_id),
+        dests: s.dest_terminal_ids.into_iter().map(Address::plain).collect(),
+        content,
+        encoding: encoding_from_fmt(s.msg_fmt),
+        want_report: s.registered_delivery != 0,
+        concat,
+        extra: ProtocolExtra::Cmpp(CmppExtra {
+            msg_id: s.msg_id,
+            pk_total: s.pk_total,
+            pk_number: s.pk_number,
+            msg_level: s.msg_level,
+            service_id: s.service_id,
+            fee_user_type: s.fee_user_type,
+            fee_terminal_id: s.fee_terminal_id,
+            tppid: s.tppid,
+            tpudhi: s.tpudhi,
+            msg_src: s.msg_src,
+            fee_type: s.fee_type,
+            fee_code: s.fee_code,
+            valid_time: s.valid_time,
+            at_time: s.at_time,
+            version: 0x20,
+            ..Default::default()
         }),
         tlvs: vec![],
     }
@@ -159,11 +194,11 @@ fn cmpp_to_unified(msg: CmppMessage) -> UnifiedMessage {
         CmppMessage::Unknown { command_id, body, .. } => {
             UnifiedMessage::Unknown { command_id, raw: body }
         }
-        // V2.0 Submit/Deliver、Query/Cancel 等本轮退化为 Unknown（仅 shadow 日志可见），保留真实
+        // V2.0 Submit → 统一模型（仅当经版本感知路径 decode_with_version(V20) 解出时才会到达；
+        // 默认 decode 走 V3.0、不产生 SubmitV20）。
+        CmppMessage::SubmitV20 { submit, .. } => UnifiedMessage::Submit(submit_v20_to_unified(submit)),
+        // Deliver V2.0、Query/Cancel 等本轮退化为 Unknown（仅 shadow 日志可见），保留真实
         // command_id 便于诊断；match 改为穷尽，未来新增变体触发编译错误而非静默归零。
-        CmppMessage::SubmitV20 { .. } => {
-            UnifiedMessage::Unknown { command_id: CommandId::Submit as u32, raw: vec![] }
-        }
         CmppMessage::DeliverV20 { .. } => {
             UnifiedMessage::Unknown { command_id: CommandId::Deliver as u32, raw: vec![] }
         }
@@ -192,33 +227,60 @@ fn unified_to_cmpp(msg: &UnifiedMessage, seq: Sequence) -> Result<CmppMessage> {
                 ProtocolExtra::Cmpp(e) => e.clone(),
                 _ => CmppExtra::default(),
             };
-            let mut sub = Submit::new();
-            sub.msg_id = extra.msg_id;
-            sub.pk_total = extra.pk_total;
-            sub.pk_number = extra.pk_number;
-            sub.registered_delivery = if s.want_report { 1 } else { 0 };
-            sub.msg_level = extra.msg_level;
-            sub.service_id = extra.service_id;
-            sub.fee_user_type = extra.fee_user_type;
-            sub.fee_terminal_id = extra.fee_terminal_id;
-            sub.fee_terminal_type = extra.fee_terminal_type;
-            sub.tppid = extra.tppid;
-            sub.msg_fmt = fmt_from_encoding(s.encoding);
-            sub.msg_src = extra.msg_src;
-            sub.fee_type = extra.fee_type;
-            sub.fee_code = extra.fee_code;
-            sub.valid_time = extra.valid_time;
-            sub.at_time = extra.at_time;
-            sub.src_id = s.src.number.clone();
-            sub.dest_usr_tl = s.dests.len() as u8;
-            sub.dest_terminal_ids = s.dests.iter().map(|a| a.number.clone()).collect();
-            sub.dest_terminal_type = extra.dest_terminal_type;
             // 有 concat 则前置级联 UDH 到正文并置 tp_udhi=1；否则正文原样、tp_udhi 沿用 extra。
             let (udh_body, tpudhi) = join_udh(&s.concat, &s.content, extra.tpudhi);
-            sub.tpudhi = tpudhi;
-            sub.msg_content = udh_body;
-            sub.link_id = extra.link_id;
-            CmppMessage::SubmitV30 { sequence_id: seq, submit: sub }
+            // version=0x20 产 SubmitV20（V2.0 比 V3.0 少 fee_terminal_type/dest_terminal_type/link_id）；
+            // 否则（0/0x30）产 SubmitV30。
+            if extra.version == 0x20 {
+                let mut sub = SubmitV20::new();
+                sub.msg_id = extra.msg_id;
+                sub.pk_total = extra.pk_total;
+                sub.pk_number = extra.pk_number;
+                sub.registered_delivery = if s.want_report { 1 } else { 0 };
+                sub.msg_level = extra.msg_level;
+                sub.service_id = extra.service_id;
+                sub.fee_user_type = extra.fee_user_type;
+                sub.fee_terminal_id = extra.fee_terminal_id;
+                sub.tppid = extra.tppid;
+                sub.tpudhi = tpudhi;
+                sub.msg_fmt = fmt_from_encoding(s.encoding);
+                sub.msg_src = extra.msg_src;
+                sub.fee_type = extra.fee_type;
+                sub.fee_code = extra.fee_code;
+                sub.valid_time = extra.valid_time;
+                sub.at_time = extra.at_time;
+                sub.src_id = s.src.number.clone();
+                sub.dest_usr_tl = s.dests.len() as u8;
+                sub.dest_terminal_ids = s.dests.iter().map(|a| a.number.clone()).collect();
+                sub.msg_content = udh_body;
+                CmppMessage::SubmitV20 { sequence_id: seq, submit: sub }
+            } else {
+                let mut sub = Submit::new();
+                sub.msg_id = extra.msg_id;
+                sub.pk_total = extra.pk_total;
+                sub.pk_number = extra.pk_number;
+                sub.registered_delivery = if s.want_report { 1 } else { 0 };
+                sub.msg_level = extra.msg_level;
+                sub.service_id = extra.service_id;
+                sub.fee_user_type = extra.fee_user_type;
+                sub.fee_terminal_id = extra.fee_terminal_id;
+                sub.fee_terminal_type = extra.fee_terminal_type;
+                sub.tppid = extra.tppid;
+                sub.msg_fmt = fmt_from_encoding(s.encoding);
+                sub.msg_src = extra.msg_src;
+                sub.fee_type = extra.fee_type;
+                sub.fee_code = extra.fee_code;
+                sub.valid_time = extra.valid_time;
+                sub.at_time = extra.at_time;
+                sub.src_id = s.src.number.clone();
+                sub.dest_usr_tl = s.dests.len() as u8;
+                sub.dest_terminal_ids = s.dests.iter().map(|a| a.number.clone()).collect();
+                sub.dest_terminal_type = extra.dest_terminal_type;
+                sub.tpudhi = tpudhi;
+                sub.msg_content = udh_body;
+                sub.link_id = extra.link_id;
+                CmppMessage::SubmitV30 { sequence_id: seq, submit: sub }
+            }
         }
         UnifiedMessage::SubmitResp(r) => {
             let mut msg_id = [0u8; 8];
@@ -317,6 +379,19 @@ impl ProtocolAdapter for CmppAdapter {
     fn encode(&self, msg: &UnifiedMessage, seq: Sequence) -> Result<Vec<u8>> {
         let cmpp = unified_to_cmpp(msg, seq)?;
         encode_message(&cmpp)
+    }
+}
+
+impl CmppAdapter {
+    /// 版本感知解码：CMPP V2.0/V3.0 命令字相同、仅字段布局不同，单凭字节无法区分，须由握手协商的
+    /// `version` 决定。trait 的 `decode` 默认按 V3.0；V2.0 连接的解码方应调用本方法传入 `CmppVersion::V20`。
+    pub fn decode_with_version(
+        &self,
+        frame: &Frame,
+        version: CmppVersion,
+    ) -> Result<UnifiedMessage> {
+        let msg = decode_message_with_version(frame.data_as_slice(), Some(version as u8))?;
+        Ok(cmpp_to_unified(msg))
     }
 }
 
@@ -517,5 +592,40 @@ mod tests {
             }
             other => panic!("expected Report, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn submit_v20_roundtrip_via_unified() {
+        // V2.0：CmppExtra.version=0x20 时 encode 产 SubmitV20；decode_with_version(V20) 还原为
+        // UnifiedMessage::Submit（而非 Unknown），且字节往返无损。CMPP V2.0/V3.0 命令字相同、
+        // 仅靠握手 version 区分，故解码用版本感知的固有方法 decode_with_version。
+        let submit = UnifiedMessage::Submit(UnifiedSubmit {
+            src: Address::plain("10086"),
+            dests: vec![Address::plain("13800138000")],
+            content: b"hi".to_vec(),
+            encoding: Encoding::Gbk,
+            want_report: true,
+            concat: None,
+            extra: ProtocolExtra::Cmpp(CmppExtra { version: 0x20, ..Default::default() }),
+            tlvs: vec![],
+        });
+        let bytes = CmppAdapter.encode(&submit, Sequence::Plain(7)).unwrap();
+        let unified = CmppAdapter
+            .decode_with_version(&frame_of(bytes.clone()), CmppVersion::V20)
+            .unwrap();
+        match &unified {
+            UnifiedMessage::Submit(u) => {
+                assert_eq!(u.src.number, "10086");
+                assert_eq!(u.dests[0].number, "13800138000");
+                assert_eq!(u.content, b"hi");
+                match &u.extra {
+                    ProtocolExtra::Cmpp(e) => assert_eq!(e.version, 0x20, "version 应透出为 V2.0"),
+                    _ => panic!("extra 应为 Cmpp"),
+                }
+            }
+            other => panic!("expected Submit, got {other:?}"),
+        }
+        let reencoded = CmppAdapter.encode(&unified, Sequence::Plain(7)).unwrap();
+        assert_eq!(reencoded, bytes, "V2.0 Submit 经统一模型往返字节应无损一致");
     }
 }

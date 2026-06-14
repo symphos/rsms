@@ -276,6 +276,9 @@ pub struct CmppExtra {
     pub at_time: String,
     pub dest_terminal_type: u8,
     pub link_id: String,
+    /// CMPP 协议版本字节：`0x20`=V2.0、`0x30`=V3.0、`0`(默认)按 V3.0 处理。
+    /// encode 据此选 SubmitV20/SubmitV30；decode 由版本感知路径填入。
+    pub version: u8,
 }
 
 #[cfg(test)]
