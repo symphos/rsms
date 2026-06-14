@@ -332,7 +332,38 @@ P1 的 window/decode/flush/锁/去拷贝改动均验证正确。但审查追查�
 ### 阶段 4 收官小结（2026-06-13）
 二轮架构研究发现的缺陷处理完毕：**4A 全 6 项修复**（连接泄漏/除零/分段超长/死代码/Merger OOM/编码截断），**4B** 完成 4B.1（pending drain）/4B.3（protocol enum）/4B.4（RawPdu doc），**4C** 完成 4C.1（容量预留），**4D** 完成 4D.1（doc）+ 死代码清理。**暂缓项**（均经源码核实前提/收益不足，仿阶段 2.4）：4B.2（账号回收竞态）、4B.5（帧层不依赖 CodecError 判半包）、4C.2/4C.4/4C.5/4C.6（无 profile 的微优化）、4C.3（agent 误报）、4D.2（去重不彻底）。全程 TDD + 单测/集成/clippy 零警告 + 四协议压测零丢失/TPS 一致。
 
-### 决策点（待确认）
-- **4B.3 protocol enum**：是否接受对外 API 破坏性变更（builder 已重构过，迁移成本可控）？
-- **4A.4 删除 cache**：确认 workspace 外无第三方依赖该 pub 类型。
-- **推进顺序**：建议 4A 全修 → 评审 → 再决定 4B/4C/4D。
+### 决策点（已确认 2026-06-13/14）
+- **4B.3 protocol enum**：✅ 已接受并落地（`EndpointConfig.protocol: String → Protocol`，见 4B.3 实施记录）。
+- **4A.4 删除 cache**：✅ 已删除（workspace 内零引用，确认无第三方依赖该 pub 类型）。
+- **推进顺序**：✅ 4A 全修 → 评审 → 4B/4C/4D 按收益取舍执行完毕。
+
+---
+
+## 阶段 5（P5）：窄腰统一模型升为业务主路径 ✅ 已落地（2026-06-14，PR #1/#2/#3 已合入 main）
+
+> 承接 `docs/superpowers/specs/` 的「统一消息模型 / 协议窄腰」设计。README 旧标注「设计与试点验证阶段、**尚未落地**」**已不成立**——本阶段将其升为**业务主路径并全量迁移**，README/docs 已同步。
+
+### 5.1 ✅ 核心契约与四协议适配器
+- 新增 `rsms-model` crate：`UnifiedMessage`（Submit/SubmitResp/Deliver/Report/Bind/BindResp/Ping/Unbind/Unknown…）、`ProtocolAdapter` trait、协议无关类型（`Address`/`MessageId`/`Encoding`/`Sequence`/`ProtocolExtra`/`Tlv`）。
+- 四协议 adapter（`rsms_codec_<proto>::adapter::<Proto>Adapter`）实现 decode（Frame→UnifiedMessage）/encode（UnifiedMessage→字节）+ `sequence_of(frame)`（SGIP 复合序列 `Sequence::Sgip` 由此保留）；各补字节往返测试。
+- `rsms_connector::adapter_registry::adapter_for(Protocol)` 按枚举动态取适配器。
+
+### 5.2 ✅ 与 Java cmos(SMSGate) 联调 + 修 5 个服务端真 bug
+> rsms↔rsms 同 codec 对称测不出，仅第三方客户端能暴露。
+- **connector**：accept 后未 `mark_connected` → 服务端 MO/回执从不下发（通用，惠及四协议）。
+- **smpp**：BindResp `sc_interface_version` 编成裸字节 → 应为可选 TLV(0x0210)；dcs 0x08(UCS2) 未映射。
+- **sgip**：Submit/Deliver/Report_Resp 改 Result(1B)+Reserve(8B)=9B；msg_fmt 4/8 编码弄反已纠正。
+- **smgp**：Exit_Resp 多 1 保留字节 → 合规 12B 空体。
+- **cmpp**：Connect 鉴权与状态报告二进制解析对齐 cmos。
+
+### 5.3 ✅ 全量迁移 example + test
+- 8 个 example（四协议 server/client）全改统一模型，零裸 codec。
+- 全部 tests（集成/压测/longmsg/动态）迁统一模型；按协议能力边界保留少量裸 codec（CMPP 2.0 版本化 decode、SMPP `command_status`、SGIP Report_Resp 经 `Unknown`），均注释说明。
+- 修迁移暴露的 **SGIP 压测 future 非 Send**：Report 分支 std 锁（edition 2024 下）进 async 协程 witness 跨 await → 锁操作收进同步块、await 前全部释放。
+
+### 5.4 验证
+- `cargo build`/`clippy` 全 workspace + `rsms-tests` 包零告警零错误。
+- 四协议 integration + longmsg + 事务 ~98 测试全过。
+- 8 个 stress 目标实跑零丢失（多账号 60s 各 76 万+ 全链路，Sent=Received=MsgId Matched、Pending=0）；300s 全程 TPS ~12,500+ 不退化。
+
+> **工具链补记**：阶段 0 记录的 rustc 1.94.0 ICE 经本轮定位为 **`annotate_snippets` 渲染器**对「async 协程 Send 多 span 诊断」渲染时切片越界（`StyledBuffer::replace`）。除 `RUSTFLAGS='--cap-lints allow'` 外，**`cargo … --message-format=short` 可避开该渲染器**、拿到真实错误 headline（短格式不渲染源码片段）。
