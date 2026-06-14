@@ -22,6 +22,40 @@ pub struct Frame { ... }       // 解析后的帧（command_id + sequence_id + d
 - `RawPdu`：协议编码后的原始字节，用于 `write_frame()` 发送
 - `Frame`：解码后的帧结构，用于 `on_inbound()` 接收
 
+### 窄腰统一模型（UnifiedMessage + ProtocolAdapter）—— 推荐主路径
+
+业务代码无需直接接触各协议的裸 codec 类型（`Submit`/`Deliver`/`decode_message` 等），
+统一用协议无关的 `rsms_model::UnifiedMessage` + 每协议的 `ProtocolAdapter` 收发：
+
+```rust
+use rsms_model::{ProtocolAdapter, UnifiedMessage, UnifiedSubmitResp, MessageId};
+use rsms_codec_cmpp::adapter::CmppAdapter;   // 各协议：rsms_codec_<proto>::adapter::<Proto>Adapter
+
+// 收包：字节帧 -> 统一消息，按协议无关的枚举分支处理
+let unified = CmppAdapter.decode(frame)?;
+match unified {
+    UnifiedMessage::Submit(s)  => { /* s.src / s.dests / s.content / s.encoding / s.want_report */ }
+    UnifiedMessage::Deliver(d) => { /* MO 上行 */ }
+    UnifiedMessage::Report(r)  => { /* 状态报告（不分底层是 Deliver 还是独立 Report 命令）*/ }
+    UnifiedMessage::Ping       => { /* 心跳 */ }
+    _ => {}
+}
+
+// 发包/回执：构造统一消息 -> 字节；回复请求用 sequence_of(frame) 回显序列
+let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+    msg_id: MessageId::Binary(msg_id_bytes.to_vec()),   // SMPP 用 MessageId::Text(..)
+    status: 0,
+});
+let bytes = CmppAdapter.encode(&resp, CmppAdapter.sequence_of(frame))?;
+ctx.conn.write_frame(&bytes).await?;
+```
+
+- `ProtocolAdapter` trait 来自 `rsms_model`；四个实现：`CmppAdapter` / `SmgpAdapter` / `SmppAdapter` / `SgipAdapter`
+- 协议方言字段（CMPP/SMGP/SGIP 的 fee/service_id 等）经 `UnifiedMessage` 的 `ProtocolExtra` 携带
+- 序列号抽象为 `Sequence`：CMPP/SMGP/SMPP 为 `Sequence::Plain(u32)`，SGIP 为复合 `Sequence::Sgip{node_id,timestamp,number}`；回复一律用 `adapter.sequence_of(frame)`
+- 也可按协议枚举动态取适配器：`rsms_connector::adapter_registry::adapter_for(Protocol::Cmpp)`
+- 四协议的 `examples/` server/client 与 `tests/` 均为该模型的完整参考
+
 ### MessageSource
 
 业务方实现此 trait，提供待发送的消息。框架通过 `fetch()` 拉取消息并自动发送。
@@ -94,7 +128,12 @@ pub trait ClientHandler: Send + Sync {
 #[async_trait]
 pub trait AuthHandler: Send + Sync {
     fn name(&self) -> &'static str;
-    async fn authenticate(&self, client_id: &str, credentials: AuthCredentials) -> Result<AuthResult>;
+    async fn authenticate(
+        &self,
+        client_id: &str,
+        credentials: AuthCredentials,
+        conn_info: &ConnectionInfo,
+    ) -> Result<AuthResult>;
 }
 ```
 
@@ -105,15 +144,22 @@ use rsms_connector::{
     ServerBuilder, AuthHandler, AuthCredentials, AuthResult,
     AccountConfig, AccountConfigProvider,
 };
-use rsms_business::BusinessHandler;
-use rsms_core::{EndpointConfig, Frame, Protocol, Result};
+use rsms_business::{BusinessHandler, InboundContext};
+use rsms_core::{ConnectionInfo, EndpointConfig, Frame, Protocol, Result};
+use rsms_codec_cmpp::adapter::CmppAdapter;
+use rsms_model::{ProtocolAdapter, UnifiedMessage};
 
 // 1. 认证
 struct MyAuth;
 #[async_trait]
 impl AuthHandler for MyAuth {
     fn name(&self) -> &'static str { "my-auth" }
-    async fn authenticate(&self, _: &str, credentials: AuthCredentials) -> Result<AuthResult> {
+    async fn authenticate(
+        &self,
+        _: &str,
+        credentials: AuthCredentials,
+        _: &ConnectionInfo,
+    ) -> Result<AuthResult> {
         match credentials {
             AuthCredentials::Cmpp { source_addr, .. } => {
                 // 校验 source_addr 和 authenticator_source
@@ -124,15 +170,21 @@ impl AuthHandler for MyAuth {
     }
 }
 
-// 2. 业务处理
+// 2. 业务处理（窄腰统一模型：解码为 UnifiedMessage，按枚举分支处理）
 struct MyBiz;
 #[async_trait]
 impl BusinessHandler for MyBiz {
     fn name(&self) -> &'static str { "my-biz" }
     async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        // frame.command_id 区分消息类型
-        // frame.data_as_slice() 获取原始 PDU 字节
-        // ctx.conn.write_frame() 发送响应
+        match CmppAdapter.decode(frame)? {
+            UnifiedMessage::Submit(_s) => {
+                // 框架不会自动回 SubmitResp，业务方自行构造并发送：
+                // let resp = UnifiedMessage::SubmitResp(..);
+                // let bytes = CmppAdapter.encode(&resp, CmppAdapter.sequence_of(frame))?;
+                // ctx.conn.write_frame(&bytes).await?;
+            }
+            _ => {}
+        }
         Ok(())
     }
 }
@@ -167,7 +219,8 @@ struct MyClient;
 impl ClientHandler for MyClient {
     fn name(&self) -> &'static str { "my-client" }
     async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        // 处理服务端发来的 SubmitResp / Deliver 等
+        // 用 CmppAdapter.decode(frame)? 解为 UnifiedMessage 后分支处理
+        // （SubmitResp / Deliver / Report / PingResp 等）
         Ok(())
     }
 }
@@ -182,8 +235,9 @@ async fn main() -> Result<()> {
         // .event_handler(e)    // ClientEventHandler（可选）
         .connect().await?;
 
-    // 发送消息
-    let pdu_bytes = build_some_pdu();
+    // 发送消息：构造 UnifiedMessage 经适配器编码（CMPP 序列用 Sequence::Plain）
+    let msg = UnifiedMessage::Submit(/* UnifiedSubmit { .. } */);
+    let pdu_bytes = CmppAdapter.encode(&msg, Sequence::Plain(seq))?;
     conn.write_frame(&pdu_bytes).await?;
 
     // 或者通过 window 等待响应
@@ -201,12 +255,17 @@ async fn main() -> Result<()> {
 // 1. EndpointConfig 的 protocol（需 use rsms_core::Protocol; 或 use rsms_connector::Protocol;）
 .with_protocol(Protocol::Smpp)   // Protocol::Cmpp | Smgp | Smpp | Sgip
 
-// 2. Decoder
+// 2. 客户端 Decoder（ClientBuilder 第三参）
 SmppDecoder   // CmppDecoder | SmgpDecoder | SmppDecoder | SgipDecoder
 
-// 3. Codec 的 PDU 类型
-use rsms_codec_smpp::{BindTransmitter, SubmitSm, ...};  // 替换为对应协议的 codec
+// 3. 协议适配器（收发统一走它，不直接碰裸 codec PDU 类型）
+use rsms_codec_smpp::adapter::SmppAdapter;   // CmppAdapter | SmgpAdapter | SmppAdapter | SgipAdapter
 ```
+
+业务/收发代码本身因为只依赖协议无关的 `UnifiedMessage`，**换协议时基本不用动**——
+把上面用到的 `<Proto>Adapter` 换成目标协议的即可（编码差异如 UCS2 的 dcs/msg_fmt、
+SGIP 复合序列等都已在各 Adapter 内部处理）。`.with_protocol(...)` **必须**正确设置，
+否则 SMPP/SGIP 的 16/20 字节头部会按默认 CMPP 的 12 字节错位解析序列号。
 
 ## EndpointConfig 配置
 

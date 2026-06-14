@@ -4,7 +4,7 @@ Rust 实现的多协议短信网关框架，支持 **CMPP 2.0/3.0**、**SMGP 3.0
 
 ## 核心特性
 
-- **四协议统一抽象**：服务端/客户端 API 统一，切换协议只需改 Decoder 和 EndpointConfig
+- **四协议统一抽象（窄腰模型）**：业务只依赖协议无关的 `UnifiedMessage` + `ProtocolAdapter` 收发，切换协议基本只改 `EndpointConfig.protocol`、客户端 Decoder 和所用 Adapter
 - **高吞吐**：单账号 TPS 2500+，5 账号并发 TPS 12500+，消息零丢失
 - **动态调整**：运行时动态调整连接数上限和 QPS，自动剔除多余连接
 - **长短信**：内置长短信拆分/合包（`rsms-longmsg`），支持 8-bit 和 16-bit UDH
@@ -44,12 +44,17 @@ Rust 实现的多协议短信网关框架，支持 **CMPP 2.0/3.0**、**SMGP 3.0
                         TCP Socket
 ```
 
+> **窄腰统一模型**：业务代码不直接接触各协议裸 codec，而是经 `rsms-model` 的 `ProtocolAdapter`
+> （`CmppAdapter`/`SmgpAdapter`/`SmppAdapter`/`SgipAdapter`）在 `UnifiedMessage` ↔ 字节之间互译；
+> `rsms-codec-*` 退居适配器底层。`examples/` 与 `tests/` 均按此模型实现。
+
 ## Crate 结构
 
 | Crate | 说明 |
 |-------|------|
-| `rsms-core` | 核心类型：`Frame`、`RawPdu`、`EncodedPdu` trait、`EndpointConfig` |
-| `rsms-connector` | 连接管理：服务端 `ServerBuilder`、客户端 `ClientBuilder`、`AccountPool`、`MessageSource` |
+| `rsms-core` | 核心类型：`Frame`、`RawPdu`、`EncodedPdu` trait、`EndpointConfig`、`Protocol`、`Sequence` 入口 |
+| `rsms-model` | 窄腰统一模型：`UnifiedMessage`、`ProtocolAdapter` trait、`Sequence`、`Address`/`MessageId`/`Encoding` 等协议无关类型 |
+| `rsms-connector` | 连接管理：服务端 `ServerBuilder`、客户端 `ClientBuilder`、`AccountPool`、`MessageSource`、`adapter_registry::adapter_for` |
 | `rsms-business` | 业务处理器：`BusinessHandler` trait、`run_chain()` |
 | `rsms-codec-cmpp` | CMPP 2.0/3.0 协议编解码 |
 | `rsms-codec-smgp` | SMGP 3.0.3 协议编解码 |
@@ -101,5 +106,6 @@ Rust 实现的多协议短信网关框架，支持 **CMPP 2.0/3.0**、**SMGP 3.0
 
 ## 快速链接
 
-- 示例代码：`examples/<protocol>-endpoint/src/{server,client}.rs`
-- 压测代码：`examples/<protocol>-endpoint/tests/*stress_test.rs`
+- 示例代码：`examples/<protocol>_server/src/main.rs`、`examples/<protocol>_client/src/main.rs`（protocol = cmpp/smgp/smpp/sgip）
+- 测试代码：`tests/<protocol>/`（集成 `integration.rs`、压测 `stress_test.rs` / `multi_account_stress_test.rs` 等），统一在 `rsms-tests` 包
+- 运行测试见 [reference/01-tests.md](reference/01-tests.md)
