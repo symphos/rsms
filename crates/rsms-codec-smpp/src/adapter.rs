@@ -13,9 +13,9 @@ use crate::datatypes::{
 use crate::message::{decode_message, SmppMessage};
 use rsms_core::{Frame, Protocol, Result, RsmsError};
 use rsms_model::{
-    Address, BindMode, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra, Sequence,
-    SmppExtra, Tlv as UTlv, UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmit,
-    UnifiedSubmitResp,
+    Address, BindMode, Concat, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra,
+    Sequence, SmppExtra, Tlv as UTlv, UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedReport,
+    UnifiedSubmit, UnifiedSubmitResp,
 };
 
 /// SMPP 协议适配器。
@@ -54,7 +54,33 @@ fn tlvs_from_unified(tlvs: &[UTlv]) -> Vec<Tlv> {
     tlvs.iter().map(|t| Tlv::new(t.tag, t.value.clone())).collect()
 }
 
+/// 解码侧：esm_class 置 UDHI(0x40) 且正文以级联 UDH 开头时，剥离 UDH → (Some(concat), payload)；
+/// 否则 (None, 原正文)。
+fn split_udh(esm_class: u8, content: Vec<u8>) -> (Option<Concat>, Vec<u8>) {
+    if esm_class & 0x40 != 0 {
+        if let Some((c, off)) = Concat::from_udh(&content) {
+            return (Some(c), content[off..].to_vec());
+        }
+    }
+    (None, content)
+}
+
+/// 编码侧：有 concat 则前置级联 UDH 到正文并在 esm_class 置 UDHI(0x40)；否则原样。
+fn join_udh(concat: &Option<Concat>, content: &[u8], esm_class: u8) -> (Vec<u8>, u8) {
+    match concat {
+        Some(c) => {
+            let mut body = c.to_udh_prefix();
+            body.extend_from_slice(content);
+            (body, esm_class | 0x40)
+        }
+        None => (content.to_vec(), esm_class),
+    }
+}
+
 fn submit_to_unified(s: SubmitSm) -> UnifiedSubmit {
+    // 级联长短信：esm_class bit6(0x40)=UDHI 表示正文以 UDH 开头。剥离 UDH → concat 承载分段信息、
+    // content 为纯 payload；非 UDHI 或无有效级联 UDH 时 concat=None、content 原样。
+    let (concat, content) = split_udh(s.esm_class, s.short_message);
     UnifiedSubmit {
         src: Address {
             number: s.source_addr,
@@ -66,10 +92,10 @@ fn submit_to_unified(s: SubmitSm) -> UnifiedSubmit {
             ton: Some(s.dest_addr_ton),
             npi: Some(s.dest_addr_npi),
         }],
-        content: s.short_message,
+        content,
         encoding: encoding_from_dcs(s.data_coding),
         want_report: s.registered_delivery & 0x01 != 0,
-        concat: None,
+        concat,
         extra: ProtocolExtra::Smpp(SmppExtra {
             service_type: s.service_type,
             esm_class: s.esm_class,
@@ -101,9 +127,9 @@ fn deliver_to_unified(d: DeliverSm) -> UnifiedMessage {
             .unwrap_or_else(|| MessageId::Text(String::new()));
         UnifiedMessage::Report(UnifiedReport {
             msg_id,
-            // 注：DeliverSm 回执的 MESSAGE_STATE(0x0427)/NETWORK_ERROR_CODE 等 TLV 本轮未解析，
-            // status 暂为 Unknown，raw 仅含 short_message。精确状态解析待后续。
-            status: DeliveryStatus::Unknown,
+            // 回执正文（short_message）形如 id:.. stat:DELIVRD ..，解析 stat 段 → DeliveryStatus。
+            // 注：MESSAGE_STATE(0x0427) TLV 的数字状态本轮未用，以文本 stat 为准（cmos 等网关均带 stat 文本）。
+            status: DeliveryStatus::from_receipt_text(&d.short_message),
             // 报告源地址：从 DeliverSm 的 source_addr/ton/npi 落入统一模型，
             // encode 回报告时据此还原 DeliverSm.source_addr。
             src: Address {
@@ -115,6 +141,8 @@ fn deliver_to_unified(d: DeliverSm) -> UnifiedMessage {
             raw: d.short_message,
         })
     } else {
+        // MO 长短信分段：同 Submit，按 UDHI 剥离级联 UDH → concat。
+        let (concat, content) = split_udh(d.esm_class, d.short_message);
         UnifiedMessage::Deliver(UnifiedDeliver {
             src: Address {
                 number: d.source_addr,
@@ -122,9 +150,9 @@ fn deliver_to_unified(d: DeliverSm) -> UnifiedMessage {
                 npi: Some(d.source_addr_npi),
             },
             dest,
-            content: d.short_message,
+            content,
             encoding: encoding_from_dcs(d.data_coding),
-            concat: None,
+            concat,
             extra: ProtocolExtra::None,
             tlvs: tlvs_to_unified(&d.tlvs),
         })
@@ -156,7 +184,8 @@ fn smpp_to_unified(msg: SmppMessage) -> UnifiedMessage {
         SmppMessage::SubmitSm(s) => UnifiedMessage::Submit(submit_to_unified(s)),
         SmppMessage::SubmitSmResp(r) => UnifiedMessage::SubmitResp(UnifiedSubmitResp {
             msg_id: MessageId::Text(r.message_id),
-            status: 0,
+            // SMPP 结果码在头部 command_status，经 decode 透传到统一模型 status。
+            status: r.command_status,
         }),
         SmppMessage::DeliverSm(d) => deliver_to_unified(d),
         SmppMessage::DeliverSmResp(_) => UnifiedMessage::DeliverResp,
@@ -181,12 +210,16 @@ fn smpp_to_unified(msg: SmppMessage) -> UnifiedMessage {
             b.interface_version,
             BindMode::Transceiver,
         )),
-        // SMPP BindResp 的结果码在 PDU command_status，decode_message 读后丢弃、未透出；
-        // 本轮 BindResp.status 暂填 0（不可用 sc_interface_version 充当 status——它是服务端协议版本，非结果码）。
-        SmppMessage::BindTransmitterResp(_)
-        | SmppMessage::BindReceiverResp(_)
-        | SmppMessage::BindTransceiverResp(_) => {
-            UnifiedMessage::BindResp(rsms_model::UnifiedBindResp { status: 0 })
+        // SMPP BindResp 的结果码在 PDU command_status，经 decode 透传到统一模型 status
+        // （sc_interface_version 是服务端协议版本、非结果码，不可充当 status）。
+        SmppMessage::BindTransmitterResp(r) => {
+            UnifiedMessage::BindResp(rsms_model::UnifiedBindResp { status: r.command_status })
+        }
+        SmppMessage::BindReceiverResp(r) => {
+            UnifiedMessage::BindResp(rsms_model::UnifiedBindResp { status: r.command_status })
+        }
+        SmppMessage::BindTransceiverResp(r) => {
+            UnifiedMessage::BindResp(rsms_model::UnifiedBindResp { status: r.command_status })
         }
         SmppMessage::EnquireLink(_) => UnifiedMessage::Ping,
         SmppMessage::EnquireLinkResp(_) => UnifiedMessage::PingResp,
@@ -222,7 +255,9 @@ fn unified_to_smpp_bytes(msg: &UnifiedMessage, seq: Sequence) -> Result<Vec<u8>>
             sm.dest_addr_ton = dest.ton.unwrap_or(0);
             sm.dest_addr_npi = dest.npi.unwrap_or(0);
             sm.destination_addr = dest.number;
-            sm.esm_class = extra.esm_class;
+            // 有 concat 则前置级联 UDH 并置 esm_class UDHI(0x40)。
+            let (udh_body, esm_class) = join_udh(&s.concat, &s.content, extra.esm_class);
+            sm.esm_class = esm_class;
             sm.protocol_id = extra.protocol_id;
             sm.priority_flag = extra.priority_flag;
             sm.schedule_delivery_time = extra.schedule_delivery_time;
@@ -231,7 +266,7 @@ fn unified_to_smpp_bytes(msg: &UnifiedMessage, seq: Sequence) -> Result<Vec<u8>>
             sm.replace_if_present_flag = extra.replace_if_present_flag;
             sm.data_coding = dcs_from_encoding(s.encoding);
             sm.sm_default_msg_id = extra.sm_default_msg_id;
-            sm.short_message = s.content.clone();
+            sm.short_message = udh_body;
             sm.tlvs = tlvs_from_unified(&s.tlvs);
             Pdu::from(sm)
         }
@@ -240,7 +275,8 @@ fn unified_to_smpp_bytes(msg: &UnifiedMessage, seq: Sequence) -> Result<Vec<u8>>
                 MessageId::Text(t) => t.clone(),
                 MessageId::Binary(b) => String::from_utf8_lossy(b).into_owned(),
             };
-            Pdu::from(SubmitSmResp { message_id })
+            // 统一模型 status 写回 SubmitSmResp.command_status → to_pdu_bytes 写进头部。
+            Pdu::from(SubmitSmResp { message_id, command_status: r.status })
         }
         UnifiedMessage::DeliverResp => Pdu::from(DeliverSmResp { message_id: String::new() }),
         UnifiedMessage::Bind(b) => {
@@ -262,11 +298,14 @@ fn unified_to_smpp_bytes(msg: &UnifiedMessage, seq: Sequence) -> Result<Vec<u8>>
                 }
             }
         }
-        UnifiedMessage::BindResp(_) => {
-            // best-effort：统一模型 BindResp 仅带 status，无法区分 transceiver/transmitter/receiver resp，
-            // 默认产出 BindTransceiverResp。结果码在头部 command_status，本 codec 路径不透传 status；
-            // example 不依赖此分支，框架 AuthHandler 走 codec 直接构造响应。
-            Pdu::from(BindTransceiverResp { system_id: String::new(), sc_interface_version: 0 })
+        UnifiedMessage::BindResp(r) => {
+            // 统一模型 BindResp 仅带 status，无法区分 transceiver/transmitter/receiver resp，默认产出
+            // BindTransceiverResp；status 写回 command_status → to_pdu_bytes 写进头部（rsms 作 server 回失败）。
+            Pdu::from(BindTransceiverResp {
+                system_id: String::new(),
+                sc_interface_version: 0,
+                command_status: r.status,
+            })
         }
         UnifiedMessage::Deliver(d) => {
             // MO 上行 → DeliverSm（esm_class 非回执位）。
@@ -274,6 +313,8 @@ fn unified_to_smpp_bytes(msg: &UnifiedMessage, seq: Sequence) -> Result<Vec<u8>>
                 ProtocolExtra::Smpp(e) => e.clone(),
                 _ => SmppExtra::default(),
             };
+            // 有 concat 则前置级联 UDH 并置 esm_class UDHI(0x40)。
+            let (udh_body, esm_class) = join_udh(&d.concat, &d.content, extra.esm_class);
             let mut sm = DeliverSm {
                 service_type: extra.service_type,
                 source_addr_ton: d.src.ton.unwrap_or(0),
@@ -282,7 +323,7 @@ fn unified_to_smpp_bytes(msg: &UnifiedMessage, seq: Sequence) -> Result<Vec<u8>>
                 dest_addr_ton: d.dest.ton.unwrap_or(0),
                 dest_addr_npi: d.dest.npi.unwrap_or(0),
                 destination_addr: d.dest.number.clone(),
-                esm_class: extra.esm_class,
+                esm_class,
                 protocol_id: extra.protocol_id,
                 priority_flag: extra.priority_flag,
                 schedule_delivery_time: extra.schedule_delivery_time,
@@ -291,10 +332,10 @@ fn unified_to_smpp_bytes(msg: &UnifiedMessage, seq: Sequence) -> Result<Vec<u8>>
                 replace_if_present_flag: extra.replace_if_present_flag,
                 data_coding: dcs_from_encoding(d.encoding),
                 sm_default_msg_id: extra.sm_default_msg_id,
-                short_message: d.content.clone(),
+                short_message: udh_body,
                 tlvs: tlvs_from_unified(&d.tlvs),
             };
-            // ProtocolExtra::None 时 esm_class 已为 0；MO 不应置回执位，保持 extra 提供的值。
+            // MO 不应置回执位（保留 UDHI 等其它位）。
             sm.esm_class &= !0x04;
             Pdu::from(sm)
         }
@@ -546,5 +587,123 @@ mod tests {
         let reencoded = SmppAdapter.encode(&unified1, Sequence::Plain(13)).unwrap();
         let unified2 = SmppAdapter.decode(&frame_of(reencoded)).unwrap();
         assert_eq!(unified1, unified2, "Report 经统一模型往返后语义应稳定");
+    }
+
+    // ── 结果码透出（#1）：SMPP 结果码在 16B 头的 command_status，需经 adapter 透到统一模型 ──
+
+    /// 把整包 PDU 的 command_status（字节 8..12）设为指定值（测试夹具）。
+    fn set_command_status(mut bytes: Vec<u8>, status: u32) -> Vec<u8> {
+        bytes[8..12].copy_from_slice(&status.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn decode_submit_resp_surfaces_command_status() {
+        // 非 0 command_status（ESME_RSUBMITFAIL=0x45）应透出到 UnifiedSubmitResp.status。
+        let bytes = Pdu::from(SubmitSmResp { message_id: "9".to_string(), command_status: 0 })
+            .to_pdu_bytes(7)
+            .to_vec();
+        let bytes = set_command_status(bytes, 0x0000_0045);
+        match SmppAdapter.decode(&frame_of(bytes)).unwrap() {
+            UnifiedMessage::SubmitResp(r) => {
+                assert_eq!(r.status, 0x45, "command_status 应透出到 status，而非恒 0");
+            }
+            other => panic!("expected SubmitResp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_bind_resp_surfaces_command_status() {
+        // 非 0 command_status（ESME_RBINDFAIL=0x0D）应透出到 UnifiedBindResp.status。
+        let bytes = Pdu::from(BindTransceiverResp {
+            system_id: "900001".to_string(),
+            sc_interface_version: 0x34,
+            command_status: 0,
+        })
+        .to_pdu_bytes(11)
+        .to_vec();
+        let bytes = set_command_status(bytes, 0x0000_000D);
+        match SmppAdapter.decode(&frame_of(bytes)).unwrap() {
+            UnifiedMessage::BindResp(r) => {
+                assert_eq!(r.status, 0x0D, "bind command_status 应透出到 status");
+            }
+            other => panic!("expected BindResp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_submit_resp_writes_command_status() {
+        // UnifiedSubmitResp.status 应写进 PDU 头部 command_status（rsms 作 server 回失败）。
+        let msg = UnifiedMessage::SubmitResp(rsms_model::UnifiedSubmitResp {
+            msg_id: MessageId::Text("9".to_string()),
+            status: 0x58, // ESME_RTHROTTLED
+        });
+        let bytes = SmppAdapter.encode(&msg, Sequence::Plain(1)).unwrap();
+        let cs = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        assert_eq!(cs, 0x58, "status 应写入 command_status，而非恒 0");
+    }
+
+    #[test]
+    fn encode_bind_resp_writes_command_status() {
+        let msg = UnifiedMessage::BindResp(rsms_model::UnifiedBindResp { status: 0x0D });
+        let bytes = SmppAdapter.encode(&msg, Sequence::Plain(1)).unwrap();
+        let cs = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        assert_eq!(cs, 0x0D, "bind status 应写入 command_status");
+    }
+
+    #[test]
+    fn decode_report_parses_delivery_status() {
+        // esm_class=0x04 的投递回执，正文含 stat:DELIVRD → 统一模型 status 应解析为 Delivered。
+        let d = DeliverSm {
+            service_type: String::new(),
+            source_addr_ton: 0,
+            source_addr_npi: 0,
+            source_addr: String::new(),
+            dest_addr_ton: 0,
+            dest_addr_npi: 0,
+            destination_addr: "1065900000".to_string(),
+            esm_class: 0x04,
+            protocol_id: 0,
+            priority_flag: 0,
+            schedule_delivery_time: String::new(),
+            validity_period: String::new(),
+            registered_delivery: 0,
+            replace_if_present_flag: 0,
+            data_coding: 0,
+            sm_default_msg_id: 0,
+            short_message: b"id:9876543210 sub:001 dlvrd:001 stat:DELIVRD err:000 text:hi".to_vec(),
+            tlvs: vec![Tlv::new(0x001E, b"9876543210".to_vec())],
+        };
+        let bytes = Pdu::from(d).to_pdu_bytes(20).to_vec();
+        match SmppAdapter.decode(&frame_of(bytes)).unwrap() {
+            UnifiedMessage::Report(r) => {
+                assert_eq!(r.status, DeliveryStatus::Delivered, "stat:DELIVRD 应解析为 Delivered");
+            }
+            other => panic!("expected Report, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submit_concat_udh_roundtrip_via_unified() {
+        // esm_class 0x40(UDHI) + 8-bit 级联 UDH(05 00 03 ref total seq) + payload。
+        let mut s = SubmitSm::new();
+        s.source_addr = "10086".to_string();
+        s.destination_addr = "13800138000".to_string();
+        s.esm_class = 0x40;
+        s.data_coding = 0;
+        s.short_message = vec![0x05, 0x00, 0x03, 7, 2, 1, b'A', b'B'];
+        let original = Pdu::from(s).to_pdu_bytes(30).to_vec();
+
+        let unified = SmppAdapter.decode(&frame_of(original.clone())).unwrap();
+        match &unified {
+            UnifiedMessage::Submit(u) => {
+                assert_eq!(u.concat, Some(Concat { reference: 7, total: 2, sequence: 1 }));
+                assert_eq!(u.content, b"AB", "content 应为剥离 UDH 后的纯 payload");
+            }
+            other => panic!("expected Submit, got {other:?}"),
+        }
+        // encode 重建 UDH + 置 esm_class 0x40 → 字节与原始无损一致。
+        let reencoded = SmppAdapter.encode(&unified, Sequence::Plain(30)).unwrap();
+        assert_eq!(reencoded, original, "级联 Submit 经统一模型往返字节应无损一致");
     }
 }

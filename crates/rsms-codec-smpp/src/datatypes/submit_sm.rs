@@ -29,6 +29,9 @@ pub struct SubmitSm {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SubmitSmResp {
     pub message_id: String,
+    /// PDU 头部 command_status（操作结果码，0=ESME_ROK 成功）。decode 时从头部填入，
+    /// encode 时由 `Pdu::to_pdu_bytes` 写回头部。body 编解码不含此字段。
+    pub command_status: u32,
 }
 
 impl SubmitSm {
@@ -218,7 +221,10 @@ impl Decodable for SubmitSmResp {
             });
         }
         let message_id = decode_cstring(buf, 65, "message_id")?;
-        Ok(Self { message_id })
+        Ok(Self {
+            message_id,
+            command_status: header.command_status as u32,
+        })
     }
 
     fn command_id() -> CommandId {

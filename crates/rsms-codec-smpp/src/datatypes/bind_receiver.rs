@@ -23,6 +23,9 @@ pub struct BindReceiver {
 pub struct BindReceiverResp {
     pub system_id: String,
     pub sc_interface_version: u8,
+    /// PDU 头部 command_status（绑定结果码，0=成功）。decode 从头部填入，encode 由
+    /// `Pdu::to_pdu_bytes` 写回头部；body 编解码不含此字段。
+    pub command_status: u32,
 }
 
 impl BindReceiver {
@@ -122,6 +125,7 @@ impl Decodable for BindReceiverResp {
         Ok(Self {
             system_id,
             sc_interface_version,
+            command_status: header.command_status as u32,
         })
     }
 

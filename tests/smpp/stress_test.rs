@@ -141,23 +141,22 @@ impl ClientHandler for ClientState {
             return Ok(());
         }
 
-        // 消息类型经 SmppAdapter 识别；BindResp/SubmitResp 的 command_status 不透传，裸读 bytes 8..12（规则3）。
-        let status = u32::from_be_bytes([pdu[8], pdu[9], pdu[10], pdu[11]]);
+        // 消息类型与结果码均经 SmppAdapter 透出到统一模型（command_status → status）。
         let unified = match SmppAdapter.decode(frame) {
             Ok(m) => m,
             Err(_) => return Ok(()),
         };
 
         match unified {
-            UnifiedMessage::BindResp(_) => {
-                *self.login_status.lock().unwrap() = Some(status);
-                if status == 0 {
+            UnifiedMessage::BindResp(r) => {
+                *self.login_status.lock().unwrap() = Some(r.status);
+                if r.status == 0 {
                     self.connected.store(true, Ordering::Relaxed);
                 }
             }
             UnifiedMessage::SubmitResp(resp) => {
                 self.stats.submit_resp_received.fetch_add(1, Ordering::Relaxed);
-                if status == 0 {
+                if resp.status == 0 {
                     // adapter 已把 message_id 落入 SubmitResp.msg_id（SMPP 用 MessageId::Text）。
                     let msg_id = match resp.msg_id {
                         MessageId::Text(t) => t,

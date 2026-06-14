@@ -16,8 +16,9 @@
 //   - login_mode=Some(2) 表示 DUPLEX（既 submit 又收 MO/报告）。
 //   - 计费/service_id/fee/msg_type/priority 等方言字段落 ProtocolExtra::Smgp(SmgpExtra)。
 //     本 example 全取默认（与旧版 Submit::new() 默认值一致），仅设 want_report。
-//   - 长短信：SMGP 不通过 SmgpExtra 标志 UDH，分段 UDH 字节直接内嵌在 content 中
-//     （LongMessageSplitter 产出的 frame.content 已含 6B/7B UDH 头），收端靠 UdhParser 合包。
+//   - 长短信：走窄腰 concat——发端传 Concat + 纯载荷，SmgpAdapter 自动前置 UDH 并置
+//     SMGP TP_UDHI 可选参数 TLV(0x0002,[1])；收端 adapter 剥 UDH 还原为 concat + 纯载荷，
+//     业务侧据 concat 重建含 UDH 段交 UdhParser 合包。
 // ============================================================================
 
 use async_trait::async_trait;
@@ -30,8 +31,8 @@ use rsms_longmsg::{
     split::SmsAlphabet, LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser,
 };
 use rsms_model::{
-    Address, BindMode, Encoding, MessageId, ProtocolAdapter, ProtocolExtra, Sequence, SmgpExtra,
-    UnifiedBind, UnifiedMessage, UnifiedSubmit,
+    Address, BindMode, Concat, Encoding, MessageId, ProtocolAdapter, ProtocolExtra, Sequence,
+    SmgpExtra, UnifiedBind, UnifiedMessage, UnifiedSubmit,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -105,29 +106,54 @@ fn decode_text(bytes: &[u8], encoding: Encoding) -> String {
     }
 }
 
-/// SMGP TP_UDHI 可选参数标签（content 含 UDH 长短信头时须置 1，否则对端不重组）。
-const SMGP_TP_UDHI: u16 = 0x0002;
-
 /// 构造一条 SMGP 提交的统一消息。
 /// SMGP 计费/service_id/msg_type 等方言字段落 ProtocolExtra::Smgp，本 example 全取默认。
-/// **长短信段必须置 TP_UDHI=1**（SMGP 经可选参数 TLV 承载，不像 SMPP 用 esm_class 固定位）——
-/// 缺它对端不知道正文含 UDH、不会重组（联调实测 cmos 会把 UDH 字节当正文、echo 失败）。
-fn build_submit(phone: &str, content: &[u8], encoding: Encoding, tpudhi: bool) -> UnifiedMessage {
-    let tlvs = if tpudhi {
-        vec![rsms_model::Tlv { tag: SMGP_TP_UDHI, value: vec![1] }]
-    } else {
-        vec![]
-    };
+/// **长短信走 concat（窄腰）**：传 concat + 纯载荷，adapter 自动前置 UDH 并置 SMGP TP_UDHI 可选参数
+/// TLV(0x0002,[1])——缺它对端不知道正文含 UDH、不会重组（联调实测 cmos 会把 UDH 字节当正文、echo 失败）。
+fn build_submit(
+    phone: &str,
+    content: &[u8],
+    encoding: Encoding,
+    concat: Option<Concat>,
+) -> UnifiedMessage {
     UnifiedMessage::Submit(UnifiedSubmit {
         src: Address::plain(ACCOUNT),
         dests: vec![Address::plain(phone)],
         content: content.to_vec(),
         encoding,
         want_report: true,
-        concat: None,
+        concat,
         extra: ProtocolExtra::Smgp(SmgpExtra::default()),
-        tlvs,
+        tlvs: vec![],
     })
+}
+
+/// 消费侧：把窄腰 (concat, 纯载荷) 重建为含 UDH 的字节，供 UdhParser 合包逻辑复用。
+fn seg_with_udh(concat: &Option<Concat>, content: &[u8]) -> Vec<u8> {
+    match concat {
+        Some(c) => {
+            let mut v = c.to_udh_prefix();
+            v.extend_from_slice(content);
+            v
+        }
+        None => content.to_vec(),
+    }
+}
+
+/// 把 splitter 的分段帧转为窄腰 (concat, 纯载荷)：has_udhi 段剥掉 UDH、concat 承载分段信息。
+fn frame_to_concat(f: &LongMessageFrame) -> (Option<Concat>, Vec<u8>) {
+    if f.has_udhi {
+        (
+            Some(Concat {
+                reference: f.reference_id,
+                total: f.total_segments,
+                sequence: f.segment_number,
+            }),
+            UdhParser::strip_udh(&f.content),
+        )
+    } else {
+        (None, f.content.clone())
+    }
 }
 
 // ============================================================================
@@ -154,8 +180,8 @@ impl ClientMessageSource {
             let frames = splitter.split(&wire, alphabet);
 
             if frames.len() == 1 && !frames[0].has_udhi {
-                // 单条短信：content 不含 UDH，tpudhi=false。
-                let msg = build_submit(phone, &frames[0].content, encoding, false);
+                // 单条短信：无级联信息（concat=None）。
+                let msg = build_submit(phone, &frames[0].content, encoding, None);
                 let bytes = SmgpAdapter
                     .encode(&msg, Sequence::Plain(next_seq()))
                     .expect("encode submit");
@@ -163,12 +189,12 @@ impl ClientMessageSource {
                     Arc::new(RawPdu::from(bytes)) as Arc<dyn EncodedPdu>
                 ));
             } else {
-                // 长短信：每段 content 已内嵌 UDH 头（6B/7B），同组顺序发出。
+                // 长短信：每段传 concat + 纯载荷，adapter 自动建 UDH + 置 TP_UDHI 可选参数，整组顺序发出。
                 let items: Vec<Arc<dyn EncodedPdu>> = frames
-                    .into_iter()
+                    .iter()
                     .map(|frame| {
-                        // 长短信段：tpudhi=true，让 adapter 发 TP_UDHI=1 可选参数。
-                        let msg = build_submit(phone, &frame.content, encoding, frame.has_udhi);
+                        let (concat, payload) = frame_to_concat(frame);
+                        let msg = build_submit(phone, &payload, encoding, concat);
                         let bytes = SmgpAdapter
                             .encode(&msg, Sequence::Plain(next_seq()))
                             .expect("encode submit segment");
@@ -318,7 +344,9 @@ impl ClientHandler for SmgpClientHandler {
             }
             UnifiedMessage::Deliver(deliver) => {
                 let enc = deliver.encoding;
-                self.handle_mo(&deliver.src.number, &deliver.dest.number, deliver.content, enc);
+                // 窄腰：adapter 已剥 UDH → deliver.concat + 纯载荷，据 concat 重建含 UDH 段供合包逻辑复用。
+                let seg = seg_with_udh(&deliver.concat, &deliver.content);
+                self.handle_mo(&deliver.src.number, &deliver.dest.number, seg, enc);
                 reply_deliver_resp(ctx, frame).await?;
             }
             UnifiedMessage::UnbindResp => tracing::info!("收到 ExitResp，连接将关闭"),

@@ -16,8 +16,8 @@
 //
 // 已知边界（统一模型当前限制，见文末注释）：
 //   - SMGP 报告的 recv_time/msg_fmt 不进统一模型，经 adapter.encode 时取 Deliver::new() 默认
-//   - 长短信 MO 的 SMGP optional_params（TP_UDHI/PK_TOTAL/PK_NUMBER）当前 adapter 不透出；
-//     分段并发信息由 content 内嵌 UDH 头携带（接收端 UdhParser 即据此合包）
+//   - 长短信走窄腰 concat：发端传 Concat + 纯载荷，SmgpAdapter 自动前置 UDH 并置 SMGP TP_UDHI
+//     可选参数 TLV(0x0002,[1])；收端 adapter 剥 UDH 还原为 concat + 纯载荷，业务侧据 concat 合包
 // ============================================================================
 
 use async_trait::async_trait;
@@ -33,8 +33,8 @@ use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Frame, Protocol, Raw
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
 use rsms_model::{
-    Address, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra, Sequence,
-    UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmitResp,
+    Address, Concat, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra,
+    Sequence, UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmitResp,
 };
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -219,8 +219,9 @@ impl FileMessageSource {
                 // 长短信 MO：对 wire 字节拆段，每段内嵌 UDH 头，整组顺序下发
                 let frames = splitter.split(&wire, alphabet);
                 let mut items = Vec::new();
-                for frame in frames {
-                    let pdu = build_deliver_mo_with_udh(&mo.account, &mo.phone, &frame.content);
+                for frame in &frames {
+                    let (concat, payload) = frame_to_concat(frame);
+                    let pdu = build_deliver_mo_with_udh(&mo.account, &mo.phone, concat, &payload);
                     items.push(Arc::new(pdu) as Arc<dyn EncodedPdu>);
                 }
                 source.push_sync(&mo.account, MessageItem::Group { items });
@@ -345,18 +346,24 @@ impl SmgpBusinessHandler {
         let resp_bytes = SmgpAdapter.encode(&resp, SmgpAdapter.sequence_of(frame))?;
         ctx.conn.write_frame(&resp_bytes).await?;
 
-        // 长短信合包：含 UDH 则交 merger 合并，否则直接呈现
-        if let Some((udh, _)) = UdhParser::extract_udh(&submit.content) {
-            let ref_id = udh.reference_id;
-            let total = udh.total_segments;
-            let seg = udh.segment_number;
+        // 长短信合包：窄腰 concat 表达分段信息（adapter 已剥 UDH、submit.content 为纯载荷）。
+        // 据 concat 重建含 UDH 段字节交 merger（merger 内部按 UDH 解析合并）。
+        if let Some(concat) = &submit.concat {
+            let ref_id = concat.reference;
+            let total = concat.total;
+            let seg = concat.sequence;
+            let seg_bytes = {
+                let mut v = concat.to_udh_prefix();
+                v.extend_from_slice(&submit.content);
+                v
+            };
             let lm_frame = LongMessageFrame::new(
-                udh.reference_id,
-                udh.total_segments,
-                udh.segment_number,
-                submit.content.clone(),
+                ref_id,
+                total,
+                seg,
+                seg_bytes,
                 true,
-                Some(udh),
+                None,
             );
             let mut merger = self.merger.lock().unwrap();
             match merger.add_frame(lm_frame) {
@@ -464,24 +471,43 @@ fn build_deliver_mo(account: &str, phone: &str, wire_content: &[u8]) -> RawPdu {
     RawPdu::from(bytes)
 }
 
-/// 构造下行长短信 MO 分段：content_with_udh 已内嵌 UDH 头（接收端据此合包）。
-/// 注：SMGP optional_params（TP_UDHI/PK_TOTAL/PK_NUMBER）当前 adapter 不透出，
-/// 分段并发信息全部由内嵌 UDH 头携带——这是统一模型当前已知边界。
-fn build_deliver_mo_with_udh(account: &str, phone: &str, content_with_udh: &[u8]) -> RawPdu {
+/// 构造下行长短信 MO 分段（窄腰 concat）：传 concat + 纯载荷，SmgpAdapter 自动前置 UDH 并置
+/// SMGP TP_UDHI 可选参数 TLV(0x0002,[1])——否则对端不重组、把 UDH 当正文。
+fn build_deliver_mo_with_udh(
+    account: &str,
+    phone: &str,
+    concat: Option<Concat>,
+    payload: &[u8],
+) -> RawPdu {
     let unified = UnifiedMessage::Deliver(UnifiedDeliver {
         src: Address::plain(phone),
         dest: Address::plain(account),
-        content: content_with_udh.to_vec(),
+        content: payload.to_vec(),
         encoding: Encoding::Gbk,
-        concat: None,
+        concat,
         extra: ProtocolExtra::None,
-        // 长短信段须带 TP_UDHI=1（SMGP 经可选参数 TLV 承载），否则对端不重组、把 UDH 当正文。
-        tlvs: vec![rsms_model::Tlv { tag: 0x0002, value: vec![1] }],
+        tlvs: vec![],
     });
     let bytes = SmgpAdapter
         .encode(&unified, Sequence::Plain(0))
         .expect("encode SMGP MO segment");
     RawPdu::from(bytes)
+}
+
+/// 把 splitter 的分段帧转为窄腰 (concat, 纯载荷)：has_udhi 段剥掉 UDH、concat 承载分段信息。
+fn frame_to_concat(f: &LongMessageFrame) -> (Option<Concat>, Vec<u8>) {
+    if f.has_udhi {
+        (
+            Some(Concat {
+                reference: f.reference_id,
+                total: f.total_segments,
+                sequence: f.segment_number,
+            }),
+            UdhParser::strip_udh(&f.content),
+        )
+    } else {
+        (None, f.content.clone())
+    }
 }
 
 fn chrono_now_str() -> String {

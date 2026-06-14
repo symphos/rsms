@@ -12,7 +12,7 @@ use crate::datatypes::{
 use crate::message::{decode_message, SgipMessage};
 use rsms_core::{Frame, Protocol, Result, RsmsError};
 use rsms_model::{
-    Address, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra, Sequence,
+    Address, Concat, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra, Sequence,
     SgipExtra, UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmit, UnifiedSubmitResp,
 };
 
@@ -41,12 +41,17 @@ fn fmt_from_encoding(enc: Encoding) -> u8 {
     }
 }
 
-/// SGIP 状态码 → 统一 DeliveryStatus（state: 0=成功投递；其余取值——等待/投递中/已删除等——
-/// 完整映射待后续，本轮非 0 一律归 Unknown）。
+/// SGIP Report State → 统一 DeliveryStatus。
+/// 0=成功送达→Delivered；1=未送达→Undeliverable；2=超时→Expired；
+/// 其余未知数字**保真**为 Other(数字串)（不再一律 Unknown，便于业务按自家网关解释）。
+/// 注：非 0 子码语义随厂商/规范版本略有出入，此为 SGIP 1.2 常见解释；如对接网关定义不同，
+/// 改本函数即可（与 `state_from_status` 保持对称）。
 fn status_from_state(state: u8) -> DeliveryStatus {
     match state {
         0 => DeliveryStatus::Delivered,
-        _ => DeliveryStatus::Unknown,
+        1 => DeliveryStatus::Undeliverable,
+        2 => DeliveryStatus::Expired,
+        other => DeliveryStatus::Other(other.to_string()),
     }
 }
 
@@ -60,14 +65,41 @@ fn seq_to_msg_id(seq: SgipSequence) -> MessageId {
     MessageId::Binary(b)
 }
 
+/// 解码侧：tp_udhi 置位（!=0）且正文以级联 UDH 开头时，剥离 UDH → (Some(concat), payload)；
+/// 否则 (None, 原正文)。与 SMPP 的 split_udh 对称，仅判定标志改为 SGIP 的 tp_udhi 字段。
+fn split_udh(tpudhi: u8, content: Vec<u8>) -> (Option<Concat>, Vec<u8>) {
+    if tpudhi != 0 {
+        if let Some((c, off)) = Concat::from_udh(&content) {
+            return (Some(c), content[off..].to_vec());
+        }
+    }
+    (None, content)
+}
+
+/// 编码侧：有 concat 则前置级联 UDH 到正文并置 tp_udhi=1（返回新 tpudhi）；否则原样、保留原 tpudhi。
+/// 与 SMPP 的 join_udh 对称，仅标志载体改为 SGIP 的 tp_udhi 字段。
+fn join_udh(concat: &Option<Concat>, content: &[u8], tpudhi: u8) -> (Vec<u8>, u8) {
+    match concat {
+        Some(c) => {
+            let mut body = c.to_udh_prefix();
+            body.extend_from_slice(content);
+            (body, 1)
+        }
+        None => (content.to_vec(), tpudhi),
+    }
+}
+
 fn submit_to_unified(s: Submit) -> UnifiedSubmit {
+    // 级联长短信：仅当 tp_udhi 置位且正文确以级联 UDH 开头时，剥离 UDH → concat 承载分段信息、
+    // content 为纯 payload；否则 concat=None、content 原样。
+    let (concat, content) = split_udh(s.tpudhi, s.message_content);
     UnifiedSubmit {
         src: Address::plain(s.sp_number),
         dests: s.user_numbers.into_iter().map(Address::plain).collect(),
-        content: s.message_content,
+        content,
         encoding: encoding_from_fmt(s.msg_fmt),
         want_report: s.report_flag != 0,
-        concat: None,
+        concat,
         extra: ProtocolExtra::Sgip(SgipExtra {
             charge_number: s.charge_number,
             corp_id: s.corp_id,
@@ -109,15 +141,23 @@ fn sgip_to_unified(msg: SgipMessage) -> UnifiedMessage {
             msg_id: MessageId::Text(String::new()),
             status: r.result,
         }),
-        SgipMessage::Deliver(d) => UnifiedMessage::Deliver(UnifiedDeliver {
-            src: Address::plain(d.sp_number),
-            dest: Address::plain(d.user_number),
-            content: d.message_content,
-            encoding: encoding_from_fmt(d.msg_fmt),
-            concat: None,
-            extra: ProtocolExtra::None,
-            tlvs: vec![],
-        }),
+        SgipMessage::Deliver(d) => {
+            // MO 长短信分段：同 Submit，仅当 tp_udhi 置位时按级联 UDH 剥离 → concat。
+            let (concat, content) = split_udh(d.tpudhi, d.message_content);
+            UnifiedMessage::Deliver(UnifiedDeliver {
+                src: Address::plain(d.sp_number),
+                dest: Address::plain(d.user_number),
+                content,
+                encoding: encoding_from_fmt(d.msg_fmt),
+                concat,
+                // tp_udhi 经 SgipExtra 透出，供 encode 在无 concat 时保持原标志一致。
+                extra: ProtocolExtra::Sgip(SgipExtra {
+                    tpudhi: d.tpudhi,
+                    ..Default::default()
+                }),
+                tlvs: vec![],
+            })
+        }
         SgipMessage::DeliverResp(_) => UnifiedMessage::DeliverResp,
         SgipMessage::Report(r) => UnifiedMessage::Report(report_to_unified(r)),
         // ReportResp 是独立 Report 命令的响应；统一模型暂无对应变体，退化为 Unknown 并保留真实
@@ -167,11 +207,15 @@ fn seq_parts(seq: Sequence) -> (u32, u32, u32) {
     }
 }
 
-/// SGIP state(投递状态) 反映射：Delivered→0；其余统一归 1（投递失败/未知，取合理默认非 0）。
-/// 与正向 `status_from_state`（仅区分 0/非 0）对称，有损但语义稳定。
+/// SGIP state(投递状态) 反映射，与正向 `status_from_state` 对称：
+/// Delivered→0、Undeliverable→1、Expired→2、Other(数字串)→解析回原数字；
+/// 其它状态（Accepted/Rejected/Unknown，SGIP 正常不产生）默认 1（投递失败）。
 fn state_from_status(status: &DeliveryStatus) -> u8 {
     match status {
         DeliveryStatus::Delivered => 0,
+        DeliveryStatus::Undeliverable => 1,
+        DeliveryStatus::Expired => 2,
+        DeliveryStatus::Other(s) => s.parse::<u8>().unwrap_or(1),
         _ => 1,
     }
 }
@@ -203,10 +247,12 @@ fn unified_to_sgip_bytes(msg: &UnifiedMessage, seq: Sequence) -> Result<Vec<u8>>
             sub.schedule_time = extra.schedule_time;
             sub.report_flag = if s.want_report { 1 } else { 0 };
             sub.tppid = extra.tppid;
-            sub.tpudhi = extra.tpudhi;
+            // 有 concat 则前置级联 UDH 到正文并置 tp_udhi=1；否则原样、保留 extra.tpudhi。
+            let (udh_body, tpudhi) = join_udh(&s.concat, &s.content, extra.tpudhi);
+            sub.tpudhi = tpudhi;
             sub.msg_fmt = fmt_from_encoding(s.encoding);
             sub.message_type = extra.message_type;
-            sub.message_content = s.content.clone();
+            sub.message_content = udh_body;
             // reserve 保持 Submit::new() 默认 [0u8;8]
             sub.to_pdu_bytes(node, ts, num)
         }
@@ -230,23 +276,19 @@ fn unified_to_sgip_bytes(msg: &UnifiedMessage, seq: Sequence) -> Result<Vec<u8>>
         }
         // MO 上行 Deliver：与 decode 对称（decode 时 src=sp_number, dest=user_number）。
         UnifiedMessage::Deliver(d) => {
-            // tpudhi：优先取 SgipExtra.tpudhi；无该方言时按 concat 是否存在推导（长短信置 1）。
-            let tpudhi = match &d.extra {
+            // 基准 tpudhi：优先取 SgipExtra.tpudhi（decode 已透出），无该方言时取 0。
+            let base_tpudhi = match &d.extra {
                 ProtocolExtra::Sgip(e) => e.tpudhi,
-                _ => {
-                    if d.concat.is_some() {
-                        1
-                    } else {
-                        0
-                    }
-                }
+                _ => 0,
             };
+            // 有 concat 则前置级联 UDH 并置 tp_udhi=1；否则原样、保留基准 tpudhi。
+            let (udh_body, tpudhi) = join_udh(&d.concat, &d.content, base_tpudhi);
             let mut del = Deliver::new();
             del.sp_number = d.src.number.clone();
             del.user_number = d.dest.number.clone();
             del.tpudhi = tpudhi;
             del.msg_fmt = fmt_from_encoding(d.encoding);
-            del.message_content = d.content.clone();
+            del.message_content = udh_body;
             // tppid、reserve 保持 Deliver::new() 默认
             del.to_pdu_bytes(node, ts, num)
         }
@@ -444,5 +486,85 @@ mod tests {
         }
         let reencoded = SgipAdapter.encode(&unified, Sequence::Plain(8)).unwrap();
         assert_eq!(reencoded, original, "SGIP ReportResp 经统一模型往返后字节应无损一致");
+    }
+
+    #[test]
+    fn submit_concat_udh_roundtrip_via_unified() {
+        // tp_udhi=1 + 8-bit 级联 UDH(05 00 03 ref total seq) + payload。
+        let mut s = Submit::new().with_message("10655000000", "13800138000", &[]);
+        s.tpudhi = 1;
+        s.msg_fmt = 8;
+        s.message_content = vec![0x05, 0x00, 0x03, 7, 2, 1, b'A', b'B'];
+        let original = s.to_pdu_bytes(0, 0, 30).to_vec();
+
+        let unified = SgipAdapter.decode(&frame_of(original.clone())).unwrap();
+        match &unified {
+            UnifiedMessage::Submit(u) => {
+                assert_eq!(u.concat, Some(Concat { reference: 7, total: 2, sequence: 1 }));
+                assert_eq!(u.content, b"AB", "content 应为剥离 UDH 后的纯 payload");
+            }
+            other => panic!("expected Submit, got {other:?}"),
+        }
+        // encode 据 concat 重建 UDH + 置 tp_udhi=1 → 字节与原始无损一致。
+        let reencoded = SgipAdapter.encode(&unified, Sequence::Plain(30)).unwrap();
+        assert_eq!(reencoded, original, "级联 Submit 经统一模型往返字节应无损一致");
+    }
+
+    #[test]
+    fn deliver_concat_udh_roundtrip_via_unified() {
+        // MO 长短信分段：tp_udhi=1 + 级联 UDH + payload。
+        let mut d = Deliver::new();
+        d.sp_number = "10655000000".to_string();
+        d.user_number = "13800138000".to_string();
+        d.tpudhi = 1;
+        d.msg_fmt = 8;
+        d.message_content = vec![0x05, 0x00, 0x03, 9, 3, 2, b'X', b'Y'];
+        let original = d.to_pdu_bytes(0, 0, 31).to_vec();
+
+        let unified = SgipAdapter.decode(&frame_of(original.clone())).unwrap();
+        match &unified {
+            UnifiedMessage::Deliver(u) => {
+                assert_eq!(u.concat, Some(Concat { reference: 9, total: 3, sequence: 2 }));
+                assert_eq!(u.content, b"XY", "content 应为剥离 UDH 后的纯 payload");
+            }
+            other => panic!("expected Deliver, got {other:?}"),
+        }
+        let reencoded = SgipAdapter.encode(&unified, Sequence::Plain(31)).unwrap();
+        assert_eq!(reencoded, original, "级联 Deliver(MO) 经统一模型往返字节应无损一致");
+    }
+
+    #[test]
+    fn submit_no_udhi_keeps_content_even_if_looks_like_udh() {
+        // tp_udhi=0 时不得剥离，即便正文恰好形似 UDH（gate on flag）。
+        let mut s = Submit::new().with_message("10655000000", "13800138000", &[]);
+        s.tpudhi = 0;
+        s.message_content = vec![0x05, 0x00, 0x03, 7, 2, 1, b'A', b'B'];
+        let original = s.to_pdu_bytes(0, 0, 32).to_vec();
+        match SgipAdapter.decode(&frame_of(original.clone())).unwrap() {
+            UnifiedMessage::Submit(u) => {
+                assert_eq!(u.concat, None, "tp_udhi=0 不应剥离 UDH");
+                assert_eq!(u.content, vec![0x05, 0x00, 0x03, 7, 2, 1, b'A', b'B']);
+            }
+            other => panic!("expected Submit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_from_state_enriched_mapping() {
+        // 非 0 state 不再一律 Unknown：1=未送达→Undeliverable，2=超时→Expired，
+        // 其余未知数字保真为 Other(数字串)。
+        assert_eq!(status_from_state(0), DeliveryStatus::Delivered);
+        assert_eq!(status_from_state(1), DeliveryStatus::Undeliverable);
+        assert_eq!(status_from_state(2), DeliveryStatus::Expired);
+        assert_eq!(status_from_state(5), DeliveryStatus::Other("5".to_string()));
+    }
+
+    #[test]
+    fn state_from_status_is_symmetric() {
+        // 反向映射与 status_from_state 对称，保证 Report 往返 state 不变。
+        assert_eq!(state_from_status(&DeliveryStatus::Delivered), 0);
+        assert_eq!(state_from_status(&DeliveryStatus::Undeliverable), 1);
+        assert_eq!(state_from_status(&DeliveryStatus::Expired), 2);
+        assert_eq!(state_from_status(&DeliveryStatus::Other("5".to_string())), 5);
     }
 }

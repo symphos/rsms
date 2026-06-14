@@ -65,7 +65,7 @@ pub fn decode_message_with_version(
     let command_id_raw = cursor
         .try_get_u32()
         .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
-    let _command_status = cursor
+    let command_status = cursor
         .try_get_u32()
         .map_err(|_| RsmsError::Codec("incomplete PDU".to_string()))?;
     let _sequence_number = cursor
@@ -136,6 +136,7 @@ pub fn decode_message_with_version(
             SmppMessage::BindTransmitterResp(BindTransmitterResp {
                 system_id,
                 sc_interface_version,
+                command_status,
             })
         }
         CommandId::BIND_RECEIVER => {
@@ -176,6 +177,7 @@ pub fn decode_message_with_version(
             SmppMessage::BindReceiverResp(BindReceiverResp {
                 system_id,
                 sc_interface_version,
+                command_status,
             })
         }
         CommandId::BIND_TRANSCEIVER => {
@@ -216,6 +218,7 @@ pub fn decode_message_with_version(
             SmppMessage::BindTransceiverResp(BindTransceiverResp {
                 system_id,
                 sc_interface_version,
+                command_status,
             })
         }
         CommandId::SUBMIT_SM => {
@@ -225,7 +228,10 @@ pub fn decode_message_with_version(
         CommandId::SUBMIT_SM_RESP => {
             let mut cursor = Cursor::new(body.as_slice());
             let message_id = decode_cstring(&mut cursor, 65, "message_id")?;
-            SmppMessage::SubmitSmResp(SubmitSmResp { message_id })
+            SmppMessage::SubmitSmResp(SubmitSmResp {
+                message_id,
+                command_status,
+            })
         }
         CommandId::DELIVER_SM => {
             let deliver = decode_deliver_sm(version, command_length, &body)?;

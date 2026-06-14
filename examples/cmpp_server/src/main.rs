@@ -41,8 +41,8 @@ use rsms_core::{
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
 use rsms_model::{
-    Address, CmppExtra, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra,
-    Sequence, UnifiedDeliver, UnifiedMessage, UnifiedReport,
+    Address, CmppExtra, Concat, DeliveryStatus, Encoding, MessageId, ProtocolAdapter,
+    ProtocolExtra, Sequence, UnifiedDeliver, UnifiedMessage, UnifiedReport,
 };
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -243,11 +243,24 @@ impl FileMessageSource {
                 let mut items = Vec::new();
                 for frame in frames {
                     let msg_id = source.id_generator.next_msg_id().to_be_bytes();
+                    // 窄腰：拆成 (concat, 纯载荷)，UDH 由 adapter 重建。
+                    let (concat, payload) = if frame.has_udhi {
+                        (
+                            Some(Concat {
+                                reference: frame.reference_id,
+                                total: frame.total_segments,
+                                sequence: frame.segment_number,
+                            }),
+                            UdhParser::strip_udh(&frame.content),
+                        )
+                    } else {
+                        (None, frame.content.clone())
+                    };
                     let pdu = build_deliver_mo_with_udh(
                         &mo.account,
                         &mo.phone,
-                        &frame.content,
-                        frame.has_udhi,
+                        &payload,
+                        concat,
                         &msg_id,
                         alphabet,
                     );
@@ -256,12 +269,12 @@ impl FileMessageSource {
                 source.push_group_sync(&mo.account, MessageItem::Group { items });
             } else {
                 let msg_id = source.id_generator.next_msg_id().to_be_bytes();
-                // 单条短信：wire 字节已是正确编码（UCS2→UTF-16BE），直接构造 MO。
+                // 单条短信：wire 字节已是正确编码（UCS2→UTF-16BE），无 concat，直接构造 MO。
                 let pdu = build_deliver_mo_with_udh(
                     &mo.account,
                     &mo.phone,
                     &wire,
-                    false,
+                    None,
                     &msg_id,
                     alphabet,
                 );
@@ -369,10 +382,11 @@ impl CmppBusinessHandler {
             .unwrap_or("unknown")
             .to_string();
 
-        // CMPP 方言字段（msg_id / tpudhi）在 ProtocolExtra::Cmpp 里。
-        let (msg_id, tpudhi) = match &submit.extra {
-            ProtocolExtra::Cmpp(e) => (e.msg_id, e.tpudhi),
-            _ => ([0u8; 8], 0),
+        // CMPP 方言字段 msg_id 在 ProtocolExtra::Cmpp 里。长短信级联信息已被 adapter
+        // 剥进 submit.concat（窄腰），业务不再读 tpudhi/手剥 UDH。
+        let msg_id = match &submit.extra {
+            ProtocolExtra::Cmpp(e) => e.msg_id,
+            _ => [0u8; 8],
         };
 
         // 回 SubmitResp（框架不自动回，业务方自己回）。
@@ -384,42 +398,43 @@ impl CmppBusinessHandler {
         let resp_bytes = CmppAdapter.encode(&resp, CmppAdapter.sequence_of(frame))?;
         ctx.conn.write_frame(&resp_bytes).await?;
 
-        // 处理长短信合包（对 UnifiedSubmit.content 跑 UdhParser/merger）。
-        if tpudhi == 1 {
-            if let Some((udh, _)) = UdhParser::extract_udh(&submit.content) {
-                let frame_lm = LongMessageFrame::new(
-                    udh.reference_id,
-                    udh.total_segments,
-                    udh.segment_number,
-                    submit.content.clone(),
-                    true,
-                    Some(udh),
-                );
-                let mut merger = self.merger.lock().unwrap();
-                let seg = frame_lm.segment_number;
-                let total = frame_lm.total_segments;
-                match merger.add_frame(frame_lm) {
-                    Ok(Some(complete)) => {
-                        // 长短信合包完成后按 encoding 正确解码（UCS2→UTF-16BE，否则 UTF-8）
-                        let content = decode_text(&complete, submit.encoding);
-                        tracing::info!(
-                            conn_id = ctx.conn.id(),
-                            phone = %phone,
-                            content = %content,
-                            "长短信合包完成"
-                        );
-                    }
-                    Ok(None) => {
-                        tracing::info!(
-                            conn_id = ctx.conn.id(),
-                            phone = %phone,
-                            seg = seg,
-                            total = total,
-                            "长短信分段接收"
-                        );
-                    }
-                    Err(e) => tracing::warn!(conn_id = ctx.conn.id(), "长短信合包错误: {}", e),
+        // 处理长短信合包（窄腰）：adapter 已把 UDH 剥成 submit.concat、content 为纯载荷。
+        // 据 concat 重建含 UDH 段喂 merger（merger 内部对多段 strip_udh 取纯载荷拼接）。
+        if let Some(c) = submit.concat {
+            let mut seg_bytes = c.to_udh_prefix();
+            seg_bytes.extend_from_slice(&submit.content);
+            let frame_lm = LongMessageFrame::new(
+                c.reference,
+                c.total,
+                c.sequence,
+                seg_bytes,
+                true,
+                None,
+            );
+            let mut merger = self.merger.lock().unwrap();
+            let seg = frame_lm.segment_number;
+            let total = frame_lm.total_segments;
+            match merger.add_frame(frame_lm) {
+                Ok(Some(complete)) => {
+                    // 长短信合包完成后按 encoding 正确解码（UCS2→UTF-16BE，否则 UTF-8）
+                    let content = decode_text(&complete, submit.encoding);
+                    tracing::info!(
+                        conn_id = ctx.conn.id(),
+                        phone = %phone,
+                        content = %content,
+                        "长短信合包完成"
+                    );
                 }
+                Ok(None) => {
+                    tracing::info!(
+                        conn_id = ctx.conn.id(),
+                        phone = %phone,
+                        seg = seg,
+                        total = total,
+                        "长短信分段接收"
+                    );
+                }
+                Err(e) => tracing::warn!(conn_id = ctx.conn.id(), "长短信合包错误: {}", e),
             }
         } else {
             // 按 encoding 解码显示（UCS2→UTF-16BE，否则 UTF-8）
@@ -485,30 +500,26 @@ fn build_deliver_mo(account: &str, phone: &str, content: &str, msg_id: &[u8; 8])
         SmsAlphabet::UCS2
     };
     let wire = to_wire_bytes(content, alphabet);
-    build_deliver_mo_with_udh(account, phone, &wire, false, msg_id, alphabet)
+    build_deliver_mo_with_udh(account, phone, &wire, None, msg_id, alphabet)
 }
 
 fn build_deliver_mo_with_udh(
     account: &str,
     phone: &str,
     content: &[u8],
-    has_udhi: bool,
+    concat: Option<Concat>,
     _msg_id: &[u8; 8],
     alphabet: SmsAlphabet,
 ) -> RawPdu {
-    // MO 上行：UnifiedDeliver（src=终端号 phone，dest=账号），由 adapter 编码为
-    // Deliver(registered_delivery=0) 字节。长短信 UDH 标志通过 ProtocolExtra::Cmpp.tpudhi 传递。
-    let extra = ProtocolExtra::Cmpp(CmppExtra {
-        tpudhi: if has_udhi { 1 } else { 0 },
-        ..Default::default()
-    });
+    // MO 上行（窄腰）：UnifiedDeliver（src=终端号 phone，dest=账号），传 concat + 纯载荷，
+    // 由 adapter 重建 UDH 并置 tp_udhi、编码为 Deliver(registered_delivery=0) 字节。
     let deliver = UnifiedMessage::Deliver(UnifiedDeliver {
         src: Address::plain(phone),
         dest: Address::plain(account),
         content: content.to_vec(),
         encoding: encoding_of(alphabet),
-        concat: None,
-        extra,
+        concat,
+        extra: ProtocolExtra::Cmpp(CmppExtra::default()),
         tlvs: vec![],
     });
     let bytes = CmppAdapter

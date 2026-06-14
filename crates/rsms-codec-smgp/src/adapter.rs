@@ -7,10 +7,13 @@ use crate::datatypes::{
 use crate::message::{decode_message, encode_message, SmgpMessage};
 use rsms_core::{Frame, Protocol, Result, RsmsError};
 use rsms_model::{
-    Address, BindMode, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra,
-    Sequence, SmgpExtra, UnifiedBind, UnifiedBindResp, UnifiedDeliver, UnifiedMessage,
-    UnifiedReport, UnifiedSubmit, UnifiedSubmitResp,
+    Address, BindMode, Concat, DeliveryStatus, Encoding, MessageId, ProtocolAdapter,
+    ProtocolExtra, Sequence, SmgpExtra, UnifiedBind, UnifiedBindResp, UnifiedDeliver,
+    UnifiedMessage, UnifiedReport, UnifiedSubmit, UnifiedSubmitResp,
 };
+
+/// SMGP TP_UDHI 可选参数标签：value=[1] 表示正文以 UDH 开头（与 SMPP 的 esm_class 固定位不同）。
+const TP_UDHI_TAG: u16 = 0x0002;
 
 /// SMGP 协议适配器：实现 `ProtocolAdapter`，把 SMGP PDU 字节与统一消息模型互译。
 pub struct SmgpAdapter;
@@ -84,18 +87,68 @@ fn tlvs_to_optional_params(tlvs: &[rsms_model::Tlv]) -> OptionalParameters {
 }
 
 // ──────────────────────────────────────────────
+// 级联长短信 UDH ↔ Concat（SMGP 通过 TP_UDHI 可选参数 TLV(0x0002,[1]) 标志，不像 SMPP 用 esm_class 固定位）
+// ──────────────────────────────────────────────
+
+/// 判断统一 tlvs 是否置位 TP_UDHI（tag==0x0002 且 value 首字节==1）。
+fn tp_udhi_set(tlvs: &[rsms_model::Tlv]) -> bool {
+    tlvs.iter()
+        .any(|t| t.tag == TP_UDHI_TAG && t.value.first().copied() == Some(1))
+}
+
+/// 解码侧：TP_UDHI 置位且正文以级联 UDH 开头时，剥离 UDH → (Some(concat), 纯载荷)；否则 (None, 原正文)。
+/// 同时从 tlvs 移除 TP_UDHI TLV——concat 已表达 UDHI 语义，移除以保证 decode∘encode 不重复添加 0x0002，
+/// 从而字节往返一致（encode 侧据 concat 重新补一个权威的 TP_UDHI(0x0002,[1])）。
+fn split_udh(
+    tlvs: Vec<rsms_model::Tlv>,
+    content: Vec<u8>,
+) -> (Option<Concat>, Vec<u8>, Vec<rsms_model::Tlv>) {
+    if tp_udhi_set(&tlvs) {
+        if let Some((c, off)) = Concat::from_udh(&content) {
+            let rest: Vec<rsms_model::Tlv> =
+                tlvs.into_iter().filter(|t| t.tag != TP_UDHI_TAG).collect();
+            return (Some(c), content[off..].to_vec(), rest);
+        }
+    }
+    (None, content, tlvs)
+}
+
+/// 编码侧：有 concat 则前置级联 UDH 到正文，并确保 tlvs 含权威 TP_UDHI(0x0002,[1])
+/// （先剔除任何已有的 0x0002 再补一个，以 concat 为准、避免重复）；无 concat 则原样。
+fn join_udh(
+    concat: &Option<Concat>,
+    content: &[u8],
+    tlvs: &[rsms_model::Tlv],
+) -> (Vec<u8>, Vec<rsms_model::Tlv>) {
+    match concat {
+        Some(c) => {
+            let mut body = c.to_udh_prefix();
+            body.extend_from_slice(content);
+            let mut out: Vec<rsms_model::Tlv> =
+                tlvs.iter().filter(|t| t.tag != TP_UDHI_TAG).cloned().collect();
+            out.push(rsms_model::Tlv { tag: TP_UDHI_TAG, value: vec![1] });
+            (body, out)
+        }
+        None => (content.to_vec(), tlvs.to_vec()),
+    }
+}
+
+// ──────────────────────────────────────────────
 // Decode 方向：SmgpMessage → UnifiedMessage
 // ──────────────────────────────────────────────
 
 fn submit_to_unified(s: Submit) -> UnifiedSubmit {
+    // 级联长短信：TP_UDHI 可选参数置位且正文以级联 UDH 开头时剥离 → concat 承载分段信息、
+    // content 为纯载荷，并从 tlvs 移除 0x0002（避免 encode 重复，保证字节往返一致）。
+    let tlvs = optional_params_to_tlvs(&s.optional_params);
+    let (concat, content, tlvs) = split_udh(tlvs, s.msg_content);
     UnifiedSubmit {
         src: Address::plain(s.src_term_id),
         dests: s.dest_term_ids.into_iter().map(Address::plain).collect(),
-        content: s.msg_content,
+        content,
         encoding: encoding_from_fmt(s.msg_fmt),
         want_report: s.need_report != 0,
-        // 长短信分片由 rsms-longmsg 在更上层处理，试点期 adapter 不拆 UDH
-        concat: None,
+        concat,
         extra: ProtocolExtra::Smgp(SmgpExtra {
             msg_type: s.msg_type,
             priority: s.priority,
@@ -107,29 +160,34 @@ fn submit_to_unified(s: Submit) -> UnifiedSubmit {
             valid_time: s.valid_time,
             at_time: s.at_time,
         }),
-        tlvs: optional_params_to_tlvs(&s.optional_params),
+        tlvs,
     }
 }
 
 fn deliver_to_unified(d: Deliver) -> UnifiedMessage {
     if d.is_report != 0 {
+        // SMGP 报告正文为文本（形如 id:.. stat:DELIVRD ..），解析 stat 段 → DeliveryStatus。
+        let status = DeliveryStatus::from_receipt_text(&d.msg_content);
         UnifiedMessage::Report(UnifiedReport {
             msg_id: MessageId::Binary(d.msg_id.bytes.to_vec()),
-            status: DeliveryStatus::Unknown, // 精确状态解析留待后续
+            status,
             // 报告源地址：SMGP Deliver-报告的 src_term_id（构造下行回执需要）。
             src: Address::plain(d.src_term_id.clone()),
             dest: Address::plain(d.dest_term_id),
             raw: d.msg_content,
         })
     } else {
+        // MO 长短信分段：同 Submit，按 TP_UDHI 剥离级联 UDH → concat、content 纯载荷、tlvs 去 0x0002。
+        let tlvs = optional_params_to_tlvs(&d.optional_params);
+        let (concat, content, tlvs) = split_udh(tlvs, d.msg_content);
         UnifiedMessage::Deliver(UnifiedDeliver {
             src: Address::plain(d.src_term_id),
             dest: Address::plain(d.dest_term_id),
-            content: d.msg_content,
+            content,
             encoding: encoding_from_fmt(d.msg_fmt),
-            concat: None,
+            concat,
             extra: ProtocolExtra::None,
-            tlvs: optional_params_to_tlvs(&d.optional_params),
+            tlvs,
         })
     }
 }
@@ -188,11 +246,13 @@ fn unified_to_smgp(msg: &UnifiedMessage, seq: Sequence) -> Result<SmgpMessage> {
                 ProtocolExtra::Smgp(e) => e.clone(),
                 _ => SmgpExtra::default(),
             };
+            // 有 concat 则前置级联 UDH 到正文，并确保 tlvs 含权威 TP_UDHI(0x0002,[1])。
+            let (content, tlvs) = join_udh(&s.concat, &s.content, &s.tlvs);
             let mut sub = Submit::new();
             sub.src_term_id = s.src.number.clone();
             sub.dest_term_ids = s.dests.iter().map(|a| a.number.clone()).collect();
             sub.dest_term_id_count = sub.dest_term_ids.len() as u8;
-            sub.msg_content = s.content.clone();
+            sub.msg_content = content;
             sub.msg_fmt = fmt_from_encoding(s.encoding);
             sub.need_report = if s.want_report { 1 } else { 0 };
             sub.msg_type = extra.msg_type;
@@ -205,7 +265,7 @@ fn unified_to_smgp(msg: &UnifiedMessage, seq: Sequence) -> Result<SmgpMessage> {
             sub.valid_time = extra.valid_time;
             sub.at_time = extra.at_time;
             // 把统一模型 tlvs 映射为 SMGP 可选参数（含长短信必需的 TP_UDHI=1）。
-            sub.optional_params = tlvs_to_optional_params(&s.tlvs);
+            sub.optional_params = tlvs_to_optional_params(&tlvs);
             SmgpMessage::Submit {
                 sequence_id: seq,
                 submit: sub,
@@ -274,14 +334,16 @@ fn unified_to_smgp(msg: &UnifiedMessage, seq: Sequence) -> Result<SmgpMessage> {
         }
         UnifiedMessage::Deliver(d) => {
             // 上行 MO：is_report=0，其余字段走 Deliver::new() 默认（recv_time/reserve 等）。
+            // 有 concat 则前置级联 UDH 并确保 tlvs 含权威 TP_UDHI(0x0002,[1])。
+            let (content, tlvs) = join_udh(&d.concat, &d.content, &d.tlvs);
             let mut deliver = Deliver::new();
             deliver.is_report = 0;
             deliver.src_term_id = d.src.number.clone();
             deliver.dest_term_id = d.dest.number.clone();
-            deliver.msg_content = d.content.clone();
+            deliver.msg_content = content;
             deliver.msg_fmt = fmt_from_encoding(d.encoding);
             // 下行 MO 的可选参数（含长短信 TP_UDHI=1）。
-            deliver.optional_params = tlvs_to_optional_params(&d.tlvs);
+            deliver.optional_params = tlvs_to_optional_params(&tlvs);
             SmgpMessage::Deliver {
                 sequence_id: seq,
                 deliver,
@@ -552,5 +614,84 @@ mod tests {
             .encode(&unified, Sequence::Plain(13))
             .unwrap();
         assert_eq!(reencoded, original, "Deliver(报告) 经统一模型往返字节应无损一致");
+    }
+
+    #[test]
+    fn submit_concat_udh_roundtrip_via_unified() {
+        // 8-bit 级联 UDH(05 00 03 ref total seq) + payload，经 TP_UDHI(0x0002,[1]) 标志。
+        // 用 adapter encode 一个带 concat 的 Submit 产出 wire 字节作为基准（含 UDH + TP_UDHI TLV），
+        // 再 decode 验证剥离 + tlvs 无残留 0x0002，最后 encode 验证字节无损一致。
+        let submit = UnifiedMessage::Submit(UnifiedSubmit {
+            src: Address::plain("10086"),
+            dests: vec![Address::plain("13800138000")],
+            content: b"AB".to_vec(),
+            encoding: Encoding::Ascii,
+            want_report: false,
+            concat: Some(Concat { reference: 7, total: 2, sequence: 1 }),
+            extra: ProtocolExtra::Smgp(SmgpExtra::default()),
+            tlvs: vec![],
+        });
+        let original = SmgpAdapter.encode(&submit, Sequence::Plain(30)).unwrap();
+
+        let unified = SmgpAdapter.decode(&frame_of(original.clone())).unwrap();
+        match &unified {
+            UnifiedMessage::Submit(u) => {
+                assert_eq!(u.concat, Some(Concat { reference: 7, total: 2, sequence: 1 }));
+                assert_eq!(u.content, b"AB", "content 应为剥离 UDH 后的纯载荷");
+                assert!(
+                    !u.tlvs.iter().any(|t| t.tag == 0x0002),
+                    "剥 UDH 后 tlvs 不应残留 TP_UDHI(0x0002)，避免 encode 重复"
+                );
+            }
+            other => panic!("expected Submit, got {other:?}"),
+        }
+        let reencoded = SmgpAdapter.encode(&unified, Sequence::Plain(30)).unwrap();
+        assert_eq!(reencoded, original, "级联 Submit 经统一模型往返字节应无损一致");
+    }
+
+    #[test]
+    fn deliver_mo_concat_udh_roundtrip_via_unified() {
+        // MO 长短信分段：同 Submit 路径，concat + TP_UDHI 往返无损。
+        let deliver = UnifiedMessage::Deliver(UnifiedDeliver {
+            src: Address::plain("13800138000"),
+            dest: Address::plain("106900"),
+            content: b"\x4e\x2d".to_vec(),
+            encoding: Encoding::Ucs2,
+            concat: Some(Concat { reference: 9, total: 3, sequence: 2 }),
+            extra: ProtocolExtra::None,
+            tlvs: vec![],
+        });
+        let original = SmgpAdapter.encode(&deliver, Sequence::Plain(31)).unwrap();
+
+        let unified = SmgpAdapter.decode(&frame_of(original.clone())).unwrap();
+        match &unified {
+            UnifiedMessage::Deliver(d) => {
+                assert_eq!(d.concat, Some(Concat { reference: 9, total: 3, sequence: 2 }));
+                assert_eq!(d.content, b"\x4e\x2d", "content 应为剥离 UDH 后的纯载荷");
+                assert!(
+                    !d.tlvs.iter().any(|t| t.tag == 0x0002),
+                    "剥 UDH 后 tlvs 不应残留 TP_UDHI(0x0002)"
+                );
+            }
+            other => panic!("expected Deliver, got {other:?}"),
+        }
+        let reencoded = SmgpAdapter.encode(&unified, Sequence::Plain(31)).unwrap();
+        assert_eq!(reencoded, original, "级联 Deliver(MO) 经统一模型往返字节应无损一致");
+    }
+
+    #[test]
+    fn decode_report_parses_delivery_status() {
+        // is_report=1 的 Deliver，正文含 stat:DELIVRD → 统一模型 status 应解析为 Delivered。
+        let mut d = crate::datatypes::Deliver::new();
+        d.is_report = 1;
+        d.dest_term_id = "1065900000".to_string();
+        d.msg_content = b"id:1234567890 sub:001 dlvrd:001 stat:DELIVRD err:000 text:hi".to_vec();
+        let bytes = Pdu::from(d).to_pdu_bytes(14).to_vec();
+        match SmgpAdapter.decode(&frame_of(bytes)).unwrap() {
+            UnifiedMessage::Report(r) => {
+                assert_eq!(r.status, DeliveryStatus::Delivered, "stat:DELIVRD 应解析为 Delivered");
+            }
+            _ => panic!("expected Report"),
+        }
     }
 }
