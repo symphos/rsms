@@ -35,7 +35,7 @@ cargo test -p rsms-tests --test cmpp-longmsg-test -- --nocapture
 cargo test -p rsms-tests --test cmpp-dynamic-connection-test -- --nocapture
 ```
 
-> Note: README.md / CONTRIBUTING.md still reference the old `-p cmpp-endpoint-example --test ...` package names. Those are **stale** — the tests were migrated into the single `rsms-tests` package (`tests/Cargo.toml`). Use the `-p rsms-tests --test <name>` form above. Test target names follow `<proto>-<kind>` (e.g. `smpp-multi-account-stress-test`).
+> Note: tests live in the single `rsms-tests` package (`tests/Cargo.toml`), not the old per-protocol `cmpp-endpoint-example` packages. Use the `-p rsms-tests --test <name>` form above; test target names follow `<proto>-<kind>` (e.g. `smpp-multi-account-stress-test`). README.md / CONTRIBUTING.md / docs/reference/01-tests.md already use this form.
 
 **Stress testing rule (critical):** stress tests MUST run with log level `WARN`. At `INFO`, a 300s run emits 2.4M+ log lines and throughput collapses from ~12,500 TPS to ~2,700. `EndpointConfig` in the stress tests is already configured with `.with_log_level(WARN)` — do not lower it.
 
