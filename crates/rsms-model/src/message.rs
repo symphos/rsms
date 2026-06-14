@@ -42,6 +42,14 @@ pub struct UnifiedSubmitResp {
     pub status: u32,
 }
 
+impl UnifiedSubmitResp {
+    /// 提交是否成功。`status == 0` 在四协议通用为成功（CMPP Result / SMGP Status /
+    /// SMPP ESME_ROK / SGIP Result 均 0=ok）；非 0 的具体含义按协议查 `status` 原始码。
+    pub fn is_success(&self) -> bool {
+        self.status == 0
+    }
+}
+
 /// MO 上行（用户发来的短信）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnifiedDeliver {
@@ -89,6 +97,13 @@ pub struct UnifiedBindResp {
     pub status: u32,
 }
 
+impl UnifiedBindResp {
+    /// 认证是否成功。`status == 0` 在四协议通用为成功；非 0 含义按协议查原始码。
+    pub fn is_success(&self) -> bool {
+        self.status == 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +122,20 @@ mod tests {
             tlvs: vec![],
         });
         assert!(matches!(m, UnifiedMessage::Submit(_)));
+    }
+
+    #[test]
+    fn submit_resp_is_success_reflects_status() {
+        // status==0 即成功（四协议通用），非 0 即失败。
+        let ok = UnifiedSubmitResp { msg_id: MessageId::Binary(vec![]), status: 0 };
+        let fail = UnifiedSubmitResp { msg_id: MessageId::Binary(vec![]), status: 0x45 };
+        assert!(ok.is_success());
+        assert!(!fail.is_success());
+    }
+
+    #[test]
+    fn bind_resp_is_success_reflects_status() {
+        assert!(UnifiedBindResp { status: 0 }.is_success());
+        assert!(!UnifiedBindResp { status: 0x0D }.is_success());
     }
 }
