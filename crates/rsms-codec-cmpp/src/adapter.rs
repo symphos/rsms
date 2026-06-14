@@ -1,15 +1,18 @@
 //! CmppAdapter：复用 decode_message/encode_message，做 CmppMessage ↔ UnifiedMessage 翻译。
 //! 本轮仅 V3.0（无状态 decode 默认 V3.0；V2.0 需握手版本上下文，见计划范围边界）。
 //!
-//! 已知限制（本轮）：encode 不支持 Bind/Deliver/Report（仅 Submit/SubmitResp/心跳/解绑，
-//! 与其它 adapter 一致）；Deliver 报告路径 status 暂为 Unknown（精确状态解析待后续）。
+//! 已知限制（本轮）：Deliver 报告路径 status 暂为 Unknown（精确状态解析待后续）。
+//! 本轮 encode 已补 Bind/Deliver(MO)/Report/BindResp（详见各 match 臂注释）。
 
-use crate::datatypes::{CmppVersion, CommandId, Connect, Deliver, Submit, SubmitResp};
+use crate::datatypes::{
+    CmppVersion, CommandId, Connect, ConnectResp, Deliver, DeliverResp, Submit, SubmitResp,
+};
 use crate::message::{decode_message, encode_message, CmppMessage};
 use rsms_core::{Frame, Protocol, Result, RsmsError};
 use rsms_model::{
     Address, CmppExtra, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra,
-    UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmit, UnifiedSubmitResp,
+    Sequence, UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmit,
+    UnifiedSubmitResp,
 };
 
 /// CMPP 协议适配器（V3.0）。
@@ -71,6 +74,8 @@ fn deliver_v30_to_unified(d: Deliver) -> UnifiedMessage {
         UnifiedMessage::Report(UnifiedReport {
             msg_id: MessageId::Binary(d.msg_id.to_vec()),
             status: DeliveryStatus::Unknown,
+            // 新增 src 字段：报告源地址取 src_terminal_id（dest 仍取 dest_id）。
+            src: Address::plain(d.src_terminal_id.clone()),
             dest: Address::plain(d.dest_id),
             raw: d.msg_content,
         })
@@ -93,6 +98,10 @@ fn connect_to_unified(c: Connect) -> UnifiedBind {
         authenticator: c.authenticator_source.to_vec(),
         timestamp: c.timestamp,
         version: c.version,
+        // CMPP 无 system_type/login_mode，bind 模式单一，取默认；encode 时忽略这三项。
+        system_type: None,
+        mode: rsms_model::BindMode::default(),
+        login_mode: None,
     }
 }
 
@@ -140,7 +149,9 @@ fn cmpp_to_unified(msg: CmppMessage) -> UnifiedMessage {
 }
 
 // ── Encode 方向：UnifiedMessage → CmppMessage(V3.0) → encode_message ──
-fn unified_to_cmpp(msg: &UnifiedMessage, seq: u32) -> Result<CmppMessage> {
+fn unified_to_cmpp(msg: &UnifiedMessage, seq: Sequence) -> Result<CmppMessage> {
+    // CMPP 头部序列为单字段 u32；从统一 Sequence 退化取主序列号。
+    let seq = seq.as_u32();
     let m = match msg {
         UnifiedMessage::Submit(s) => {
             let extra = match &s.extra {
@@ -185,10 +196,68 @@ fn unified_to_cmpp(msg: &UnifiedMessage, seq: u32) -> Result<CmppMessage> {
                 resp: SubmitResp { msg_id, result: r.status },
             }
         }
+        UnifiedMessage::DeliverResp => CmppMessage::DeliverResp {
+            version: CmppVersion::V30,
+            sequence_id: seq,
+            // 统一模型 DeliverResp 不携带回执 MsgId，置默认；result=0 表示成功。
+            resp: DeliverResp { msg_id: [0u8; 8], result: 0 },
+        },
         UnifiedMessage::Ping => CmppMessage::ActiveTest { version: CmppVersion::V30, sequence_id: seq },
         UnifiedMessage::PingResp => CmppMessage::ActiveTestResp { version: CmppVersion::V30, sequence_id: seq },
         UnifiedMessage::Unbind => CmppMessage::Terminate { version: CmppVersion::V30, sequence_id: seq },
         UnifiedMessage::UnbindResp => CmppMessage::TerminateResp { version: CmppVersion::V30, sequence_id: seq },
+        UnifiedMessage::Bind(b) => {
+            // authenticator 已是算好的 16B MD5，直接取前 16 字节填入定长数组，不再算 MD5。
+            let mut auth = [0u8; 16];
+            let n = b.authenticator.len().min(16);
+            auth[..n].copy_from_slice(&b.authenticator[..n]);
+            CmppMessage::Connect {
+                version: CmppVersion::V30,
+                sequence_id: seq,
+                connect: Connect {
+                    source_addr: b.client_id.clone(),
+                    authenticator_source: auth,
+                    version: b.version,
+                    timestamp: b.timestamp,
+                },
+            }
+        }
+        UnifiedMessage::Deliver(d) => {
+            // MO 上行：registered_delivery=0，其余字段用 Deliver::new() 默认。
+            let mut dl = Deliver::new();
+            dl.registered_delivery = 0;
+            dl.src_terminal_id = d.src.number.clone();
+            dl.dest_id = d.dest.number.clone();
+            dl.msg_content = d.content.clone();
+            dl.msg_fmt = fmt_from_encoding(d.encoding);
+            CmppMessage::DeliverV30 { sequence_id: seq, deliver: dl }
+        }
+        UnifiedMessage::Report(r) => {
+            // 状态报告下行：以 Deliver(registered_delivery=1) 承载。
+            let mut dl = Deliver::new();
+            dl.registered_delivery = 1;
+            if let MessageId::Binary(b) = &r.msg_id {
+                let n = b.len().min(8);
+                dl.msg_id[..n].copy_from_slice(&b[..n]);
+            }
+            dl.dest_id = r.dest.number.clone();
+            dl.src_terminal_id = r.src.number.clone();
+            dl.msg_content = r.raw.clone();
+            CmppMessage::DeliverV30 { sequence_id: seq, deliver: dl }
+        }
+        UnifiedMessage::BindResp(r) => {
+            // best-effort：统一模型不携带 ISMG 回鉴权，authenticator_ismg 用默认全 0、version 用默认 0。
+            // example 不依赖此路径；框架 AuthHandler 自走 codec 生成合规 ConnectResp，故此处够用。
+            CmppMessage::ConnectResp {
+                version: CmppVersion::V30,
+                sequence_id: seq,
+                resp: ConnectResp {
+                    status: r.status,
+                    authenticator_ismg: [0u8; 16],
+                    version: 0,
+                },
+            }
+        }
         other => {
             return Err(RsmsError::Other(format!(
                 "CMPP encode 暂不支持该消息类型: {other:?}"
@@ -206,8 +275,8 @@ impl ProtocolAdapter for CmppAdapter {
         let msg = decode_message(frame.data_as_slice())?;
         Ok(cmpp_to_unified(msg))
     }
-    fn encode(&self, msg: &UnifiedMessage, sequence_id: u32) -> Result<Vec<u8>> {
-        let cmpp = unified_to_cmpp(msg, sequence_id)?;
+    fn encode(&self, msg: &UnifiedMessage, seq: Sequence) -> Result<Vec<u8>> {
+        let cmpp = unified_to_cmpp(msg, seq)?;
         encode_message(&cmpp)
     }
 }
@@ -280,7 +349,63 @@ mod tests {
         let original = pdu.to_pdu_bytes(42).to_vec();
 
         let unified = CmppAdapter.decode(&frame_of(original.clone())).unwrap();
-        let reencoded = CmppAdapter.encode(&unified, 42).unwrap();
+        let reencoded = CmppAdapter.encode(&unified, Sequence::Plain(42)).unwrap();
         assert_eq!(reencoded, original, "CMPP V3.0 Submit 经统一模型往返后字节应无损一致");
+    }
+
+    #[test]
+    fn connect_byte_roundtrip_via_unified() {
+        // Bind：用 codec 构造 Connect PDU → decode → Bind → encode，断言字节无损一致。
+        // authenticator_source 含非零字节，验证 encode 不重算 MD5 而是原样回填。
+        let connect = Connect {
+            source_addr: "106900".to_string(),
+            authenticator_source: [0xab; 16],
+            version: 0x30,
+            timestamp: 0x01020304,
+        };
+        let original = Pdu::from(connect).to_pdu_bytes(7).to_vec();
+
+        let unified = CmppAdapter.decode(&frame_of(original.clone())).unwrap();
+        assert!(matches!(unified, UnifiedMessage::Bind(_)));
+        let reencoded = CmppAdapter.encode(&unified, Sequence::Plain(7)).unwrap();
+        assert_eq!(reencoded, original, "CMPP Connect 经统一模型往返后字节应无损一致");
+    }
+
+    #[test]
+    fn deliver_mo_byte_roundtrip_via_unified() {
+        // Deliver(MO)：registered_delivery=0。统一模型不承载 service_id/link_id 等 Deliver 方言字段，
+        // 故只让原始 PDU 的这些字段保持 Deliver::new() 默认（空），才能字节级一致。
+        let mut d = Deliver::new();
+        d.registered_delivery = 0;
+        d.src_terminal_id = "13800138000".to_string();
+        d.dest_id = "1065900000".to_string();
+        d.msg_fmt = 8;
+        d.msg_content = b"\x4e\x2d\x65\x87".to_vec();
+        let original = Pdu::from(d).to_pdu_bytes(5).to_vec();
+
+        let unified = CmppAdapter.decode(&frame_of(original.clone())).unwrap();
+        assert!(matches!(unified, UnifiedMessage::Deliver(_)));
+        let reencoded = CmppAdapter.encode(&unified, Sequence::Plain(5)).unwrap();
+        assert_eq!(reencoded, original, "CMPP Deliver(MO) 经统一模型往返后字节应无损一致");
+    }
+
+    #[test]
+    fn report_byte_roundtrip_via_unified() {
+        // Report：registered_delivery=1。统一 UnifiedReport 承载 msg_id/src/dest/raw，
+        // 不承载 service_id/link_id 等方言字段，故原始 PDU 这些字段须保持默认（空）方可字节一致。
+        // 注意 status 解码恒为 Unknown（有损点），但 encode 不读 status（仅 registered_delivery 标志），
+        // 故字节往返仍可一致。
+        let mut d = Deliver::new();
+        d.registered_delivery = 1;
+        d.msg_id = [0x67, 0x05, 0xf1, 0x03, 0x24, 0x66, 0x2f, 0x02];
+        d.src_terminal_id = "10086".to_string();
+        d.dest_id = "1065900000".to_string();
+        d.msg_content = b"DELIVRD report body".to_vec();
+        let original = Pdu::from(d).to_pdu_bytes(9).to_vec();
+
+        let unified = CmppAdapter.decode(&frame_of(original.clone())).unwrap();
+        assert!(matches!(unified, UnifiedMessage::Report(_)));
+        let reencoded = CmppAdapter.encode(&unified, Sequence::Plain(9)).unwrap();
+        assert_eq!(reencoded, original, "CMPP Report 经统一模型往返后字节应无损一致");
     }
 }
