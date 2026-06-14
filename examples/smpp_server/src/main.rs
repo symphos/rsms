@@ -42,7 +42,7 @@ use rsms_longmsg::{
     split::SmsAlphabet,
 };
 use rsms_model::{
-    Address, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra, Sequence,
+    Address, Concat, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra, Sequence,
     SmppExtra, UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmitResp,
 };
 use std::collections::{HashMap, VecDeque};
@@ -245,16 +245,22 @@ impl FileMessageSource {
             let frames = splitter.split(&wire, alphabet);
 
             if frames.len() == 1 && !frames[0].has_udhi {
-                // 普通 MO：单条 Deliver，esm_class 不置 UDH 位
-                let bytes = encode_deliver_mo(&mo.account, &mo.phone, &frames[0].content, encoding, 0);
+                // 普通 MO：单条 Deliver，无 concat
+                let bytes = encode_deliver_mo(&mo.account, &mo.phone, &frames[0].content, encoding, None);
                 source.push_sync(&mo.account, RawPdu::from(bytes));
             } else {
-                // 长短信 MO：每段 esm_class 置 TP-UDHI(0x40)，同组顺序发出
+                // 长短信 MO：每段传 concat+纯载荷，adapter 重建 UDH 并置 TP-UDHI，同组顺序发出
                 let items: Vec<Arc<dyn EncodedPdu>> = frames
                     .into_iter()
                     .map(|frame| {
+                        let concat = Some(Concat {
+                            reference: frame.reference_id,
+                            total: frame.total_segments,
+                            sequence: frame.segment_number,
+                        });
+                        let payload = UdhParser::strip_udh(&frame.content);
                         let bytes =
-                            encode_deliver_mo(&mo.account, &mo.phone, &frame.content, encoding, 0x40);
+                            encode_deliver_mo(&mo.account, &mo.phone, &payload, encoding, concat);
                         Arc::new(RawPdu::from(bytes)) as Arc<dyn EncodedPdu>
                     })
                     .collect();
@@ -391,17 +397,21 @@ impl SmppBusinessHandler {
         let resp_bytes = SmppAdapter.encode(&resp, SmppAdapter.sequence_of(frame))?;
         ctx.conn.write_frame(&resp_bytes).await?;
 
-        // 长短信合包：adapter 不透传 esm_class，对 content 直接判 UDH
-        if let Some((udh, _)) = UdhParser::extract_udh(&submit.content) {
-            let seg_num = udh.segment_number;
-            let total = udh.total_segments;
+        // 长短信合包：adapter 已把 UDH 剥成 submit.concat、content 为纯载荷；
+        // 据 concat 重建含 UDH 段交给 merger（其内部再 strip_udh 取 payload 合并）。
+        if let Some(concat) = &submit.concat {
+            let seg_num = concat.sequence;
+            let total = concat.total;
+            let mut seg_bytes = concat.to_udh_prefix();
+            seg_bytes.extend_from_slice(&submit.content);
+            let udh = UdhParser::extract_udh(&seg_bytes).map(|(h, _)| h);
             let lm_frame = LongMessageFrame::new(
-                udh.reference_id,
+                concat.reference,
                 total,
                 seg_num,
-                submit.content.clone(),
+                seg_bytes,
                 true,
-                Some(udh),
+                udh,
             );
             let mut merger = self.merger.lock().unwrap();
             match merger.add_frame(lm_frame) {
@@ -480,24 +490,21 @@ fn encode_deliver_report(account: &str, msg_id: &str, phone: &str) -> Vec<u8> {
 
 /// 构建 MO 上行字节。
 /// 统一模型 UnifiedMessage::Deliver（非回执位）→ SmppAdapter 产出 DeliverSm。
-/// esm_class=0x40 时标记 TP-UDHI（长短信分段，content 已带 UDH 头）。
+/// 传 concat（Some=长短信分段）则由 adapter 重建 UDH 并置 esm_class TP-UDHI(0x40)。
 fn encode_deliver_mo(
     account: &str,
     phone: &str,
     content: &[u8],
     encoding: Encoding,
-    esm_class: u8,
+    concat: Option<Concat>,
 ) -> Vec<u8> {
     let deliver = UnifiedMessage::Deliver(UnifiedDeliver {
         src: Address::plain(phone),
         dest: Address::plain(account),
         content: content.to_vec(),
         encoding,
-        concat: None,
-        extra: ProtocolExtra::Smpp(SmppExtra {
-            esm_class,
-            ..Default::default()
-        }),
+        concat,
+        extra: ProtocolExtra::None,
         tlvs: vec![],
     });
     SmppAdapter

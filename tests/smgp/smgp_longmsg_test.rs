@@ -1,12 +1,12 @@
 use async_trait::async_trait;
 use rsms_business::{BusinessHandler, InboundContext};
 // 窄腰统一模型：编解码统一走 SmgpAdapter + UnifiedMessage。
-// 长短信分段元数据（TP_UDHI/PK_TOTAL/PK_NUMBER）经 rsms_model::Tlv 承载，tag 复用 SMGP 常量。
+// 长短信级联信息经 rsms_model::Concat 承载：构造侧传 concat + 纯载荷，由 adapter 自动建 UDH +
+// 置 SMGP 的 TP_UDHI 可选参数 TLV(0x0002,[1])；消费侧据 concat 用 seg_with_udh 重建含 UDH 段供合包。
 use rsms_codec_smgp::adapter::SmgpAdapter;
 use rsms_codec_smgp::auth::compute_login_auth;
-use rsms_codec_smgp::datatypes::tlv::tlv_tags;
 use rsms_model::{
-    Address, BindMode, Encoding, MessageId, ProtocolAdapter, ProtocolExtra, Sequence, Tlv,
+    Address, BindMode, Concat, Encoding, MessageId, ProtocolAdapter, ProtocolExtra, Sequence,
     UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedSubmit, UnifiedSubmitResp,
 };
 use rsms_connector::{
@@ -24,11 +24,32 @@ use tokio::time::Duration;
 const TEST_ACCOUNT: &str = "106900";
 const TEST_PASSWORD: &str = "password123";
 
-/// 从统一模型 tlvs 里取某 tag 的单字节值（长度为 1 的 TLV）。
-fn tlv_byte(tlvs: &[Tlv], tag: u16) -> Option<u8> {
-    tlvs.iter()
-        .find(|t| t.tag == tag)
-        .and_then(|t| t.value.first().copied())
+/// 把 splitter 的分段帧转为窄腰模型的 (concat, 纯载荷)：has_udhi 段剥掉 UDH、concat 承载分段信息。
+fn frame_to_concat(f: &LongMessageFrame) -> (Option<Concat>, Vec<u8>) {
+    if f.has_udhi {
+        (
+            Some(Concat {
+                reference: f.reference_id,
+                total: f.total_segments,
+                sequence: f.segment_number,
+            }),
+            UdhParser::strip_udh(&f.content),
+        )
+    } else {
+        (None, f.content.clone())
+    }
+}
+
+/// 消费侧：把窄腰 (concat, 纯载荷) 重建为含 UDH 的分段字节，供既有 merge_*/has_udhi 断言复用。
+fn seg_with_udh(concat: &Option<Concat>, content: &[u8]) -> Vec<u8> {
+    match concat {
+        Some(c) => {
+            let mut v = c.to_udh_prefix();
+            v.extend_from_slice(content);
+            v
+        }
+        None => content.to_vec(),
+    }
 }
 
 struct PasswordAuthHandler;
@@ -62,16 +83,8 @@ impl AccountConfigProvider for MockAccountConfigProvider {
     }
 }
 
-#[derive(Clone)]
-struct LongMsgSegment {
-    pk_total: u8,
-    pk_number: u8,
-    tpudhi: u8,
-    msg_content: Vec<u8>,
-}
-
 struct LongMsgBizHandler {
-    received_segments: Arc<Mutex<Vec<LongMsgSegment>>>,
+    received_segments: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl LongMsgBizHandler {
@@ -92,16 +105,12 @@ impl BusinessHandler for LongMsgBizHandler {
         if let Ok(msg) = SmgpAdapter.decode(frame) {
             match msg {
                 UnifiedMessage::Submit(s) => {
-                    // 长短信分段元数据现经统一模型 tlvs 携带（tag 复用 SMGP 可选参数常量）。
-                    let tpudhi = tlv_byte(&s.tlvs, tlv_tags::TP_UDHI).unwrap_or(0);
-                    let pk_total = tlv_byte(&s.tlvs, tlv_tags::PK_TOTAL).unwrap_or(1);
-                    let pk_number = tlv_byte(&s.tlvs, tlv_tags::PK_NUMBER).unwrap_or(1);
-                    self.received_segments.lock().unwrap().push(LongMsgSegment {
-                        pk_total,
-                        pk_number,
-                        tpudhi,
-                        msg_content: s.content.clone(),
-                    });
+                    // 窄腰：adapter 已把 UDH 剥成 s.concat、s.content 为纯载荷。
+                    // 据 concat 重建含 UDH 的分段字节，供后续 merge_submit_segments 合包断言复用。
+                    self.received_segments
+                        .lock()
+                        .unwrap()
+                        .push(seg_with_udh(&s.concat, &s.content));
                     let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
                         msg_id: MessageId::Binary(vec![0u8; 10]),
                         status: 0,
@@ -167,23 +176,17 @@ impl LongMsgClientHandler {
         let frames = splitter.split(content, alphabet);
 
         frames.iter().map(|frame| {
-            // 分段元数据经统一模型 tlvs：TP_UDHI（长短信段）+ PK_TOTAL/PK_NUMBER。
-            let mut tlvs = Vec::new();
-            if frame.has_udhi {
-                tlvs.push(Tlv { tag: tlv_tags::TP_UDHI, value: vec![1] });
-            }
-            tlvs.push(Tlv { tag: tlv_tags::PK_TOTAL, value: vec![frame.total_segments] });
-            tlvs.push(Tlv { tag: tlv_tags::PK_NUMBER, value: vec![frame.segment_number] });
-
+            // 窄腰：传 concat + 纯载荷，由 adapter 重建 UDH 并置 SMGP TP_UDHI 可选参数 TLV。
+            let (concat, payload) = frame_to_concat(frame);
             let submit = UnifiedMessage::Submit(UnifiedSubmit {
                 src: Address::plain("106900"),
                 dests: vec![Address::plain("13800138000")],
-                content: frame.content.clone(),
+                content: payload,
                 encoding,
                 want_report: false,
-                concat: None,
+                concat,
                 extra: ProtocolExtra::None,
-                tlvs,
+                tlvs: vec![],
             });
             let bytes = SmgpAdapter.encode(&submit, Sequence::Plain(self.next_seq())).expect("encode submit");
             RawPdu::from(bytes)
@@ -212,9 +215,12 @@ impl ClientHandler for LongMsgClientHandler {
             UnifiedMessage::SubmitResp(_) => {
                 self.submit_resp_count.fetch_add(1, Ordering::Relaxed);
             }
-            // is_report=0 的 MO 分段：收集内容并回 DeliverResp。
+            // is_report=0 的 MO 分段：据 concat 重建含 UDH 段供合包断言复用，并回 DeliverResp。
             UnifiedMessage::Deliver(d) => {
-                self.deliver_segments.lock().unwrap().push(d.content.clone());
+                self.deliver_segments
+                    .lock()
+                    .unwrap()
+                    .push(seg_with_udh(&d.concat, &d.content));
                 let resp_bytes = SmgpAdapter.encode(&UnifiedMessage::DeliverResp, SmgpAdapter.sequence_of(frame))?;
                 ctx.conn.write_frame(&resp_bytes).await?;
             }
@@ -256,27 +262,22 @@ async fn connect_client(port: u16) -> Result<(Arc<LongMsgClientHandler>, Arc<Cli
     Ok((handler, conn))
 }
 
-fn build_deliver_mo_pdu(seq_id: u32, src: &str, dest: &str, msg_fmt: u8, tpudhi: u8, msg_content: Vec<u8>) -> RawPdu {
+fn build_deliver_mo_pdu(seq_id: u32, src: &str, dest: &str, msg_fmt: u8, concat: Option<Concat>, payload: Vec<u8>) -> RawPdu {
     let encoding = match msg_fmt {
         8 => Encoding::Ucs2,
         0 => Encoding::Ascii,
         15 => Encoding::Gbk,
         other => Encoding::Other(other),
     };
-    // 长短信段须带 TP_UDHI=1（SMGP 经可选参数 TLV 承载）。
-    let tlvs = if tpudhi > 0 {
-        vec![Tlv { tag: tlv_tags::TP_UDHI, value: vec![1] }]
-    } else {
-        vec![]
-    };
+    // 窄腰：传 concat + 纯载荷，由 adapter 重建 UDH 并置 SMGP TP_UDHI 可选参数 TLV。
     let unified = UnifiedMessage::Deliver(UnifiedDeliver {
         src: Address::plain(src),
         dest: Address::plain(dest),
-        content: msg_content,
+        content: payload,
         encoding,
-        concat: None,
+        concat,
         extra: ProtocolExtra::None,
-        tlvs,
+        tlvs: vec![],
     });
     let bytes = SmgpAdapter.encode(&unified, Sequence::Plain(seq_id)).expect("encode MO");
     RawPdu::from(bytes)
@@ -304,17 +305,16 @@ fn merge_deliver_segments(segments: &[Vec<u8>]) -> Vec<u8> {
     result.unwrap_or_default()
 }
 
-fn merge_submit_segments(segments: &[LongMsgSegment]) -> Vec<u8> {
+fn merge_submit_segments(segments: &[Vec<u8>]) -> Vec<u8> {
     let mut merger = LongMessageMerger::new();
     let mut result = None;
-    for seg in segments {
-        let content = &seg.msg_content;
+    for content in segments {
         let has_udhi = UdhParser::has_udhi(content);
         let (reference_id, total_segments, segment_number) = if has_udhi {
             if let Some((udh, _)) = UdhParser::extract_udh(content) {
                 (udh.reference_id, udh.total_segments, udh.segment_number)
             } else {
-                (0, seg.pk_total, seg.pk_number)
+                (0, 1, 1)
             }
         } else {
             (0, 1, 1)
@@ -409,8 +409,8 @@ async fn test_longmsg_mt_submit() {
     assert_eq!(segments.len(), submit_pdus.len(), "服务端应收到的分段数不匹配");
 
     for seg in segments.iter() {
-        assert!(seg.tpudhi == 1, "长短信 tpudhi 应为 1");
-        assert!(UdhParser::has_udhi(&seg.msg_content), "msg_content 应包含 UDH");
+        // adapter 据 concat 重建的段字节应含 UDH（seg_with_udh 已在 biz handler 重建）。
+        assert!(UdhParser::has_udhi(seg), "重建的分段字节应包含 UDH");
     }
 
     let merged = merge_submit_segments(&segments);
@@ -441,13 +441,14 @@ async fn test_longmsg_mo_deliver() {
     let server_conn = pool.first().await.expect("应有一个服务端连接");
 
     for (i, frame) in frames.iter().enumerate() {
+        let (concat, payload) = frame_to_concat(frame);
         let deliver_pdu = build_deliver_mo_pdu(
             (100 + i) as u32,
             "13800138000",
             "106900",
             8,
-            if frame.has_udhi { 1 } else { 0 },
-            frame.content.clone(),
+            concat,
+            payload,
         );
         server_conn.write_frame(deliver_pdu.as_slice()).await.expect("send deliver segment");
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -532,13 +533,14 @@ async fn test_longmsg_mt_and_mo_roundtrip() {
 
     let server_conn = pool.first().await.expect("应有一个服务端连接");
     for (i, frame) in deliver_frames.iter().enumerate() {
+        let (concat, payload) = frame_to_concat(frame);
         let deliver_pdu = build_deliver_mo_pdu(
             (200 + i) as u32,
             "13800138000",
             "106900",
             8,
-            if frame.has_udhi { 1 } else { 0 },
-            frame.content.clone(),
+            concat,
+            payload,
         );
         server_conn.write_frame(deliver_pdu.as_slice()).await.expect("send deliver");
         tokio::time::sleep(Duration::from_millis(50)).await;

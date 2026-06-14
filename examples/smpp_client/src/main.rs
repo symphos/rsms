@@ -20,8 +20,8 @@ use rsms_longmsg::{
     split::SmsAlphabet, LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser,
 };
 use rsms_model::{
-    Address, BindMode, Encoding, ProtocolAdapter, ProtocolExtra, Sequence, SmppExtra, UnifiedBind,
-    UnifiedMessage, UnifiedSubmit,
+    Address, BindMode, Concat, Encoding, ProtocolAdapter, ProtocolExtra, Sequence, SmppExtra,
+    UnifiedBind, UnifiedMessage, UnifiedSubmit,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -97,16 +97,16 @@ fn load_messages(path: &str) -> Vec<(String, String)> {
 /// 构造一条 SMPP 提交的统一消息。
 /// SMPP 的 registered_delivery / esm_class 是协议方言，落在 ProtocolExtra::Smpp 里；
 /// 注意 SMPP adapter 的 encode 用 extra.registered_delivery 驱动回执标志（非 want_report）。
-fn build_submit(phone: &str, content: &[u8], encoding: Encoding, esm_class: u8) -> UnifiedMessage {
+fn build_submit(phone: &str, content: &[u8], encoding: Encoding, concat: Option<Concat>) -> UnifiedMessage {
     UnifiedMessage::Submit(UnifiedSubmit {
         src: Address::plain(ACCOUNT),
         dests: vec![Address::plain(phone)],
         content: content.to_vec(),
         encoding,
         want_report: true,
-        concat: None,
+        // 传 concat（Some=长短信分段），adapter 据此重建 UDH 并置 esm_class TP-UDHI(0x40)。
+        concat,
         extra: ProtocolExtra::Smpp(SmppExtra {
-            esm_class,
             registered_delivery: 1, // 需要状态报告
             ..Default::default()
         }),
@@ -138,7 +138,7 @@ impl ClientMessageSource {
             let frames = splitter.split(&wire, alphabet);
 
             if frames.len() == 1 && !frames[0].has_udhi {
-                let msg = build_submit(phone, &frames[0].content, encoding, 0);
+                let msg = build_submit(phone, &frames[0].content, encoding, None);
                 let bytes = SmppAdapter
                     .encode(&msg, Sequence::Plain(next_seq()))
                     .expect("encode submit");
@@ -146,11 +146,17 @@ impl ClientMessageSource {
                     Arc::new(RawPdu::from(bytes)) as Arc<dyn EncodedPdu>
                 ));
             } else {
-                // 长短信：每段 esm_class 置 TP-UDHI(0x40)，同组顺序发出
+                // 长短信：每段传 concat+纯载荷，adapter 重建 UDH 并置 TP-UDHI，同组顺序发出
                 let items: Vec<Arc<dyn EncodedPdu>> = frames
                     .into_iter()
                     .map(|frame| {
-                        let msg = build_submit(phone, &frame.content, encoding, 0x40);
+                        let concat = Some(Concat {
+                            reference: frame.reference_id,
+                            total: frame.total_segments,
+                            sequence: frame.segment_number,
+                        });
+                        let payload = UdhParser::strip_udh(&frame.content);
+                        let msg = build_submit(phone, &payload, encoding, concat);
                         let bytes = SmppAdapter
                             .encode(&msg, Sequence::Plain(next_seq()))
                             .expect("encode submit segment");
@@ -213,18 +219,22 @@ impl SmppClientHandler {
         }
     }
 
-    /// 处理上行短信内容：含 UDH 则合包，否则直接呈现（按编码正确解码显示）。
-    fn handle_mo(&self, src: &str, dest: &str, content: Vec<u8>, encoding: Encoding) {
-        if let Some((udh, _)) = UdhParser::extract_udh(&content) {
+    /// 处理上行短信内容：有 concat 则合包，否则直接呈现（按编码正确解码显示）。
+    /// adapter 已把 UDH 剥成 concat、content 为纯载荷；据 concat 重建含 UDH 段交 merger。
+    fn handle_mo(&self, src: &str, dest: &str, concat: Option<&Concat>, content: Vec<u8>, encoding: Encoding) {
+        if let Some(c) = concat {
+            let mut seg = c.to_udh_prefix();
+            seg.extend_from_slice(&content);
+            let udh = UdhParser::extract_udh(&seg).map(|(h, _)| h);
             let frame =
-                LongMessageFrame::new(udh.reference_id, udh.total_segments, udh.segment_number, content, true, Some(udh.clone()));
+                LongMessageFrame::new(c.reference, c.total, c.sequence, seg, true, udh);
             let mut merger = self.mo_merger.lock().unwrap();
             match merger.add_frame(frame) {
                 Ok(Some(merged)) => tracing::info!(
                     "长短信 MO 合包完成: src={}, dest={}, content={}",
                     src, dest, decode_text(&merged, encoding)
                 ),
-                Ok(None) => tracing::debug!("长短信 MO 分段 {}/{} 等待更多分段", udh.segment_number, udh.total_segments),
+                Ok(None) => tracing::debug!("长短信 MO 分段 {}/{} 等待更多分段", c.sequence, c.total),
                 Err(e) => tracing::warn!("长短信 MO 合包失败: {}", e),
             }
         } else {
@@ -276,7 +286,7 @@ impl ClientHandler for SmppClientHandler {
             }
             UnifiedMessage::Deliver(deliver) => {
                 let enc = deliver.encoding;
-                self.handle_mo(&deliver.src.number, &deliver.dest.number, deliver.content, enc);
+                self.handle_mo(&deliver.src.number, &deliver.dest.number, deliver.concat.as_ref(), deliver.content, enc);
                 reply_deliver_resp(ctx, frame).await?;
             }
             UnifiedMessage::UnbindResp => tracing::info!("收到 UnbindResp，连接将关闭"),

@@ -32,7 +32,7 @@ use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Frame, Protocol, Raw
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
 use rsms_model::{
-    Address, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra, Sequence,
+    Address, Concat, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra, Sequence,
     SgipExtra, UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmitResp,
 };
 use std::collections::{HashMap, VecDeque};
@@ -266,19 +266,15 @@ impl FileMessageSource {
                 let frames = splitter.split(&wire, alphabet);
                 let mut items = Vec::new();
                 for frame in frames {
-                    let pdu = build_deliver_mo_with_udh(
-                        &mo.account,
-                        &mo.phone,
-                        &frame.content,
-                        encoding,
-                        frame.has_udhi,
-                    );
+                    // 窄腰：把分段帧转为 (concat, 纯载荷)，由 adapter 重建 UDH 并置 tp_udhi。
+                    let (concat, payload) = frame_to_concat(&frame);
+                    let pdu = build_deliver_mo(&mo.account, &mo.phone, &payload, encoding, concat);
                     items.push(Arc::new(pdu) as Arc<dyn EncodedPdu>);
                 }
                 source.push_group_sync(&mo.account, MessageItem::Group { items });
             } else {
-                // 单条：直接用 wire 字节构造 Deliver，不再用原始 UTF-8。
-                let pdu = build_deliver_mo_wire(&mo.account, &mo.phone, &wire, encoding);
+                // 单条：直接用 wire 字节构造 Deliver（无 concat），不再用原始 UTF-8。
+                let pdu = build_deliver_mo(&mo.account, &mo.phone, &wire, encoding, None);
                 source.push_sync(&mo.account, pdu);
             }
         }
@@ -536,33 +532,41 @@ fn build_report(submit_seq: &Sequence, phone: &str, report_number: u32) -> RawPd
     RawPdu::from(bytes)
 }
 
-/// 构建单条 MO 上行 Deliver（接受已转换的 wire 字节 + 编码）。
-/// 调用方须先用 `to_wire_bytes` 把文本转为正确的线路字节
-/// （UCS2 → UTF-16BE），再传入此函数，避免对端按 UTF-16BE 解 UTF-8 导致乱码。
-fn build_deliver_mo_wire(account: &str, phone: &str, wire: &[u8], encoding: Encoding) -> RawPdu {
-    build_deliver_mo_with_udh(account, phone, wire, encoding, false)
+/// 把 splitter 的分段帧转为窄腰模型的 (concat, 纯载荷)：has_udhi 段剥掉 UDH、concat 承载分段信息。
+fn frame_to_concat(f: &LongMessageFrame) -> (Option<Concat>, Vec<u8>) {
+    if f.has_udhi {
+        (
+            Some(Concat {
+                reference: f.reference_id,
+                total: f.total_segments,
+                sequence: f.segment_number,
+            }),
+            UdhParser::strip_udh(&f.content),
+        )
+    } else {
+        (None, f.content.clone())
+    }
 }
 
-/// 构建 MO 上行 Deliver（可带 UDH，用于长短信分段）。
+/// 构建 MO 上行 Deliver（窄腰：传 concat + 纯载荷，由 adapter 重建 UDH 并置 tp_udhi）。
+/// - 调用方须先用 `to_wire_bytes` 把文本转为正确的线路字节（UCS2 → UTF-16BE），
+///   再（必要时）经 splitter 拆分、`frame_to_concat` 转为纯载荷传入。
 /// - src=sp_number(account)，dest=user_number(phone)（与 adapter decode 对称）
-/// - tpudhi 经 SgipExtra 传递；头部序列 Sequence::Sgip{NODE_ID, sgip_timestamp(), 0}
-fn build_deliver_mo_with_udh(
+/// - 单条短信传 concat=None；长短信分段传 Some(concat)；头部序列 Sequence::Sgip{NODE_ID, sgip_timestamp(), 0}
+fn build_deliver_mo(
     account: &str,
     phone: &str,
-    content: &[u8],
+    payload: &[u8],
     encoding: Encoding,
-    has_udhi: bool,
+    concat: Option<Concat>,
 ) -> RawPdu {
     let deliver = UnifiedMessage::Deliver(UnifiedDeliver {
         src: Address::plain(account),
         dest: Address::plain(phone),
-        content: content.to_vec(),
+        content: payload.to_vec(),
         encoding,
-        concat: None,
-        extra: ProtocolExtra::Sgip(SgipExtra {
-            tpudhi: if has_udhi { 1 } else { 0 },
-            ..Default::default()
-        }),
+        concat,
+        extra: ProtocolExtra::None,
         tlvs: vec![],
     });
 

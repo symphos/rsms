@@ -29,8 +29,8 @@ use rsms_core::{EncodedPdu, EndpointConfig, Frame, Protocol, RawPdu, Result};
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
 use rsms_model::{
-    Address, BindMode, Encoding, ProtocolAdapter, ProtocolExtra, Sequence, SgipExtra, UnifiedBind,
-    UnifiedMessage, UnifiedSubmit,
+    Address, BindMode, Concat, Encoding, ProtocolAdapter, ProtocolExtra, Sequence, SgipExtra,
+    UnifiedBind, UnifiedMessage, UnifiedSubmit,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -122,18 +122,16 @@ fn load_messages(path: &str) -> Vec<(String, String)> {
 /// SGIP 方言（charge_number/corp_id/service_type/fee_*/tppid/tpudhi/message_type 等）
 /// 落在 ProtocolExtra::Sgip(SgipExtra)，由 SgipAdapter.encode 还原回裸 Submit 字段。
 /// tpudhi=1 标记长短信分段（含 UDH），单条短信 tpudhi=0。
-fn build_submit(phone: &str, content: &[u8], encoding: Encoding, tpudhi: u8) -> UnifiedMessage {
+fn build_submit(phone: &str, content: &[u8], encoding: Encoding, concat: Option<Concat>) -> UnifiedMessage {
     UnifiedMessage::Submit(UnifiedSubmit {
         src: Address::plain(SP_NUMBER),
         dests: vec![Address::plain(phone)],
         content: content.to_vec(),
         encoding,
         want_report: true, // report_flag=1：请求状态报告
-        concat: None,
-        extra: ProtocolExtra::Sgip(SgipExtra {
-            tpudhi,
-            ..Default::default()
-        }),
+        // 传 concat（Some=长短信分段），adapter 据此重建 UDH 并置 tp_udhi=1。
+        concat,
+        extra: ProtocolExtra::Sgip(SgipExtra::default()),
         tlvs: vec![],
     })
 }
@@ -183,14 +181,23 @@ impl ClientMessageSource {
             let wire = to_wire_bytes(content, alphabet);
 
             if wire.len() > single_max {
-                // 长短信：每段 tpudhi=1（内容含 UDH），同组顺序发出（框架保证同连接有序）
+                // 长短信：每段传 concat+纯载荷，adapter 重建 UDH 并置 tp_udhi=1，同组顺序发出
                 let frames = splitter.split(&wire, alphabet);
                 let total = frames.len();
                 let items: Vec<Arc<dyn EncodedPdu>> = frames
                     .into_iter()
                     .map(|frame| {
-                        let tpudhi = if frame.has_udhi { 1 } else { 0 };
-                        let msg = build_submit(phone, &frame.content, encoding, tpudhi);
+                        let concat = if frame.has_udhi {
+                            Some(Concat {
+                                reference: frame.reference_id,
+                                total: frame.total_segments,
+                                sequence: frame.segment_number,
+                            })
+                        } else {
+                            None
+                        };
+                        let payload = UdhParser::strip_udh(&frame.content);
+                        let msg = build_submit(phone, &payload, encoding, concat);
                         let bytes = SgipAdapter
                             .encode(&msg, next_seq())
                             .expect("encode submit segment");
@@ -206,8 +213,8 @@ impl ClientMessageSource {
                 );
                 queue.push_back(MessageItem::Group { items });
             } else {
-                // 单段短信：直接用 wire 字节
-                let msg = build_submit(phone, &wire, encoding, 0);
+                // 单段短信：直接用 wire 字节，无 concat
+                let msg = build_submit(phone, &wire, encoding, None);
                 let bytes = SgipAdapter
                     .encode(&msg, next_seq())
                     .expect("encode submit");
@@ -281,18 +288,15 @@ impl SgipClientHandler {
         }
     }
 
-    /// 处理上行短信内容：含 UDH 则合包，否则直接呈现。
+    /// 处理上行短信内容：有 concat 则合包，否则直接呈现。
+    /// adapter 已把 UDH 剥成 concat、content 为纯载荷；据 concat 重建含 UDH 段交 merger。
     /// encoding 用于按正确编码解码显示（UCS2→UTF-16BE，其余→UTF-8 宽松）。
-    fn handle_mo(&self, src: &str, content: Vec<u8>, encoding: Encoding) {
-        if let Some((udh, _)) = UdhParser::extract_udh(&content) {
-            let frame = LongMessageFrame::new(
-                udh.reference_id,
-                udh.total_segments,
-                udh.segment_number,
-                content,
-                true,
-                Some(udh.clone()),
-            );
+    fn handle_mo(&self, src: &str, concat: Option<&Concat>, content: Vec<u8>, encoding: Encoding) {
+        if let Some(c) = concat {
+            let mut seg = c.to_udh_prefix();
+            seg.extend_from_slice(&content);
+            let udh = UdhParser::extract_udh(&seg).map(|(h, _)| h);
+            let frame = LongMessageFrame::new(c.reference, c.total, c.sequence, seg, true, udh);
             let mut merger = self.mo_merger.lock().unwrap();
             match merger.add_frame(frame) {
                 Ok(Some(merged)) => tracing::info!(
@@ -302,8 +306,8 @@ impl SgipClientHandler {
                 ),
                 Ok(None) => tracing::info!(
                     "长短信 MO 分段 {}/{} 等待更多分段",
-                    udh.segment_number,
-                    udh.total_segments
+                    c.sequence,
+                    c.total
                 ),
                 Err(e) => tracing::warn!("长短信 MO 合包失败: {}", e),
             }
@@ -358,7 +362,7 @@ impl ClientHandler for SgipClientHandler {
             UnifiedMessage::Deliver(deliver) => {
                 reply_deliver_resp(ctx, frame).await?;
                 // 传入 deliver.encoding，handle_mo 按编码正确解码显示内容
-                self.handle_mo(&deliver.dest.number, deliver.content, deliver.encoding);
+                self.handle_mo(&deliver.dest.number, deliver.concat.as_ref(), deliver.content, deliver.encoding);
             }
             UnifiedMessage::UnbindResp => tracing::debug!("收到 UnbindResp"),
             other => tracing::warn!("收到未处理统一消息: {:?}", other),

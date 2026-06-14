@@ -3,7 +3,7 @@ use rsms_business::{BusinessHandler, InboundContext};
 // 窄腰统一模型：收发一律走 SgipAdapter + UnifiedMessage，不再手构裸 codec / 手剥头部字节。
 use rsms_codec_sgip::adapter::SgipAdapter;
 use rsms_model::{
-    Address, Encoding, ProtocolAdapter, ProtocolExtra, Sequence, SgipExtra, UnifiedBind,
+    Address, Concat, Encoding, ProtocolAdapter, ProtocolExtra, Sequence, SgipExtra, UnifiedBind,
     UnifiedDeliver, UnifiedMessage, UnifiedSubmit, UnifiedSubmitResp,
 };
 use rsms_connector::client::{ClientConfig, ClientContext, ClientHandler};
@@ -18,6 +18,34 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::time::Duration;
+
+/// 把 splitter 的分段帧转为窄腰模型的 (concat, 纯载荷)：has_udhi 段剥掉 UDH、concat 承载分段信息。
+fn frame_to_concat(f: &LongMessageFrame) -> (Option<Concat>, Vec<u8>) {
+    if f.has_udhi {
+        (
+            Some(Concat {
+                reference: f.reference_id,
+                total: f.total_segments,
+                sequence: f.segment_number,
+            }),
+            UdhParser::strip_udh(&f.content),
+        )
+    } else {
+        (None, f.content.clone())
+    }
+}
+
+/// 消费侧：把窄腰 (concat, 纯载荷) 重建为含 UDH 的分段字节，供既有 merge_segments/has_udhi 断言复用。
+fn seg_with_udh(concat: &Option<Concat>, content: &[u8]) -> Vec<u8> {
+    match concat {
+        Some(c) => {
+            let mut v = c.to_udh_prefix();
+            v.extend_from_slice(content);
+            v
+        }
+        None => content.to_vec(),
+    }
+}
 
 const TEST_ACCOUNT: &str = "106900";
 const TEST_PASSWORD: &str = "password123";
@@ -94,14 +122,16 @@ impl BusinessHandler for LongMsgBizHandler {
 
     async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
         if let Ok(UnifiedMessage::Submit(s)) = SgipAdapter.decode(frame) {
-            // tpudhi 取自 SGIP 方言字段；msg_content 即 submit.content。
+            // tpudhi 取自 SGIP 方言字段（adapter 据 concat 已置位）；
+            // 窄腰：adapter 已把 UDH 剥成 s.concat、s.content 为纯载荷，
+            // 这里据 concat 重建含 UDH 的分段字节，供后续 has_udhi/merge 断言复用。
             let tpudhi = match &s.extra {
                 ProtocolExtra::Sgip(e) => e.tpudhi,
                 _ => 0,
             };
             self.received_segments.lock().unwrap().push(SgipSegment {
                 tpudhi,
-                msg_content: s.content.clone(),
+                msg_content: seg_with_udh(&s.concat, &s.content),
             });
 
             // 回 SubmitResp：序列用 sequence_of 回显请求复合序列。
@@ -170,18 +200,16 @@ impl LongMsgClientHandler {
         let start_number = start_number;
 
         frames.iter().enumerate().map(|(i, frame)| {
-            // 长短信分段：tpudhi=1 标记含 UDH；report_flag=0；方言走 SgipExtra。
+            // 窄腰：传 concat + 纯载荷，由 adapter 重建 UDH 并置 tp_udhi=1。
+            let (concat, payload) = frame_to_concat(frame);
             let submit = UnifiedMessage::Submit(UnifiedSubmit {
                 src: Address::plain("106900"),
                 dests: vec![Address::plain("13800138000")],
-                content: frame.content.clone(),
+                content: payload,
                 encoding,
                 want_report: false, // report_flag=0
-                concat: None,
-                extra: ProtocolExtra::Sgip(SgipExtra {
-                    tpudhi: if frame.has_udhi { 1 } else { 0 },
-                    ..Default::default()
-                }),
+                concat,
+                extra: ProtocolExtra::Sgip(SgipExtra::default()),
                 tlvs: vec![],
             });
             let number = start_number + i as u32;
@@ -213,7 +241,12 @@ impl ClientHandler for LongMsgClientHandler {
                 self.submit_resp_count.fetch_add(1, Ordering::Relaxed);
             }
             UnifiedMessage::Deliver(d) => {
-                self.deliver_segments.lock().unwrap().push(d.content.clone());
+                // 窄腰：adapter 已把 UDH 剥成 d.concat、d.content 为纯载荷；
+                // 据 concat 重建含 UDH 段供合包断言复用。
+                self.deliver_segments
+                    .lock()
+                    .unwrap()
+                    .push(seg_with_udh(&d.concat, &d.content));
                 // 回 DeliverResp：序列用 sequence_of 回显请求复合序列。
                 let resp_bytes =
                     SgipAdapter.encode(&UnifiedMessage::DeliverResp, SgipAdapter.sequence_of(frame))?;
@@ -232,22 +265,23 @@ fn build_deliver_mo_pdu(
     user: &str,
     sp: &str,
     msg_fmt: u8,
-    tpudhi: u8,
-    msg_content: Vec<u8>,
+    concat: Option<Concat>,
+    payload: Vec<u8>,
 ) -> RawPdu {
     // msg_fmt → 统一 Encoding（8=UCS2，否则 ASCII）。
     let encoding = match msg_fmt {
         8 => Encoding::Ucs2,
         _ => Encoding::Ascii,
     };
-    // MO 上行 Deliver（统一模型）：decode 对称 src=sp_number, dest=user_number；tpudhi 经 SgipExtra。
+    // 窄腰：传 concat + 纯载荷，由 adapter 重建 UDH 并置 tp_udhi=1。
+    // decode 对称 src=sp_number, dest=user_number。
     let deliver = UnifiedMessage::Deliver(UnifiedDeliver {
         src: Address::plain(sp),
         dest: Address::plain(user),
-        content: msg_content,
+        content: payload,
         encoding,
-        concat: None,
-        extra: ProtocolExtra::Sgip(SgipExtra { tpudhi, ..Default::default() }),
+        concat,
+        extra: ProtocolExtra::None,
         tlvs: vec![],
     });
     let seq = Sequence::Sgip { node_id, timestamp, number };
@@ -439,6 +473,7 @@ async fn test_longmsg_mo_deliver() {
     let server_conn = pool.first().await.expect("应有一个服务端连接");
 
     for (i, frame) in frames.iter().enumerate() {
+        let (concat, payload) = frame_to_concat(frame);
         let deliver_pdu = build_deliver_mo_pdu(
             SGIP_NODE_ID,
             SGIP_TIMESTAMP,
@@ -446,8 +481,8 @@ async fn test_longmsg_mo_deliver() {
             "13800138000",
             "106900",
             8,
-            if frame.has_udhi { 1 } else { 0 },
-            frame.content.clone(),
+            concat,
+            payload,
         );
         server_conn.write_frame(deliver_pdu.as_bytes()).await.expect("send deliver segment");
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -532,6 +567,7 @@ async fn test_longmsg_mt_and_mo_roundtrip() {
 
     let server_conn = pool.first().await.expect("应有一个服务端连接");
     for (i, frame) in deliver_frames.iter().enumerate() {
+        let (concat, payload) = frame_to_concat(frame);
         let deliver_pdu = build_deliver_mo_pdu(
             SGIP_NODE_ID,
             SGIP_TIMESTAMP,
@@ -539,8 +575,8 @@ async fn test_longmsg_mt_and_mo_roundtrip() {
             "13800138000",
             "106900",
             8,
-            if frame.has_udhi { 1 } else { 0 },
-            frame.content.clone(),
+            concat,
+            payload,
         );
         server_conn.write_frame(deliver_pdu.as_bytes()).await.expect("send deliver");
         tokio::time::sleep(Duration::from_millis(50)).await;

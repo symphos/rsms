@@ -10,9 +10,9 @@ use crate::datatypes::{
 use crate::message::{decode_message, encode_message, CmppMessage};
 use rsms_core::{Frame, Protocol, Result, RsmsError};
 use rsms_model::{
-    Address, CmppExtra, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra,
-    Sequence, UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmit,
-    UnifiedSubmitResp,
+    Address, CmppExtra, Concat, DeliveryStatus, Encoding, MessageId, ProtocolAdapter,
+    ProtocolExtra, Sequence, UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedReport,
+    UnifiedSubmit, UnifiedSubmitResp,
 };
 
 /// CMPP 协议适配器（V3.0）。
@@ -38,14 +38,41 @@ fn fmt_from_encoding(enc: Encoding) -> u8 {
     }
 }
 
+/// 解码侧：CMPP 的 UDHI 标志在独立字段 tp_udhi（u8）。仅当 tp_udhi 置位且正文以级联 UDH 开头时，
+/// 剥离 UDH → (Some(concat), payload)；否则 (None, 原正文)。gate on tp_udhi 避免误判普通正文。
+fn split_udh(tp_udhi: u8, content: Vec<u8>) -> (Option<Concat>, Vec<u8>) {
+    if tp_udhi != 0 {
+        if let Some((c, off)) = Concat::from_udh(&content) {
+            return (Some(c), content[off..].to_vec());
+        }
+    }
+    (None, content)
+}
+
+/// 编码侧：有 concat 则前置级联 UDH 到正文并把 tp_udhi 置 1；否则原样、tp_udhi 保持入参。
+fn join_udh(concat: &Option<Concat>, content: &[u8], tp_udhi: u8) -> (Vec<u8>, u8) {
+    match concat {
+        Some(c) => {
+            let mut body = c.to_udh_prefix();
+            body.extend_from_slice(content);
+            (body, 1)
+        }
+        None => (content.to_vec(), tp_udhi),
+    }
+}
+
 fn submit_v30_to_unified(s: Submit) -> UnifiedSubmit {
+    // 级联长短信：CMPP 用独立 tp_udhi 字段标记正文以 UDH 开头。仅当 tp_udhi 置位且为有效级联 UDH
+    // 时剥离 → concat 承载分段信息、content 为纯 payload；否则 concat=None、content 原样。
+    // CmppExtra.tpudhi 仍透传原值（与 concat 一致），encode 据 concat 重建并置 tpudhi=1。
+    let (concat, content) = split_udh(s.tpudhi, s.msg_content);
     UnifiedSubmit {
         src: Address::plain(s.src_id),
         dests: s.dest_terminal_ids.into_iter().map(Address::plain).collect(),
-        content: s.msg_content,
+        content,
         encoding: encoding_from_fmt(s.msg_fmt),
         want_report: s.registered_delivery != 0,
-        concat: None,
+        concat,
         extra: ProtocolExtra::Cmpp(CmppExtra {
             msg_id: s.msg_id,
             pk_total: s.pk_total,
@@ -85,12 +112,14 @@ fn deliver_v30_to_unified(d: Deliver) -> UnifiedMessage {
             raw: d.msg_content,
         })
     } else {
+        // MO 长短信分段：同 Submit，按 tp_udhi 标志剥离级联 UDH → concat、content 为纯 payload。
+        let (concat, content) = split_udh(d.tpudhi, d.msg_content);
         UnifiedMessage::Deliver(UnifiedDeliver {
             src: Address::plain(d.src_terminal_id),
             dest: Address::plain(d.dest_id),
-            content: d.msg_content,
+            content,
             encoding: encoding_from_fmt(d.msg_fmt),
-            concat: None,
+            concat,
             extra: ProtocolExtra::None,
             tlvs: vec![],
         })
@@ -174,7 +203,6 @@ fn unified_to_cmpp(msg: &UnifiedMessage, seq: Sequence) -> Result<CmppMessage> {
             sub.fee_terminal_id = extra.fee_terminal_id;
             sub.fee_terminal_type = extra.fee_terminal_type;
             sub.tppid = extra.tppid;
-            sub.tpudhi = extra.tpudhi;
             sub.msg_fmt = fmt_from_encoding(s.encoding);
             sub.msg_src = extra.msg_src;
             sub.fee_type = extra.fee_type;
@@ -185,7 +213,10 @@ fn unified_to_cmpp(msg: &UnifiedMessage, seq: Sequence) -> Result<CmppMessage> {
             sub.dest_usr_tl = s.dests.len() as u8;
             sub.dest_terminal_ids = s.dests.iter().map(|a| a.number.clone()).collect();
             sub.dest_terminal_type = extra.dest_terminal_type;
-            sub.msg_content = s.content.clone();
+            // 有 concat 则前置级联 UDH 到正文并置 tp_udhi=1；否则正文原样、tp_udhi 沿用 extra。
+            let (udh_body, tpudhi) = join_udh(&s.concat, &s.content, extra.tpudhi);
+            sub.tpudhi = tpudhi;
+            sub.msg_content = udh_body;
             sub.link_id = extra.link_id;
             CmppMessage::SubmitV30 { sequence_id: seq, submit: sub }
         }
@@ -233,7 +264,10 @@ fn unified_to_cmpp(msg: &UnifiedMessage, seq: Sequence) -> Result<CmppMessage> {
             dl.registered_delivery = 0;
             dl.src_terminal_id = d.src.number.clone();
             dl.dest_id = d.dest.number.clone();
-            dl.msg_content = d.content.clone();
+            // 有 concat 则前置级联 UDH 到正文并置 tp_udhi=1；否则正文原样、tp_udhi=0。
+            let (udh_body, tpudhi) = join_udh(&d.concat, &d.content, 0);
+            dl.tpudhi = tpudhi;
+            dl.msg_content = udh_body;
             dl.msg_fmt = fmt_from_encoding(d.encoding);
             CmppMessage::DeliverV30 { sequence_id: seq, deliver: dl }
         }
@@ -412,6 +446,56 @@ mod tests {
         assert!(matches!(unified, UnifiedMessage::Report(_)));
         let reencoded = CmppAdapter.encode(&unified, Sequence::Plain(9)).unwrap();
         assert_eq!(reencoded, original, "CMPP Report 经统一模型往返后字节应无损一致");
+    }
+
+    #[test]
+    fn submit_concat_udh_roundtrip_via_unified() {
+        // tp_udhi=1 + 8-bit 级联 UDH(05 00 03 ref total seq) + payload。
+        // decode 应剥 UDH 填 concat、content 为纯 payload；encode 据 concat 重建 UDH 并置 tp_udhi=1，
+        // 字节与原始无损一致。
+        let mut s = Submit::new();
+        s.src_id = "10086".to_string();
+        s.dest_terminal_ids = vec!["13800138000".to_string()];
+        s.dest_usr_tl = 1;
+        s.msg_fmt = 8;
+        s.tpudhi = 1;
+        s.msg_content = vec![0x05, 0x00, 0x03, 7, 2, 1, 0x4e, 0x2d];
+        let original = Pdu::from(s).to_pdu_bytes(30).to_vec();
+
+        let unified = CmppAdapter.decode(&frame_of(original.clone())).unwrap();
+        match &unified {
+            UnifiedMessage::Submit(u) => {
+                assert_eq!(u.concat, Some(Concat { reference: 7, total: 2, sequence: 1 }));
+                assert_eq!(u.content, vec![0x4e, 0x2d], "content 应为剥离 UDH 后的纯 payload");
+            }
+            other => panic!("expected Submit, got {other:?}"),
+        }
+        let reencoded = CmppAdapter.encode(&unified, Sequence::Plain(30)).unwrap();
+        assert_eq!(reencoded, original, "级联 Submit 经统一模型往返字节应无损一致");
+    }
+
+    #[test]
+    fn deliver_mo_concat_udh_roundtrip_via_unified() {
+        // MO（registered_delivery=0）级联：tp_udhi=1 + 8-bit 级联 UDH + payload，字节往返无损一致。
+        let mut d = Deliver::new();
+        d.registered_delivery = 0;
+        d.src_terminal_id = "13800138000".to_string();
+        d.dest_id = "10086".to_string();
+        d.msg_fmt = 8;
+        d.tpudhi = 1;
+        d.msg_content = vec![0x05, 0x00, 0x03, 9, 3, 2, 0x65, 0x87];
+        let original = Pdu::from(d).to_pdu_bytes(31).to_vec();
+
+        let unified = CmppAdapter.decode(&frame_of(original.clone())).unwrap();
+        match &unified {
+            UnifiedMessage::Deliver(u) => {
+                assert_eq!(u.concat, Some(Concat { reference: 9, total: 3, sequence: 2 }));
+                assert_eq!(u.content, vec![0x65, 0x87], "content 应为剥离 UDH 后的纯 payload");
+            }
+            other => panic!("expected Deliver, got {other:?}"),
+        }
+        let reencoded = CmppAdapter.encode(&unified, Sequence::Plain(31)).unwrap();
+        assert_eq!(reencoded, original, "级联 Deliver(MO) 经统一模型往返字节应无损一致");
     }
 
     #[test]
