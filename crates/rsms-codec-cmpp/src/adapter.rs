@@ -5,8 +5,8 @@
 //! 本轮 encode 已补 Bind/Deliver(MO)/Report/BindResp（详见各 match 臂注释）。
 
 use crate::datatypes::{
-    CmppVersion, CommandId, Connect, ConnectResp, Deliver, DeliverResp, Submit, SubmitResp,
-    SubmitV20,
+    CmppVersion, CommandId, Connect, ConnectResp, Deliver, DeliverResp, DeliverV20, Submit,
+    SubmitResp, SubmitV20,
 };
 use crate::message::{decode_message, decode_message_with_version, encode_message, CmppMessage};
 use rsms_core::{Frame, Protocol, Result, RsmsError};
@@ -161,6 +161,35 @@ fn deliver_v30_to_unified(d: Deliver) -> UnifiedMessage {
     }
 }
 
+/// V2.0 Deliver → 统一模型。registered_delivery=1 为状态报告(→Report，含 stat 解析；
+/// 注：UnifiedReport 无 version 字段，V2.0 报告无法回 encode 为 V2.0——属模型边界，decode 仍可读)；
+/// 否则为 MO 上行(→Deliver，extra.version=0x20 供 encode 回产 DeliverV20)。
+fn deliver_v20_to_unified(d: DeliverV20) -> UnifiedMessage {
+    if d.registered_delivery == 1 {
+        let status = crate::datatypes::CmppReport::parse(&d.msg_content)
+            .map(|r| DeliveryStatus::from_stat_code(&r.stat))
+            .unwrap_or(DeliveryStatus::Unknown);
+        UnifiedMessage::Report(UnifiedReport {
+            msg_id: MessageId::Binary(d.msg_id.to_vec()),
+            status,
+            src: Address::plain(d.src_terminal_id),
+            dest: Address::plain(d.dest_id),
+            raw: d.msg_content,
+        })
+    } else {
+        let (concat, content) = split_udh(d.tpudhi, d.msg_content);
+        UnifiedMessage::Deliver(UnifiedDeliver {
+            src: Address::plain(d.src_terminal_id),
+            dest: Address::plain(d.dest_id),
+            content,
+            encoding: encoding_from_fmt(d.msg_fmt),
+            concat,
+            extra: ProtocolExtra::Cmpp(CmppExtra { version: 0x20, ..Default::default() }),
+            tlvs: vec![],
+        })
+    }
+}
+
 fn connect_to_unified(c: Connect) -> UnifiedBind {
     UnifiedBind {
         client_id: c.source_addr,
@@ -199,9 +228,8 @@ fn cmpp_to_unified(msg: CmppMessage) -> UnifiedMessage {
         CmppMessage::SubmitV20 { submit, .. } => UnifiedMessage::Submit(submit_v20_to_unified(submit)),
         // Deliver V2.0、Query/Cancel 等本轮退化为 Unknown（仅 shadow 日志可见），保留真实
         // command_id 便于诊断；match 改为穷尽，未来新增变体触发编译错误而非静默归零。
-        CmppMessage::DeliverV20 { .. } => {
-            UnifiedMessage::Unknown { command_id: CommandId::Deliver as u32, raw: vec![] }
-        }
+        // V2.0 Deliver → 统一模型（仅经 decode_with_version(V20) 解出时到达）。
+        CmppMessage::DeliverV20 { deliver, .. } => deliver_v20_to_unified(deliver),
         CmppMessage::Query { .. } => {
             UnifiedMessage::Unknown { command_id: CommandId::Query as u32, raw: vec![] }
         }
@@ -321,17 +349,32 @@ fn unified_to_cmpp(msg: &UnifiedMessage, seq: Sequence) -> Result<CmppMessage> {
             }
         }
         UnifiedMessage::Deliver(d) => {
-            // MO 上行：registered_delivery=0，其余字段用 Deliver::new() 默认。
-            let mut dl = Deliver::new();
-            dl.registered_delivery = 0;
-            dl.src_terminal_id = d.src.number.clone();
-            dl.dest_id = d.dest.number.clone();
             // 有 concat 则前置级联 UDH 到正文并置 tp_udhi=1；否则正文原样、tp_udhi=0。
             let (udh_body, tpudhi) = join_udh(&d.concat, &d.content, 0);
-            dl.tpudhi = tpudhi;
-            dl.msg_content = udh_body;
-            dl.msg_fmt = fmt_from_encoding(d.encoding);
-            CmppMessage::DeliverV30 { sequence_id: seq, deliver: dl }
+            let version = match &d.extra {
+                ProtocolExtra::Cmpp(e) => e.version,
+                _ => 0,
+            };
+            // MO 上行：registered_delivery=0。version=0x20 产 DeliverV20，否则 DeliverV30。
+            if version == 0x20 {
+                let mut dl = DeliverV20::new();
+                dl.registered_delivery = 0;
+                dl.src_terminal_id = d.src.number.clone();
+                dl.dest_id = d.dest.number.clone();
+                dl.tpudhi = tpudhi;
+                dl.msg_content = udh_body;
+                dl.msg_fmt = fmt_from_encoding(d.encoding);
+                CmppMessage::DeliverV20 { sequence_id: seq, deliver: dl }
+            } else {
+                let mut dl = Deliver::new();
+                dl.registered_delivery = 0;
+                dl.src_terminal_id = d.src.number.clone();
+                dl.dest_id = d.dest.number.clone();
+                dl.tpudhi = tpudhi;
+                dl.msg_content = udh_body;
+                dl.msg_fmt = fmt_from_encoding(d.encoding);
+                CmppMessage::DeliverV30 { sequence_id: seq, deliver: dl }
+            }
         }
         UnifiedMessage::Report(r) => {
             // 状态报告下行：以 Deliver(registered_delivery=1) 承载。
@@ -627,5 +670,34 @@ mod tests {
         }
         let reencoded = CmppAdapter.encode(&unified, Sequence::Plain(7)).unwrap();
         assert_eq!(reencoded, bytes, "V2.0 Submit 经统一模型往返字节应无损一致");
+    }
+
+    #[test]
+    fn deliver_v20_mo_roundtrip_via_unified() {
+        // V2.0 MO：extra.version=0x20 → encode 产 DeliverV20；decode_with_version(V20) 还原为 Deliver，
+        // 字节往返无损。
+        let deliver = UnifiedMessage::Deliver(UnifiedDeliver {
+            src: Address::plain("13800138000"),
+            dest: Address::plain("10086"),
+            content: b"mo".to_vec(),
+            encoding: Encoding::Gbk,
+            concat: None,
+            extra: ProtocolExtra::Cmpp(CmppExtra { version: 0x20, ..Default::default() }),
+            tlvs: vec![],
+        });
+        let bytes = CmppAdapter.encode(&deliver, Sequence::Plain(8)).unwrap();
+        let unified = CmppAdapter
+            .decode_with_version(&frame_of(bytes.clone()), CmppVersion::V20)
+            .unwrap();
+        match &unified {
+            UnifiedMessage::Deliver(u) => {
+                assert_eq!(u.src.number, "13800138000");
+                assert_eq!(u.dest.number, "10086");
+                assert_eq!(u.content, b"mo");
+            }
+            other => panic!("expected Deliver, got {other:?}"),
+        }
+        let reencoded = CmppAdapter.encode(&unified, Sequence::Plain(8)).unwrap();
+        assert_eq!(reencoded, bytes, "V2.0 Deliver(MO) 经统一模型往返字节应无损一致");
     }
 }
