@@ -63,6 +63,39 @@ pub enum DeliveryStatus {
     Other(String),
 }
 
+impl DeliveryStatus {
+    /// 标准 7 字符投递状态码 → 语义状态（SMPP/CMPP/SMGP 投递回执通用，大小写/空白不敏感）。
+    /// 未识别码（如 SMPP 的 `DELETED`）保留为 `Other`；空码归 `Unknown`。
+    pub fn from_stat_code(code: &str) -> DeliveryStatus {
+        match code.trim().to_ascii_uppercase().as_str() {
+            "DELIVRD" => DeliveryStatus::Delivered,
+            "EXPIRED" => DeliveryStatus::Expired,
+            "UNDELIV" => DeliveryStatus::Undeliverable,
+            "ACCEPTD" => DeliveryStatus::Accepted,
+            "REJECTD" => DeliveryStatus::Rejected,
+            "UNKNOWN" => DeliveryStatus::Unknown,
+            "" => DeliveryStatus::Unknown,
+            other => DeliveryStatus::Other(other.to_string()),
+        }
+    }
+
+    /// 从投递回执文本（形如 `id:.. stat:DELIVRD err:..`）解析状态；
+    /// SMPP/SMGP 回执正文为该格式。找不到 `stat:` 段时返回 `Unknown`。
+    pub fn from_receipt_text(text: &[u8]) -> DeliveryStatus {
+        let s = String::from_utf8_lossy(text);
+        match s.find("stat:") {
+            Some(pos) => {
+                let code: String = s[pos + 5..]
+                    .chars()
+                    .take_while(|c| !c.is_whitespace())
+                    .collect();
+                DeliveryStatus::from_stat_code(&code)
+            }
+            None => DeliveryStatus::Unknown,
+        }
+    }
+}
+
 /// 短信地址。`ton`/`npi` 是「地址」概念的可选方言修饰（非 SMPP 协议为 None）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Address {
@@ -220,5 +253,30 @@ mod tests {
             ProtocolExtra::Cmpp(CmppExtra::default()),
             ProtocolExtra::Cmpp(_)
         ));
+    }
+
+    #[test]
+    fn delivery_status_from_stat_code_maps_standard_codes() {
+        assert_eq!(DeliveryStatus::from_stat_code("DELIVRD"), DeliveryStatus::Delivered);
+        assert_eq!(DeliveryStatus::from_stat_code("EXPIRED"), DeliveryStatus::Expired);
+        assert_eq!(DeliveryStatus::from_stat_code("UNDELIV"), DeliveryStatus::Undeliverable);
+        assert_eq!(DeliveryStatus::from_stat_code("ACCEPTD"), DeliveryStatus::Accepted);
+        assert_eq!(DeliveryStatus::from_stat_code("REJECTD"), DeliveryStatus::Rejected);
+        assert_eq!(DeliveryStatus::from_stat_code("UNKNOWN"), DeliveryStatus::Unknown);
+        // 大小写/空白不敏感
+        assert_eq!(DeliveryStatus::from_stat_code(" delivrd "), DeliveryStatus::Delivered);
+        // 未识别码保留原值（如 SMPP 的 DELETED）
+        assert_eq!(
+            DeliveryStatus::from_stat_code("DELETED"),
+            DeliveryStatus::Other("DELETED".to_string())
+        );
+    }
+
+    #[test]
+    fn delivery_status_from_receipt_text_extracts_stat() {
+        let text = b"id:9876543210 sub:001 dlvrd:001 stat:DELIVRD err:000 text:hi";
+        assert_eq!(DeliveryStatus::from_receipt_text(text), DeliveryStatus::Delivered);
+        // 无 stat: 段 → Unknown
+        assert_eq!(DeliveryStatus::from_receipt_text(b"no stat here"), DeliveryStatus::Unknown);
     }
 }

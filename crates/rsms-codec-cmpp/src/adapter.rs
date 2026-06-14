@@ -71,9 +71,14 @@ fn submit_v30_to_unified(s: Submit) -> UnifiedSubmit {
 
 fn deliver_v30_to_unified(d: Deliver) -> UnifiedMessage {
     if d.registered_delivery == 1 {
+        // 报告投递状态：CMPP 报告正文是定长二进制（stat 在 [8..15]），用 CmppReport::parse 取
+        // stat 7 字符码 → DeliveryStatus；解析失败（正文过短/非标准）回退 Unknown。
+        let status = crate::datatypes::CmppReport::parse(&d.msg_content)
+            .map(|r| DeliveryStatus::from_stat_code(&r.stat))
+            .unwrap_or(DeliveryStatus::Unknown);
         UnifiedMessage::Report(UnifiedReport {
             msg_id: MessageId::Binary(d.msg_id.to_vec()),
-            status: DeliveryStatus::Unknown,
+            status,
             // 新增 src 字段：报告源地址取 src_terminal_id（dest 仍取 dest_id）。
             src: Address::plain(d.src_terminal_id.clone()),
             dest: Address::plain(d.dest_id),
@@ -407,5 +412,26 @@ mod tests {
         assert!(matches!(unified, UnifiedMessage::Report(_)));
         let reencoded = CmppAdapter.encode(&unified, Sequence::Plain(9)).unwrap();
         assert_eq!(reencoded, original, "CMPP Report 经统一模型往返后字节应无损一致");
+    }
+
+    #[test]
+    fn decode_report_parses_delivery_status() {
+        // registered_delivery=1，msg_content 为定长二进制报告（stat 在 [8..15]）→ status 应解析为 Delivered。
+        let mut content = Vec::new();
+        content.extend_from_slice(&[0u8; 8]); // msg_id(8)
+        content.extend_from_slice(b"DELIVRD"); // stat(7)
+        content.extend_from_slice(b"2601011200"); // submit_time(10)
+        content.extend_from_slice(b"2601011201"); // done_time(10)
+        let mut d = Deliver::new();
+        d.registered_delivery = 1;
+        d.dest_id = "1065900000".to_string();
+        d.msg_content = content;
+        let bytes = Pdu::from(d).to_pdu_bytes(10).to_vec();
+        match CmppAdapter.decode(&frame_of(bytes)).unwrap() {
+            UnifiedMessage::Report(r) => {
+                assert_eq!(r.status, DeliveryStatus::Delivered, "stat DELIVRD 应解析为 Delivered");
+            }
+            other => panic!("expected Report, got {other:?}"),
+        }
     }
 }

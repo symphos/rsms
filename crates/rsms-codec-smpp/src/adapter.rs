@@ -101,9 +101,9 @@ fn deliver_to_unified(d: DeliverSm) -> UnifiedMessage {
             .unwrap_or_else(|| MessageId::Text(String::new()));
         UnifiedMessage::Report(UnifiedReport {
             msg_id,
-            // 注：DeliverSm 回执的 MESSAGE_STATE(0x0427)/NETWORK_ERROR_CODE 等 TLV 本轮未解析，
-            // status 暂为 Unknown，raw 仅含 short_message。精确状态解析待后续。
-            status: DeliveryStatus::Unknown,
+            // 回执正文（short_message）形如 id:.. stat:DELIVRD ..，解析 stat 段 → DeliveryStatus。
+            // 注：MESSAGE_STATE(0x0427) TLV 的数字状态本轮未用，以文本 stat 为准（cmos 等网关均带 stat 文本）。
+            status: DeliveryStatus::from_receipt_text(&d.short_message),
             // 报告源地址：从 DeliverSm 的 source_addr/ton/npi 落入统一模型，
             // encode 回报告时据此还原 DeliverSm.source_addr。
             src: Address {
@@ -617,5 +617,37 @@ mod tests {
         let bytes = SmppAdapter.encode(&msg, Sequence::Plain(1)).unwrap();
         let cs = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
         assert_eq!(cs, 0x0D, "bind status 应写入 command_status");
+    }
+
+    #[test]
+    fn decode_report_parses_delivery_status() {
+        // esm_class=0x04 的投递回执，正文含 stat:DELIVRD → 统一模型 status 应解析为 Delivered。
+        let d = DeliverSm {
+            service_type: String::new(),
+            source_addr_ton: 0,
+            source_addr_npi: 0,
+            source_addr: String::new(),
+            dest_addr_ton: 0,
+            dest_addr_npi: 0,
+            destination_addr: "1065900000".to_string(),
+            esm_class: 0x04,
+            protocol_id: 0,
+            priority_flag: 0,
+            schedule_delivery_time: String::new(),
+            validity_period: String::new(),
+            registered_delivery: 0,
+            replace_if_present_flag: 0,
+            data_coding: 0,
+            sm_default_msg_id: 0,
+            short_message: b"id:9876543210 sub:001 dlvrd:001 stat:DELIVRD err:000 text:hi".to_vec(),
+            tlvs: vec![Tlv::new(0x001E, b"9876543210".to_vec())],
+        };
+        let bytes = Pdu::from(d).to_pdu_bytes(20).to_vec();
+        match SmppAdapter.decode(&frame_of(bytes)).unwrap() {
+            UnifiedMessage::Report(r) => {
+                assert_eq!(r.status, DeliveryStatus::Delivered, "stat:DELIVRD 应解析为 Delivered");
+            }
+            other => panic!("expected Report, got {other:?}"),
+        }
     }
 }

@@ -113,9 +113,11 @@ fn submit_to_unified(s: Submit) -> UnifiedSubmit {
 
 fn deliver_to_unified(d: Deliver) -> UnifiedMessage {
     if d.is_report != 0 {
+        // SMGP 报告正文为文本（形如 id:.. stat:DELIVRD ..），解析 stat 段 → DeliveryStatus。
+        let status = DeliveryStatus::from_receipt_text(&d.msg_content);
         UnifiedMessage::Report(UnifiedReport {
             msg_id: MessageId::Binary(d.msg_id.bytes.to_vec()),
-            status: DeliveryStatus::Unknown, // 精确状态解析留待后续
+            status,
             // 报告源地址：SMGP Deliver-报告的 src_term_id（构造下行回执需要）。
             src: Address::plain(d.src_term_id.clone()),
             dest: Address::plain(d.dest_term_id),
@@ -552,5 +554,21 @@ mod tests {
             .encode(&unified, Sequence::Plain(13))
             .unwrap();
         assert_eq!(reencoded, original, "Deliver(报告) 经统一模型往返字节应无损一致");
+    }
+
+    #[test]
+    fn decode_report_parses_delivery_status() {
+        // is_report=1 的 Deliver，正文含 stat:DELIVRD → 统一模型 status 应解析为 Delivered。
+        let mut d = crate::datatypes::Deliver::new();
+        d.is_report = 1;
+        d.dest_term_id = "1065900000".to_string();
+        d.msg_content = b"id:1234567890 sub:001 dlvrd:001 stat:DELIVRD err:000 text:hi".to_vec();
+        let bytes = Pdu::from(d).to_pdu_bytes(14).to_vec();
+        match SmgpAdapter.decode(&frame_of(bytes)).unwrap() {
+            UnifiedMessage::Report(r) => {
+                assert_eq!(r.status, DeliveryStatus::Delivered, "stat:DELIVRD 应解析为 Delivered");
+            }
+            _ => panic!("expected Report"),
+        }
     }
 }
