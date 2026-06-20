@@ -149,7 +149,8 @@
 > 来源：PR #16（CMPP 2.0 版本感知 + 服务端事件回调）code-review。以下均为「真实存在但与该 PR 主题正交」或「架构方向」，当前代码功能正确，未在该 PR 内改动，留作后续独立 PR。
 
 ### R1. CMPP 回执编码去重（codec 风险区，需测试先行）✅ 已完成（702cbb8）
-> `to_bytes`/`to_bytes_v20` 已抽为参数化 `to_fixed_bytes(dest_width)`；先补 71B 字节级表征测试锁布局再重构，逐字节等价、全测试绿。adapter 的 Submit/Deliver/Report V20/V30 臂去重仍可后续做（见下方原始记录）。
+> `to_bytes`/`to_bytes_v20` 已抽为参数化 `to_fixed_bytes(dest_width)`；先补 71B 字节级表征测试锁布局再重构，逐字节等价、全测试绿。
+> adapter 的 **Report 臂** V20/V30 已去重：重复的 `CmppReport` 合成字面量抽为 `report_body(is_v20)` 闭包，两分支已有 60B/71B roundtrip 测试护航（在 `refactor/cmpp-adapter-report-arms` 分支）。Submit/Deliver(MO) 两臂因 `SubmitV20`/`Submit`、`DeliverV20`/`Deliver` 字段集本就不同，强行去重低价值，按设计保留。
 
 - `datatypes/deliver.rs` 的 `to_bytes` / `to_bytes_v20` 重复同一 `fixed()` 闭包，函数体仅 `Dest_terminal_Id` 宽度不同（V3.0=32 / V2.0=21），其余 `Msg_Id/Stat/时间/SMSC_sequence` 一致。
 - `adapter.rs` 的 Submit/Deliver/Report 各有 V20/V30 近重复臂，可抽 builder。

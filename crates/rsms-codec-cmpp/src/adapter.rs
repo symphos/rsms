@@ -416,26 +416,31 @@ fn unified_to_cmpp_with_version(
                 let n = b.len().min(8);
                 mid[..n].copy_from_slice(&b[..n]);
             }
+            // 正文合成（两版本共用）：raw 恰为合规定长（V3.0=71B / V2.0=60B）则原样透传
+            // （解码后再编码/代理转发场景），否则从结构化字段 (msg_id + status + 终端号) 合成
+            // 合规定长二进制回执——业务无需手拼。两版本仅 Dest_terminal_Id 宽度不同（32 vs 21）。
+            let report_body = |is_v20: bool| -> Vec<u8> {
+                let spec_len = if is_v20 { 60 } else { 71 };
+                if r.raw.len() == spec_len {
+                    return r.raw.clone();
+                }
+                let rep = crate::datatypes::CmppReport {
+                    msg_id: mid,
+                    stat: r.status.to_stat_code().to_string(),
+                    submit_time: String::new(),
+                    done_time: String::new(),
+                    dest_terminal_id: r.src.number.clone(),
+                    smsc_sequence: 0,
+                };
+                if is_v20 { rep.to_bytes_v20() } else { rep.to_bytes() }
+            };
             if version == CmppVersion::V20 {
                 let mut dl = DeliverV20::new();
                 dl.registered_delivery = 1;
                 dl.msg_id = mid;
                 dl.dest_id = r.dest.number.clone();
                 dl.src_terminal_id = r.src.number.clone();
-                // raw 恰为 60B 合规回执则原样透传；否则从结构化字段合成 V2.0 定长 60B。
-                dl.msg_content = if r.raw.len() == 60 {
-                    r.raw.clone()
-                } else {
-                    crate::datatypes::CmppReport {
-                        msg_id: mid,
-                        stat: r.status.to_stat_code().to_string(),
-                        submit_time: String::new(),
-                        done_time: String::new(),
-                        dest_terminal_id: r.src.number.clone(),
-                        smsc_sequence: 0,
-                    }
-                    .to_bytes_v20()
-                };
+                dl.msg_content = report_body(true);
                 CmppMessage::DeliverV20 { sequence_id: seq, deliver: dl }
             } else {
                 let mut dl = Deliver::new();
@@ -443,21 +448,7 @@ fn unified_to_cmpp_with_version(
                 dl.msg_id = mid;
                 dl.dest_id = r.dest.number.clone();
                 dl.src_terminal_id = r.src.number.clone();
-                // raw 恰为 71B 合规回执（解码后再编码/代理转发）则原样透传；否则从结构化字段
-                // (msg_id + status + 终端号) 合成合规 71B 二进制回执——业务无需手拼定长正文。
-                dl.msg_content = if r.raw.len() == 71 {
-                    r.raw.clone()
-                } else {
-                    crate::datatypes::CmppReport {
-                        msg_id: mid,
-                        stat: r.status.to_stat_code().to_string(),
-                        submit_time: String::new(),
-                        done_time: String::new(),
-                        dest_terminal_id: r.src.number.clone(),
-                        smsc_sequence: 0,
-                    }
-                    .to_bytes()
-                };
+                dl.msg_content = report_body(false);
                 CmppMessage::DeliverV30 { sequence_id: seq, deliver: dl }
             }
         }
