@@ -39,7 +39,7 @@ pub use protocol::{
     MessageSource, MessageItem, FrameDecoder,
     ServerEventHandler, ClientEventHandler,
 };
-pub use server::{ServerBuilder, BoundServer};
+pub use server::{ServerBuilder, BoundServer, ServerShutdown};
 pub use transaction::{
     TransactionManager, TransactionStatus, MessageCallback, SubmitInfo, ReportInfo, MoInfo,
     cmpp::{CmppSubmit, CmppDeliver, CmppTransactionManager},

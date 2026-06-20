@@ -44,6 +44,11 @@ impl ConnectionPool {
         g.first().cloned()
     }
 
+    /// 全部连接的快照（优雅停机时遍历关闭用）。
+    pub async fn all(&self) -> Vec<Arc<Connection>> {
+        self.inner.read().await.clone()
+    }
+
     pub async fn len(&self) -> usize {
         self.inner.read().await.len()
     }

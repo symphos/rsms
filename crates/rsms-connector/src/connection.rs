@@ -332,6 +332,7 @@ pub async fn run_connection(
     protocol: Protocol,
     event_handler: Option<Arc<dyn ServerEventHandler>>,
     metrics: Arc<dyn rsms_core::Metrics>,
+    shutdown: Arc<AtomicBool>,
 ) {
     metrics.connection_opened();
     let mut read = read;
@@ -341,12 +342,21 @@ pub async fn run_connection(
     let smgp_handler = SmgpHandler::new(auth_handler.clone());
     let sgip_handler = SgipHandler::new(auth_handler.clone());
     let smpp_handler = SmppHandler::new(auth_handler.clone());
-    
+
     let idle_timeout = Duration::from_secs(conn.config.idle_time_sec as u64);
     let idle_check_interval = Duration::from_secs((conn.config.idle_time_sec / 2) as u64);
-    
+    // 读超时取 min(idle_check_interval, 1s)（下限 100ms 防零时长 busy-loop）：既维持原 idle
+    // 检测语义，又让循环每 ≤1s 醒来检查停机标志，使优雅停机能及时收尾本连接。
+    let poll = idle_check_interval
+        .min(Duration::from_secs(1))
+        .max(Duration::from_millis(100));
+
     loop {
-        let n = match timeout(idle_check_interval, read.read(&mut tmp_buf)).await {
+        // 优雅停机：标志置位即跳出，走循环后的统一收尾（注销/断连/回调）。
+        if shutdown.load(Ordering::Acquire) {
+            break;
+        }
+        let n = match timeout(poll, read.read(&mut tmp_buf)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => n,
             Ok(Err(e)) => {

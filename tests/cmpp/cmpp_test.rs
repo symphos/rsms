@@ -5,6 +5,7 @@ use rsms_connector::{
     ServerEventHandler, AccountConfig, AccountConfigProvider,
     CmppDecoder,
     MessageCallback, SubmitInfo, ReportInfo, MoInfo,
+    ServerShutdown,
 };
 use rsms_connector::client::{ClientContext, ClientConfig};
 use rsms_business::BusinessHandler;
@@ -883,6 +884,82 @@ async fn test_deliver_report() {
 
     assert_eq!(client_handler.deliver_count(), 1, "应该收到1个Deliver Report");
     assert_eq!(client_handler.report_count(), 1, "应该收到1个状态报告");
+
+    handle.abort();
+}
+
+/// 启动测试服务器并返回优雅停机句柄 + 连接池（用于 B2 服务端停机测试）。
+async fn start_test_server_with_shutdown(
+    auth_handler: Arc<dyn AuthHandler>,
+    biz_handler: Arc<dyn BusinessHandler>,
+    event_handler: Arc<dyn ServerEventHandler>,
+    idle_timeout_secs: u32,
+) -> Result<(u16, ServerShutdown, Arc<rsms_connector::ConnectionPool>, tokio::task::JoinHandle<()>)> {
+    let cfg = Arc::new(EndpointConfig::new("test-server", "127.0.0.1", 0, 8, idle_timeout_secs as u16));
+    let server = ServerBuilder::new(cfg)
+        .handlers(vec![biz_handler])
+        .auth_handler(auth_handler)
+        .account_config_provider(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>)
+        .event_handler(event_handler)
+        .serve()
+        .await
+        .expect("bind");
+    let port = server.local_addr.port();
+    let sd = server.shutdown_handle();
+    let pool = server.pool();
+    let handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    Ok((port, sd, pool, handle))
+}
+
+/// 服务端优雅停机（Phase B2）：`shutdown_handle().shutdown()` 应置停机标志，
+/// 并使各连接读循环及时收尾、从连接池注销（pool 归零）。
+#[tokio::test]
+async fn test_server_graceful_shutdown() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .try_init();
+
+    let auth = Arc::new(PasswordAuthHandler::new().add_account("106900", "password123"));
+    let biz = Arc::new(TestBusinessHandler::new());
+    let evt = Arc::new(TestEventHandler::new());
+    let (port, sd, pool, handle) =
+        start_test_server_with_shutdown(auth.clone(), biz.clone(), evt.clone(), 30)
+            .await
+            .unwrap();
+
+    let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
+    let client_handler = Arc::new(TestClientHandler::new());
+    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+        .client_config(ClientConfig::new())
+        .connect()
+        .await
+        .expect("connect");
+
+    let connect_pdu = client_handler.build_connect_pdu("106900", "password123");
+    conn.send_request(connect_pdu).await.expect("send connect");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(client_handler.is_connected(), "连接失败");
+    assert!(pool.len().await >= 1, "服务端应至少有 1 条连接");
+
+    // 优雅停机：无出站在途，drain 立即过，应快速返回并置标志。
+    let started = std::time::Instant::now();
+    sd.shutdown(Duration::from_secs(2)).await;
+    assert!(sd.is_shutting_down(), "应已进入停机");
+    assert!(started.elapsed() < Duration::from_secs(2), "无在途时停机应快速返回");
+
+    // 读循环因停机标志退出 → 连接从池注销，pool 归零（≤1s poll + 余量）。
+    let mut drained = false;
+    for _ in 0..30 {
+        if pool.len().await == 0 {
+            drained = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(drained, "停机后服务端连接应全部注销（pool 归零）");
 
     handle.abort();
 }
