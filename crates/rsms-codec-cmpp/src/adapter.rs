@@ -386,7 +386,7 @@ fn unified_to_cmpp_with_version(
                 _ => 0,
             };
             // MO 上行：registered_delivery=0。V2.0 形态由 encode_with_version 的 `version` 参数
-            // 或方言 `extra.version` 任一决定（参数优先支持调用方显式指定，extra 保持旧自决行为）。
+            // 与方言 `extra.version` 的并集决定（任一为 V2.0 即产 V2.0），否则产 V3.0。
             if version == CmppVersion::V20 || extra_version == 0x20 {
                 let mut dl = DeliverV20::new();
                 dl.registered_delivery = 0;

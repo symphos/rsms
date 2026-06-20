@@ -210,10 +210,15 @@ pub trait MessageSource: Send + Sync {
     async fn fetch(&self, account: &str, batch_size: usize) -> Result<Vec<MessageItem>>;
 }
 
+/// 服务端连接生命周期事件回调。框架在连接建立、认证通过、断开三个时刻分别触发，
+/// 供业务做按连接的初始化/清理（如按协商版本下发预定消息、释放账号级资源）。
 #[async_trait]
 pub trait ServerEventHandler: Send + Sync {
+    /// 连接建立、进入读循环前触发一次（尚未认证，`authenticated_account()` 可能为 `None`）。
     async fn on_connected(&self, conn: &Arc<dyn ProtocolConnection>);
+    /// 连接断开后触发；`account` 为该连接认证过的账号（未认证则为 `None`）。
     async fn on_disconnected(&self, conn_id: u64, account: Option<&str>);
+    /// 认证通过、账号首次注册到连接池后触发；此时协商版本与 `account` 均已就绪。
     async fn on_authenticated(&self, conn: &Arc<dyn ProtocolConnection>, account: &str);
 }
 

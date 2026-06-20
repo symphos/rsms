@@ -241,8 +241,12 @@ impl FileMessageSource {
     async fn enqueue_predefined_mo(&self, account: &str, version: Option<u8>) {
         {
             let mut done = self.mo_enqueued.lock().await;
-            if !done.insert(account.to_string()) {
-                return; // 该账号已入队过
+            // 去重键带上协商版本：同账号以不同 CMPP 版本重连时须按新版本重新编码入队
+            // （V2.0=60B DeliverV20 / V3.0=71B DeliverV30 字段宽度不同）。仅按账号去重会把
+            // 首连按旧版本编码的预定 MO 残留发给新版本客户端，导致对端定长解析字段错位。
+            let key = format!("{}#{}", account, version.unwrap_or(0));
+            if !done.insert(key) {
+                return; // 该账号+版本已入队过
             }
         }
         let mut splitter = LongMessageSplitter::new();

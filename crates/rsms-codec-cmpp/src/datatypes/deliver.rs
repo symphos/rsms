@@ -300,45 +300,38 @@ impl CmppReport {
         })
     }
 
-    /// 编码为 CMPP 3.0 状态报告正文（定长 71 字节二进制）：
-    /// Msg_Id(8) + Stat(7) + Submit_time(10) + Done_time(10) + Dest_terminal_Id(32) + SMSC_sequence(4)。
-    /// 字符串字段按字节截断/补 0 到定长。真实 CMPP 网关（如 lihuanghe/SMSGate）按此定长解析；
-    /// 旧 example 发自由文本（119B）会被对端按定长解致字段错位（cmos WARN: length 119 should be 71）。
-    pub fn to_bytes(&self) -> Vec<u8> {
+    /// 编码为定长二进制状态报告正文。`dest_width` 为 Dest_terminal_Id 字段宽度，
+    /// 是 V2.0/V3.0 正文的唯一差异：V3.0=32（总 71B）、V2.0=21（总 60B）。
+    /// 布局：Msg_Id(8) + Stat(7) + Submit_time(10) + Done_time(10) + Dest_terminal_Id(dest_width) + SMSC_sequence(4)。
+    /// 字符串字段按字节截断/补 0 到定长。
+    fn to_fixed_bytes(&self, dest_width: usize) -> Vec<u8> {
         fn fixed(src: &[u8], n: usize) -> Vec<u8> {
             let mut v = vec![0u8; n];
             let len = src.len().min(n);
             v[..len].copy_from_slice(&src[..len]);
             v
         }
-        let mut b = Vec::with_capacity(71);
+        let mut b = Vec::with_capacity(8 + 7 + 10 + 10 + dest_width + 4);
         b.extend_from_slice(&self.msg_id);
         b.extend_from_slice(&fixed(self.stat.as_bytes(), 7));
         b.extend_from_slice(&fixed(self.submit_time.as_bytes(), 10));
         b.extend_from_slice(&fixed(self.done_time.as_bytes(), 10));
-        b.extend_from_slice(&fixed(self.dest_terminal_id.as_bytes(), 32));
+        b.extend_from_slice(&fixed(self.dest_terminal_id.as_bytes(), dest_width));
         b.extend_from_slice(&self.smsc_sequence.to_be_bytes());
         b
     }
 
-    /// 编码为 CMPP 2.0 状态报告正文（定长 60 字节二进制）：
-    /// Msg_Id(8) + Stat(7) + Submit_time(10) + Done_time(10) + Dest_terminal_Id(21) + SMSC_sequence(4)。
-    /// 与 `to_bytes()`（V3.0/71B）的唯一区别：Dest_terminal_Id 定长 21 字节（V3.0 为 32）。
+    /// 编码为 CMPP 3.0 状态报告正文（定长 71 字节二进制，Dest_terminal_Id=32）。
+    /// 真实 CMPP 网关（如 lihuanghe/SMSGate）按此定长解析；旧 example 发自由文本（119B）
+    /// 会被对端按定长解致字段错位（cmos WARN: length 119 should be 71）。
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.to_fixed_bytes(32)
+    }
+
+    /// 编码为 CMPP 2.0 状态报告正文（定长 60 字节二进制，Dest_terminal_Id=21）。
+    /// 与 `to_bytes()`（V3.0/71B）的唯一区别即 Dest_terminal_Id 宽度。
     pub fn to_bytes_v20(&self) -> Vec<u8> {
-        fn fixed(src: &[u8], n: usize) -> Vec<u8> {
-            let mut v = vec![0u8; n];
-            let len = src.len().min(n);
-            v[..len].copy_from_slice(&src[..len]);
-            v
-        }
-        let mut b = Vec::with_capacity(60);
-        b.extend_from_slice(&self.msg_id);
-        b.extend_from_slice(&fixed(self.stat.as_bytes(), 7));
-        b.extend_from_slice(&fixed(self.submit_time.as_bytes(), 10));
-        b.extend_from_slice(&fixed(self.done_time.as_bytes(), 10));
-        b.extend_from_slice(&fixed(self.dest_terminal_id.as_bytes(), 21));
-        b.extend_from_slice(&self.smsc_sequence.to_be_bytes());
-        b
+        self.to_fixed_bytes(21)
     }
 }
 
@@ -488,5 +481,30 @@ mod tests {
         assert_eq!(&bytes[46..56], &[0u8; 10]);
         // SMSC_sequence 在 [56..60]。
         assert_eq!(&bytes[56..60], &42u32.to_be_bytes());
+    }
+
+    #[test]
+    fn report_to_bytes_v30_is_71b_with_dest32() {
+        // V3.0 报告正文：Msg_Id(8)+Stat(7)+Submit(10)+Done(10)+Dest(32)+SMSC(4)=71B。
+        let report = CmppReport {
+            msg_id: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+            stat: "DELIVRD".to_string(),
+            submit_time: "2601010000".to_string(),
+            done_time: "2601010001".to_string(),
+            dest_terminal_id: "13800138000".to_string(),
+            smsc_sequence: 42,
+        };
+        let bytes = report.to_bytes();
+        assert_eq!(bytes.len(), 71, "V3.0 报告正文应为定长 71B");
+        // 字段位置校验。
+        assert_eq!(&bytes[0..8], &report.msg_id);
+        assert_eq!(&bytes[8..15], b"DELIVRD");
+        assert_eq!(&bytes[15..25], b"2601010000");
+        assert_eq!(&bytes[25..35], b"2601010001");
+        // Dest_terminal_Id 在 [35..67]（32B），含尾部补零。
+        assert_eq!(&bytes[35..46], b"13800138000");
+        assert_eq!(&bytes[46..67], &[0u8; 21]);
+        // SMSC_sequence 在 [67..71]。
+        assert_eq!(&bytes[67..71], &42u32.to_be_bytes());
     }
 }
