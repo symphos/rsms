@@ -10,7 +10,7 @@ use rsms_codec_cmpp::CommandId as CmppCommandId;
 use rsms_codec_sgip::CommandId as SgipCommandId;
 use rsms_codec_smgp::CommandId as SmgpCommandId;
 use rsms_codec_smpp::CommandId as SmppCommandId;
-use rsms_core::{ConnectionInfo, Protocol, RawPdu, EndpointConfig, Frame, Result, RsmsError, SessionState};
+use rsms_core::{ConnectionInfo, Metrics, NoopMetrics, Protocol, RawPdu, EndpointConfig, Frame, Result, RsmsError, SessionState};
 use rsms_session::ConnectionContext;
 use rsms_window::{Window, WindowConfig};
 use std::collections::{HashMap, VecDeque};
@@ -520,6 +520,7 @@ pub struct ClientBuilder<D: FrameDecoder + Send + Sync + 'static> {
     client_config: Option<ClientConfig>,
     message_source: Option<Arc<dyn MessageSource>>,
     event_handler: Option<Arc<dyn ClientEventHandler>>,
+    metrics: Option<Arc<dyn Metrics>>,
 }
 
 impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
@@ -535,7 +536,14 @@ impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
             client_config: None,
             message_source: None,
             event_handler: None,
+            metrics: None,
         }
+    }
+
+    /// 注入指标记录器（可观测性）。不设置时使用 `NoopMetrics`。
+    pub fn metrics(mut self, metrics: Arc<dyn Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     pub fn client_config(mut self, config: ClientConfig) -> Self {
@@ -562,7 +570,9 @@ impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
             client_config,
             message_source,
             event_handler,
+            metrics,
         } = self;
+        let metrics: Arc<dyn Metrics> = metrics.unwrap_or_else(|| Arc::new(NoopMetrics));
         let config = client_config.unwrap_or_default();
     let addr = format!("{}:{}", endpoint.host, endpoint.port);
     info!(%addr, "connecting to server");
@@ -583,8 +593,10 @@ impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
         handler.on_connected(&conn_for_handler).await;
     }
 
+    metrics.connection_opened();
+    let metrics_for_read = Arc::clone(&metrics);
     tokio::spawn(async move {
-        run_client_read_loop(conn_clone, client_handler_clone, Arc::clone(&decoder), event_handler).await;
+        run_client_read_loop(conn_clone, client_handler_clone, Arc::clone(&decoder), event_handler, metrics_for_read).await;
     });
 
     // 启动 keepalive 任务
@@ -598,7 +610,7 @@ impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
     if let Some(source) = message_source {
         let conn_clone = Arc::clone(&conn);
         tokio::spawn(async move {
-            run_outbound_fetcher(conn_clone, source).await;
+            run_outbound_fetcher(conn_clone, source, metrics).await;
         });
     }
 
@@ -643,8 +655,11 @@ pub(crate) async fn connect_with_pool(
         handler.on_connected(&conn_for_handler).await;
     }
 
+    // ClientPool 管理的连接本期不接指标(用 Noop);池侧指标留作后续小增量。
+    let metrics: Arc<dyn Metrics> = Arc::new(NoopMetrics);
+    let metrics_for_read = Arc::clone(&metrics);
     tokio::spawn(async move {
-        run_client_read_loop(conn_clone, client_handler_clone, decoder, event_handler).await;
+        run_client_read_loop(conn_clone, client_handler_clone, decoder, event_handler, metrics_for_read).await;
     });
 
     // 启动 keepalive 任务
@@ -658,7 +673,7 @@ pub(crate) async fn connect_with_pool(
     if let Some(source) = message_source {
         let conn_clone = Arc::clone(&conn);
         tokio::spawn(async move {
-            run_outbound_fetcher(conn_clone, source).await;
+            run_outbound_fetcher(conn_clone, source, metrics).await;
         });
     }
 
@@ -670,6 +685,7 @@ async fn run_client_read_loop(
     client_handler: Arc<dyn ClientHandler>,
     decoder: Arc<tokio::sync::Mutex<Box<dyn FrameDecoder>>>,
     event_handler: Option<Arc<dyn ClientEventHandler>>,
+    metrics: Arc<dyn Metrics>,
 ) {
     let mut read_buf = Vec::new();
     let mut tmp_buf = [0u8; 8192];
@@ -700,6 +716,7 @@ async fn run_client_read_loop(
         let frames = match decoder.lock().await.decode_frames(&mut read_buf) {
             Ok(f) => f,
                 Err(e) => {
+                    metrics.decode_error(conn.endpoint.protocol);
                     error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "frame decode: {}", e);
                 break;
             }
@@ -707,6 +724,7 @@ async fn run_client_read_loop(
 
         for frame in frames {
             conn.touch();
+            metrics.inbound_frame(conn.endpoint.protocol, frame.command_id);
 
             // Check for connection close commands (e.g., CMPP Terminate, SMGP Exit)
             if frame.command_id == CmppCommandId::Terminate as u32
@@ -795,6 +813,7 @@ async fn run_client_read_loop(
     }
     
     conn.mark_disconnected().await;
+    metrics.connection_closed();
     info!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "connection closed");
 
     // Trigger on_disconnected callback
@@ -806,6 +825,7 @@ async fn run_client_read_loop(
 async fn run_outbound_fetcher(
     conn: Arc<ClientConnection>,
     source: Arc<dyn MessageSource>,
+    metrics: Arc<dyn Metrics>,
 ) {
     loop {
         if !conn.ready_for_fetch() {
@@ -846,6 +866,9 @@ async fn run_outbound_fetcher(
         let slices: Vec<&[u8]> = pdus.iter().map(|p| p.as_bytes()).collect();
         match conn.write_frames(&slices).await {
             Ok(_) => {
+                for _ in 0..slices.len() {
+                    metrics.outbound_frame();
+                }
                 if conn.endpoint.log_level.is_none_or(|max| tracing::Level::TRACE <= max) {
                     tracing::trace!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), batch = slices.len(), "send batch success");
                 }

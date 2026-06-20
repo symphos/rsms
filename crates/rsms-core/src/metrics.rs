@@ -33,6 +33,9 @@ pub trait Metrics: Send + Sync {
     fn decode_error(&self, protocol: Protocol) {
         let _ = protocol;
     }
+
+    /// 成功写出一帧出站 PDU（经 MessageSource 拉取后由框架发送）。
+    fn outbound_frame(&self) {}
 }
 
 /// 不记录任何指标的默认实现（框架未注入 `Metrics` 时使用）。

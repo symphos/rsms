@@ -142,9 +142,10 @@ impl BoundServer {
             let source_clone = Arc::clone(source);
             let account_pool2 = Arc::clone(&self.account_pool);
             let account_config = account_config_provider.clone();
-            
+            let metrics_clone = Arc::clone(&self.metrics);
+
             tokio::spawn(async move {
-                inbound_fetcher_task(source_clone, account_pool2, account_config).await;
+                inbound_fetcher_task(source_clone, account_pool2, account_config, metrics_clone).await;
             });
         }
         
@@ -231,6 +232,7 @@ async fn inbound_fetcher_task(
     source: Arc<dyn MessageSource>,
     account_pool: Arc<AccountPool>,
     account_config_provider: Option<Arc<dyn AccountConfigProvider>>,
+    metrics: Arc<dyn Metrics>,
 ) {
     let mut account_thread_counts: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
     
@@ -255,9 +257,10 @@ async fn inbound_fetcher_task(
                 let account_pool_clone = Arc::clone(&account_pool);
                 let interval_ms = config.fetch_interval_ms;
                 let account_clone = account.clone();
-                
+                let metrics_clone = Arc::clone(&metrics);
+
                 tokio::spawn(async move {
-                    inbound_fetch_loop(account_clone, source_clone, account_pool_clone, interval_ms).await;
+                    inbound_fetch_loop(account_clone, source_clone, account_pool_clone, interval_ms, metrics_clone).await;
                 });
                 
                 account_thread_counts.insert(account.clone(), current_threads + 1);
@@ -279,6 +282,7 @@ async fn inbound_fetch_loop(
     source: Arc<dyn MessageSource>,
     account_pool: Arc<AccountPool>,
     interval_ms: u32,
+    metrics: Arc<dyn Metrics>,
 ) {
     let interval = Duration::from_millis(interval_ms as u64);
     let account_str = account.as_str();
@@ -315,10 +319,17 @@ async fn inbound_fetch_loop(
                             }
                         }
                         let slices: Vec<&[u8]> = pdus.iter().map(|p| p.as_bytes()).collect();
-                        if let Err(e) = conn.write_frames(&slices).await {
-                            // 写失败可能造成流错位；标记连接断开，避免后续 fetch 复用这条流。
-                            error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), account = %account, "send failed, marking connection disconnected: {}", e);
-                            conn.mark_disconnected().await;
+                        match conn.write_frames(&slices).await {
+                            Ok(()) => {
+                                for _ in 0..slices.len() {
+                                    metrics.outbound_frame();
+                                }
+                            }
+                            Err(e) => {
+                                // 写失败可能造成流错位；标记连接断开，避免后续 fetch 复用这条流。
+                                error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), account = %account, "send failed, marking connection disconnected: {}", e);
+                                conn.mark_disconnected().await;
+                            }
                         }
                     }
                     Err(e) => {
