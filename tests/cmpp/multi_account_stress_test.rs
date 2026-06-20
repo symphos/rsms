@@ -159,7 +159,21 @@ impl ClientHandler for ClientState {
                 }
             }
             UnifiedMessage::Report(r) => {
-                self.handle_deliver_common(1, &r.raw);
+                // 按解码后的结构化 msg_id 匹配（回执经 adapter 编码为定长二进制，正文文本被丢弃）。
+                self.stats.report_received.fetch_add(1, Ordering::Relaxed);
+                if let MessageId::Binary(b) = &r.msg_id {
+                    let mut report_msg_id = [0u8; 8];
+                    let n = b.len().min(8);
+                    report_msg_id[..n].copy_from_slice(&b[..n]);
+                    if !self.matched_msg_ids.lock().unwrap().contains(&report_msg_id) {
+                        let mut pending = self.msg_ids.write().unwrap();
+                        if let Some(pos) = pending.iter().position(|&id| id == report_msg_id) {
+                            pending.remove(pos);
+                            self.matched_msg_ids.lock().unwrap().insert(report_msg_id);
+                            self.stats.report_matched.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
                 let resp_bytes = CmppAdapter.encode(&UnifiedMessage::DeliverResp, CmppAdapter.sequence_of(frame))?;
                 ctx.conn.write_frame(&resp_bytes).await?;
             }
@@ -359,8 +373,10 @@ async fn report_generator_task(
                         &now, &now
                     );
                     // 状态报告：统一 Report（adapter 编码为 Deliver registered_delivery=1）。
+                    // msg_id 必须填真实 8B 回执 MsgId（adapter 合成定长二进制回执时用它），
+                    // 否则 client 无法按 msgId 关联（report_matched=0）。
                     let report = UnifiedMessage::Report(UnifiedReport {
-                        msg_id: MessageId::Binary(vec![0u8; 8]),
+                        msg_id: MessageId::Binary(item.msg_id.to_vec()),
                         status: DeliveryStatus::Delivered,
                         src: Address::plain("13800138000"),
                         dest: Address::plain(item.dest_id),

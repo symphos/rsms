@@ -110,6 +110,15 @@
 - SMPP（16字节头）和 SGIP（20字节头）的 sequence_id 在 bytes 12-15
 - **已修复**：`decode_frames_drain` 新增 `protocol` 参数，SMPP/SGIP 用 offset 12
 
+### 14. CMPP 压测 harness 既有 bug（版本感知/spec 回执落地后未同步），非回归
+- **现象**：CMPP 单+多账号压测稳定失败（cmpp20 "Connection 0 failed"；cmpp30 `Report=0` → `report_matched >= submit_resp-100` 断言失败）。SMGP/SMPP/SGIP 全绿。
+- **定性**：在 `22c7dee`（任何近期重构之前）复跑**同样失败** → 既有问题，**不是** R1–R5/版本感知重构引入的回归。框架本身正常（三协议全绿即证）。
+- **根因（均在 `tests/cmpp/*stress_test.rs`）**：
+  1. client 用版本无关 `CmppAdapter.decode`（默认 V3.0）解服务端按 `ed894ca` 回的 **V2.0 宽度 ConnectResp(18B)** 失败 → 永不置 `connected`。
+  2. 回执经 adapter 编为定长二进制后（PR #12 spec-71B），原 `raw` 文本被丢弃，client 仍用 `parse_msg_id_from_report` 从**文本**抽 msgId → 永不匹配。且服务端把 `UnifiedReport.msg_id` 置 0、真 msgId 仅放文本。
+- **已修复（仅测试代码，分支 `fix/cmpp-stress-harness`）**：client 改 `decode_with_version(frame, 本连接版本)`；服务端 `UnifiedReport.msg_id` 填真实 8B msgId；client 按解码后 `r.msg_id` 结构化匹配。单/多账号两份 harness 同改。
+- **验证（60s/WARN）**：cmpp-stress 3 passed（CMPP3.0 Report 2500）、cmpp-multi 1 passed（Report 12713）；四协议单+多账号全绿、零丢失、MT 2500/12700 TPS。
+
 ## Accomplished
 
 ### CMPP（✅ 全部完成）
