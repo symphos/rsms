@@ -211,6 +211,11 @@ impl AuthHandler for CmppAuthHandler {
 struct FileMessageSource {
     queues: Mutex<HashMap<String, VecDeque<MessageItem>>>,
     id_generator: Arc<dyn IdGenerator>,
+    /// 预定 MO 原文（不在加载时编码）。CMPP 2.0/3.0 的 Deliver 线路布局不同，
+    /// 加载时连接尚未建立、协商版本未知；故推迟到 on_authenticated（版本已知）按版本编码入队。
+    raw_mo: Vec<MoMessage>,
+    /// 已入队过预定 MO 的账号（每账号仅一次，避免同账号重连重复下发）。
+    mo_enqueued: Mutex<std::collections::HashSet<String>>,
 }
 
 impl FileMessageSource {
@@ -218,14 +223,30 @@ impl FileMessageSource {
         Self {
             queues: Mutex::new(HashMap::new()),
             id_generator,
+            raw_mo: Vec::new(),
+            mo_enqueued: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
     fn load_from_file(path: &str, id_generator: Arc<dyn IdGenerator>) -> Self {
-        let source = Self::new(id_generator);
-        let messages = load_mo_messages(path);
+        let mut source = Self::new(id_generator);
+        // 只读取原文暂存；真正编码推迟到 enqueue_predefined_mo（连接版本已知后）。
+        source.raw_mo = load_mo_messages(path);
+        source
+    }
+
+    /// 按连接协商的协议版本，延迟编码并入队该账号的预定 MO（每账号仅一次）。
+    /// 必须在版本已知后调用（on_authenticated）：CMPP 2.0 Deliver 比 3.0 少 src_terminal_type/
+    /// link_id、且尾部带 Reserved(8)，加载时无法确定，故不能在 load_from_file 预编码。
+    async fn enqueue_predefined_mo(&self, account: &str, version: Option<u8>) {
+        {
+            let mut done = self.mo_enqueued.lock().await;
+            if !done.insert(account.to_string()) {
+                return; // 该账号已入队过
+            }
+        }
         let mut splitter = LongMessageSplitter::new();
-        for mo in messages {
+        for mo in self.raw_mo.iter().filter(|m| m.account == account) {
             // 先按目标编码把文本转为线路字节（UCS2 → UTF-16BE），再按字节数决定是否拆段。
             // 若直接用 as_bytes()（UTF-8）却标 UCS2，对端按 UTF-16BE 解会全乱码。
             let alphabet = if mo.content.is_ascii() {
@@ -243,7 +264,7 @@ impl FileMessageSource {
                 let frames = splitter.split(&wire, alphabet);
                 let mut items = Vec::new();
                 for frame in frames {
-                    let msg_id = source.id_generator.next_msg_id().to_be_bytes();
+                    let msg_id = self.id_generator.next_msg_id().to_be_bytes();
                     // 窄腰：拆成 (concat, 纯载荷)，UDH 由 adapter 重建。
                     let (concat, payload) = if frame.has_udhi {
                         (
@@ -264,12 +285,13 @@ impl FileMessageSource {
                         concat,
                         &msg_id,
                         alphabet,
+                        version,
                     );
                     items.push(Arc::new(pdu) as Arc<dyn EncodedPdu>);
                 }
-                source.push_group_sync(&mo.account, MessageItem::Group { items });
+                self.push_item(&mo.account, MessageItem::Group { items }).await;
             } else {
-                let msg_id = source.id_generator.next_msg_id().to_be_bytes();
+                let msg_id = self.id_generator.next_msg_id().to_be_bytes();
                 // 单条短信：wire 字节已是正确编码（UCS2→UTF-16BE），无 concat，直接构造 MO。
                 let pdu = build_deliver_mo_with_udh(
                     &mo.account,
@@ -278,29 +300,23 @@ impl FileMessageSource {
                     None,
                     &msg_id,
                     alphabet,
+                    version,
                 );
-                source.push_sync(&mo.account, pdu);
+                self.push_item(
+                    &mo.account,
+                    MessageItem::Single(Arc::new(pdu) as Arc<dyn EncodedPdu>),
+                )
+                .await;
             }
         }
-        source
     }
 
-    fn push_sync(&self, account: &str, pdu: RawPdu) {
-        if let Ok(mut queues) = self.queues.try_lock() {
-            queues
-                .entry(account.to_string())
-                .or_default()
-                .push_back(MessageItem::Single(Arc::new(pdu) as Arc<dyn EncodedPdu>));
-        }
-    }
-
-    fn push_group_sync(&self, account: &str, item: MessageItem) {
-        if let Ok(mut queues) = self.queues.try_lock() {
-            queues
-                .entry(account.to_string())
-                .or_default()
-                .push_back(item);
-        }
+    async fn push_item(&self, account: &str, item: MessageItem) {
+        let mut queues = self.queues.lock().await;
+        queues
+            .entry(account.to_string())
+            .or_default()
+            .push_back(item);
     }
 
     async fn push(&self, account: &str, pdu: RawPdu) {
@@ -514,17 +530,6 @@ fn build_deliver_report(account: &str, msg_id: &[u8; 8], phone: &str, version: O
     RawPdu::from(bytes)
 }
 
-fn build_deliver_mo(account: &str, phone: &str, content: &str, msg_id: &[u8; 8]) -> RawPdu {
-    // 先转线路字节（UCS2→UTF-16BE），再传给底层构造函数，避免对端按 UTF-16BE 解 UTF-8 乱码。
-    let alphabet = if content.is_ascii() {
-        SmsAlphabet::ASCII
-    } else {
-        SmsAlphabet::UCS2
-    };
-    let wire = to_wire_bytes(content, alphabet);
-    build_deliver_mo_with_udh(account, phone, &wire, None, msg_id, alphabet)
-}
-
 fn build_deliver_mo_with_udh(
     account: &str,
     phone: &str,
@@ -532,6 +537,7 @@ fn build_deliver_mo_with_udh(
     concat: Option<Concat>,
     _msg_id: &[u8; 8],
     alphabet: SmsAlphabet,
+    version: Option<u8>,
 ) -> RawPdu {
     // MO 上行（窄腰）：UnifiedDeliver（src=终端号 phone，dest=账号），传 concat + 纯载荷，
     // 由 adapter 重建 UDH 并置 tp_udhi、编码为 Deliver(registered_delivery=0) 字节。
@@ -544,9 +550,17 @@ fn build_deliver_mo_with_udh(
         extra: ProtocolExtra::Cmpp(CmppExtra::default()),
         tlvs: vec![],
     });
-    let bytes = CmppAdapter
-        .encode(&deliver, Sequence::Plain(0))
-        .expect("encode CMPP deliver(MO)");
+    // V2.0 时按版本编码（DeliverV20：少 src_terminal_type/link_id、尾部带 Reserved(8)）；
+    // 否则默认 V3.0。
+    let bytes = if version == Some(0x20) {
+        CmppAdapter
+            .encode_with_version(&deliver, Sequence::Plain(0), CmppVersion::V20)
+            .expect("encode CMPP deliver(MO) (V2.0)")
+    } else {
+        CmppAdapter
+            .encode(&deliver, Sequence::Plain(0))
+            .expect("encode CMPP deliver(MO)")
+    };
     RawPdu::from(bytes)
 }
 
@@ -582,7 +596,9 @@ impl AccountConfigProvider for SimpleAccountConfigProvider {
 // ServerEventHandler
 // ============================================================================
 
-struct CmppServerEventHandler;
+struct CmppServerEventHandler {
+    msg_source: Arc<FileMessageSource>,
+}
 
 #[async_trait]
 impl ServerEventHandler for CmppServerEventHandler {
@@ -595,7 +611,11 @@ impl ServerEventHandler for CmppServerEventHandler {
     }
 
     async fn on_authenticated(&self, conn: &Arc<dyn ProtocolConnection>, account: &str) {
-        tracing::info!(conn_id = conn.id(), account = %account, "认证成功");
+        // 此时连接的协商版本已确定（Connect 已处理）。按版本延迟编码并入队该账号的预定 MO，
+        // 使 CMPP 2.0 客户端也能收到正确线路布局的 MO（不再用加载时的 V3.0 预编码）。
+        let version = conn.protocol_version().await;
+        tracing::info!(conn_id = conn.id(), account = %account, version = ?version, "认证成功");
+        self.msg_source.enqueue_predefined_mo(account, version).await;
     }
 }
 
@@ -618,6 +638,8 @@ async fn main() -> Result<()> {
         &messages_path.to_string_lossy(),
         Arc::new(SimpleIdGenerator::new()),
     ));
+    // 事件处理器持有同一 MessageSource：在 on_authenticated（连接版本已知）时按版本入队预定 MO。
+    let event_msg_source = msg_source.clone();
 
     let config = Arc::new(
         EndpointConfig::new("cmpp-gateway", "0.0.0.0", 7890, 500, 60)
@@ -635,7 +657,9 @@ async fn main() -> Result<()> {
         .auth_handler(Arc::new(CmppAuthHandler { accounts }))
         .message_source(msg_source as Arc<dyn MessageSource>)
         .account_config_provider(Arc::new(SimpleAccountConfigProvider))
-        .event_handler(Arc::new(CmppServerEventHandler))
+        .event_handler(Arc::new(CmppServerEventHandler {
+            msg_source: event_msg_source,
+        }))
         .account_pool_config(AccountPoolConfig::new())
         .serve()
         .await?;
