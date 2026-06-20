@@ -144,6 +144,31 @@
 - ✅ 四协议示例 server 接入 `id_generator`
 - ✅ 全量测试通过（41 集成 + 11 压测）
 
+## 重构方向 / 技术债（待办，非缺陷）
+
+> 来源：PR #15（CMPP 2.0 版本感知 + 服务端事件回调）code-review。以下均为「真实存在但与该 PR 主题正交」或「架构方向」，当前代码功能正确，未在该 PR 内改动，留作后续独立 PR。
+
+### R1. CMPP 回执编码去重（codec 风险区，需测试先行）
+- `datatypes/deliver.rs` 的 `to_bytes` / `to_bytes_v20` 重复同一 `fixed()` 闭包，函数体仅 `Dest_terminal_Id` 宽度不同（V3.0=32 / V2.0=21），其余 `Msg_Id/Stat/时间/SMSC_sequence` 一致。
+- `adapter.rs` 的 Submit/Deliver/Report 各有 V20/V30 近重复臂，可抽 builder。
+- **不在 PR #15 内做的原因**：定长二进制回执（60B/71B）字节布局直接影响真机（cmos）解析，是该 PR 刚联调修好的高风险区；合并前应先补「V2.0/V3.0 回执逐字节对拍」单测，再做参数化合并，保证逐字节等价。
+
+### R2. 版本表示统一（跨 crate，影响 trait 签名）
+- 当前版本有三套表示：`ProtocolConnection::protocol_version() -> Option<u8>`（裸字节）、codec 的 `CmppVersion` enum、handler 里的 `matches!(v, 0x20|0x00|0x01)`。
+- PR #15 已用 `handlers/cmpp.rs::is_cmpp_v2()` 收口连接器侧最常被复制的判定；彻底统一（让 `CmppVersion` 贯穿全链路、消灭裸 `u8`）需改 `ProtocolConnection` trait，影响面大，单独做。
+
+### R3. `encode_message` V2.0 手写路径下沉到 `Pdu` 层
+- `message.rs` 顶部对 SubmitResp/DeliverResp/ConnectResp 的 V2.0 形态手写 12B 头 + 1 字节 Result/Status body，与下方 `Pdu::*.to_pdu_bytes`（写 u32）双路径并存。
+- 当前是必要特例（V2.0 Result/Status 是 1 字节，与 trait 的 u32 序列化不兼容）；理想是让各 `Pdu` 变体按版本字段自裁字节宽度，但需给每个变体引入版本感知，属更大的 codec 重构。
+
+### R4. 预定 MO 版本感知能力的归属
+- `examples/cmpp_server` 的 `FileMessageSource` 用 `raw_mo`/`mo_enqueued` 在**应用层**实现「按连接版本延迟编码」。作为演示代码这是其职责所在。
+- 若多应用都需要，可考虑框架层抽象 `VersionAwareMessageSource` 包装或 adapter 提供 `encode_auto_version`——属产品决策，不在 example 内定。
+- 关联：PR #15（fae4322）已把去重键由 `account` 改为 `account#version`，修掉换版本重连发错形态的问题；**仍未定的语义**：同账号同版本重连是否应再次补发预定 MO（当前为「种子语义」只发一次）。
+
+### R5. `ServerEventHandler` 文档注释欠账（既有代码，非本 PR 引入）
+- `crates/rsms-connector/src/protocol.rs` 的 `on_connected` / `on_disconnected` / `on_authenticated` 缺 `///` 文档注释。该 trait 是既有代码，PR #15 仅首次调用它们、未改 `protocol.rs`，故未在该 PR 内补；可单开 docs 改动补齐（CLAUDE.md 要求公开 API 必须有文档注释）。
+
 ## Relevant files / directories
 
 ### 框架核心
