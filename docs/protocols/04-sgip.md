@@ -164,7 +164,7 @@ let pdu_bytes = bind.to_pdu_bytes(node_id, timestamp, seq_number);
 
 ## 服务端完整示例
 
-参考：`examples/sgip-endpoint/src/server.rs`
+参考：`examples/sgip_server/src/main.rs`
 
 ```rust
 use rsms_core::Protocol;
@@ -179,7 +179,7 @@ let server = ServerBuilder::new(config)
 
 ## 客户端完整示例
 
-参考：`examples/sgip-endpoint/src/client.rs`
+参考：`examples/sgip_client/src/main.rs`
 
 ```rust
 let endpoint = Arc::new(EndpointConfig::new("sgip-client", "127.0.0.1", port, 500, 60)
@@ -203,8 +203,8 @@ conn.write_frame(bind.to_pdu_bytes(1, 0, seq).as_slice()).await?;
 
 | 测试文件 | 说明 |
 |----------|------|
-| `examples/sgip-endpoint/tests/mod.rs` | 集成测试（8 个） |
-| `examples/sgip-endpoint/tests/stress_test.rs` | 单账号压测 |
-| `examples/sgip-endpoint/tests/multi_account_stress_test.rs` | 多账号压测（5×5，300s） |
-| `examples/sgip-endpoint/tests/sgip_longmsg_test.rs` | 长短信测试 |
-| `examples/sgip-endpoint/tests/dynamic_connection_test.rs` | 动态连接数调整测试 |
+| `tests/sgip/integration.rs`（`sgip-integration`） | 集成测试（8 个） |
+| `tests/sgip/stress_test.rs`（`sgip-stress-test`） | 单账号压测 |
+| `tests/sgip/multi_account_stress_test.rs`（`sgip-multi-account-stress-test`） | 多账号压测（5×5，300s） |
+| `tests/sgip/sgip_longmsg_test.rs`（`sgip-longmsg-test`） | 长短信测试 |
+| `tests/sgip/dynamic_connection_test.rs`（`sgip-dynamic-connection-test`） | 动态连接数调整测试 |

@@ -153,7 +153,7 @@ let message = decode_message_with_version(pdu, Some(version))?;
 
 ## 服务端完整示例
 
-参考：`examples/smpp-endpoint/src/server.rs`
+参考：`examples/smpp_server/src/main.rs`
 
 ```rust
 use rsms_core::Protocol;
@@ -168,7 +168,7 @@ let server = ServerBuilder::new(config)
 
 ## 客户端完整示例
 
-参考：`examples/smpp-endpoint/src/client.rs`
+参考：`examples/smpp_client/src/main.rs`
 
 ```rust
 let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 500, 60)
@@ -188,8 +188,8 @@ conn.write_frame(pdu.to_pdu_bytes(1).as_slice()).await?;
 
 | 测试文件 | 说明 |
 |----------|------|
-| `examples/smpp-endpoint/tests/mod.rs` | 集成测试（9 个） |
-| `examples/smpp-endpoint/tests/stress_test.rs` | 单账号压测（V3.4 + V5.0） |
-| `examples/smpp-endpoint/tests/multi_account_stress_test.rs` | 多账号压测（5×5，300s） |
-| `examples/smpp-endpoint/tests/smpp_longmsg_test.rs` | 长短信测试（V3.4 + V5.0） |
-| `examples/smpp-endpoint/tests/dynamic_connection_test.rs` | 动态连接数调整测试 |
+| `tests/smpp/integration.rs`（`smpp-integration`） | 集成测试（9 个） |
+| `tests/smpp/stress_test.rs`（`smpp-stress-test`） | 单账号压测（V3.4 + V5.0） |
+| `tests/smpp/multi_account_stress_test.rs`（`smpp-multi-account-stress-test`） | 多账号压测（5×5，300s） |
+| `tests/smpp/smpp_longmsg_test.rs`（`smpp-longmsg-test`） | 长短信测试（V3.4 + V5.0） |
+| `tests/smpp/dynamic_connection_test.rs`（`smpp-dynamic-connection-test`） | 动态连接数调整测试 |

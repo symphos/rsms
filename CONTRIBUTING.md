@@ -109,14 +109,14 @@ crates/              — 核心框架 crate
   rsms-session/      — 连接状态管理
   rsms-pipeline/     — 处理管道
 
-examples/            — 示例代码
-  cmpp-endpoint/     — CMPP 压测套件
-  smgp-endpoint/     — SMGP 压测套件
-  sgip-endpoint/     — SGIP 压测套件
-  smpp-endpoint/     — SMPP 压测套件
+examples/            — 四协议示例（目录名用下划线，包名为 <proto>-server-example/<proto>-client-example）
   cmpp_server/       — CMPP 完整服务端示例
   cmpp_client/       — CMPP 完整客户端示例
-  ... (四协议各 server/client)
+  ... (smgp/smpp/sgip 各一对 server/client)
+
+tests/               — 集成/压测/长短信测试（统一 rsms-tests 包）
+  cmpp/ smgp/ smpp/ sgip/  — 各协议测试源
+  common/            — 共享测试辅助（crate 名 rsms-test-common）
 
 docs/                — 文档
 ```

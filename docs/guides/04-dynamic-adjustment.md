@@ -157,14 +157,14 @@ account_pool.update_config("900001", AccountConfig::new()
 
 ## 参考测试
 
-| 协议 | 测试文件 |
+| 协议 | 测试文件（统一在 `rsms-tests` 包） |
 |------|----------|
-| CMPP | `examples/cmpp-endpoint/tests/dynamic_connection_test.rs`（4 个测试） |
-| SMGP | `examples/smgp-endpoint/tests/dynamic_connection_test.rs`（2 个测试） |
-| SMPP | `examples/smpp-endpoint/tests/dynamic_connection_test.rs`（2 个测试） |
-| SGIP | `examples/sgip-endpoint/tests/dynamic_connection_test.rs`（2 个测试） |
+| CMPP | `tests/cmpp/dynamic_connection_test.rs`（4 个测试） |
+| SMGP | `tests/smgp/dynamic_connection_test.rs`（2 个测试） |
+| SMPP | `tests/smpp/dynamic_connection_test.rs`（2 个测试） |
+| SGIP | `tests/sgip/dynamic_connection_test.rs`（2 个测试） |
 
-运行命令：
+运行命令（测试代码已内置 `.with_log_level(WARN)`，无需 `RUST_LOG`）：
 ```bash
-RUST_LOG=warn cargo test -p cmpp-endpoint-example --test dynamic-connection-test -- --nocapture
+cargo test -p rsms-tests --test cmpp-dynamic-connection-test -- --nocapture
 ```

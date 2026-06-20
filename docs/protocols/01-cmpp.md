@@ -167,9 +167,21 @@ let version = conn.protocol_version().await.unwrap_or(0x30);
 let message = decode_message_with_version(pdu, Some(version))?;
 ```
 
+## 应答与回执的版本宽度（端到端版本感知）
+
+V2.0 与 V3.0 的应答包/状态报告字段宽度不同，服务端按连接协商版本编码（`CmppVersion::from_wire(version_byte)`，见 `rsms-connector/src/handlers/cmpp.rs`），框架提供独立的 `SubmitRespV20`/`DeliverRespV20`/`ConnectRespV20` 类型：
+
+| PDU | V2.0 | V3.0 |
+|-----|------|------|
+| ConnectResp / SubmitResp / DeliverResp 的 Result/Status | 1 字节 | 4 字节 |
+| 状态报告（Deliver 承载）定长正文 | 60B（Dest_terminal_Id 21B） | 71B（Dest_terminal_Id 32B） |
+| DeliverV20 尾部 | 含 `Reserved(8)` | （无） |
+
+> 客户端解码也须版本感知（`decode_with_version(frame, 本连接版本)`），否则按默认 V3.0 解 V2.0 应答会失败。
+
 ## 服务端完整示例
 
-参考：`examples/cmpp-endpoint/src/server.rs`
+参考：`examples/cmpp_server/src/main.rs`
 
 ```rust
 use rsms_core::Protocol;
@@ -189,7 +201,7 @@ tokio::spawn(async move { let _ = server.run().await; });
 
 ## 客户端完整示例
 
-参考：`examples/cmpp-endpoint/src/client.rs`
+参考：`examples/cmpp_client/src/main.rs`
 
 ```rust
 let endpoint = Arc::new(EndpointConfig::new("cmpp-client", "127.0.0.1", port, 500, 60));
@@ -205,10 +217,12 @@ conn.write_frame(connect_pdu.as_bytes()).await?;
 
 ## 参考测试
 
-| 测试文件 | 说明 |
-|----------|------|
-| `examples/cmpp-endpoint/tests/mod.rs` | 集成测试（37 个） |
-| `examples/cmpp-endpoint/tests/stress_test.rs` | 单账号压测（1连接 + 5连接） |
-| `examples/cmpp-endpoint/tests/multi_account_stress_test.rs` | 多账号压测（5×5，300s） |
-| `examples/cmpp-endpoint/tests/cmpp_longmsg_test.rs` | 长短信测试（V2.0 + V3.0） |
-| `examples/cmpp-endpoint/tests/dynamic_connection_test.rs` | 动态连接数调整测试 |
+统一在 `rsms-tests` 包，按 `cargo test -p rsms-tests --test <目标名>` 运行：
+
+| 测试文件 | 目标名 | 说明 |
+|----------|--------|------|
+| `tests/cmpp/cmpp_test.rs` | `cmpp-integration` | 集成测试 |
+| `tests/cmpp/stress_test.rs` | `cmpp-stress-test` | 单账号压测（1连接 + 5连接） |
+| `tests/cmpp/multi_account_stress_test.rs` | `cmpp-multi-account-stress-test` | 多账号压测（5×5，300s） |
+| `tests/cmpp/cmpp_longmsg_test.rs` | `cmpp-longmsg-test` | 长短信测试（V2.0 + V3.0） |
+| `tests/cmpp/dynamic_connection_test.rs` | `cmpp-dynamic-connection-test` | 动态连接数调整测试 |
