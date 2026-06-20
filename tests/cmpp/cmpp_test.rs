@@ -788,16 +788,20 @@ fn build_deliver_mo(seq_id: u32, src_terminal: &str, dest_id: &str, content: &st
 /// 辅助函数：构建 CMPP Deliver PDU (Report - 状态报告)。
 /// 统一 Report（adapter 编码为 Deliver registered_delivery=1）；msg_id 用 8 字节二进制。
 fn build_deliver_report(seq_id: u32, msg_id: &[u8; 8], dest_id: &str) -> RawPdu {
-    let report_content = format!(
-        "id:{:02x?}{:02x?}{:02x?}{:02x?}{:02x?}{:02x?}{:02x?}{:02x?} sub:001 dlvrd:001 submit date:26010100 done date:26010100 stat:DELIVRD err:000",
-        msg_id[0], msg_id[1], msg_id[2], msg_id[3], msg_id[4], msg_id[5], msg_id[6], msg_id[7]
-    );
+    // CMPP 状态报告正文为**定长二进制**：Msg_Id(8) + Stat(7) + Submit_time(10) + Done_time(10) + ...
+    // 关联键是正文体 [0..8] 的原 submit Msg_Id（真机 cmos 即此格式）。此前用文本 fixture 非规范，
+    // 旧 decode 取 Deliver 信封 id 才碰巧能过；现 decode 按规范取正文体 [0..8]。
+    let mut report_content = Vec::new();
+    report_content.extend_from_slice(msg_id); // [0..8] 原 submit Msg_Id（关联键）
+    report_content.extend_from_slice(b"DELIVRD"); // [8..15] stat
+    report_content.extend_from_slice(b"2601010000"); // [15..25] submit_time
+    report_content.extend_from_slice(b"2601010001"); // [25..35] done_time
     let report = UnifiedMessage::Report(UnifiedReport {
         msg_id: MessageId::Binary(msg_id.to_vec()),
         status: DeliveryStatus::Delivered,
         src: Address::plain(""),
         dest: Address::plain(dest_id),
-        raw: report_content.into_bytes(),
+        raw: report_content,
     });
     let bytes = CmppAdapter.encode(&report, Sequence::Plain(seq_id)).expect("encode report");
     RawPdu::from_vec(bytes)
