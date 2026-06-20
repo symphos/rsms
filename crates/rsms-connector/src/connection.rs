@@ -331,7 +331,9 @@ pub async fn run_connection(
     auth_handler: Option<Arc<dyn crate::protocol::AuthHandler>>,
     protocol: Protocol,
     event_handler: Option<Arc<dyn ServerEventHandler>>,
+    metrics: Arc<dyn rsms_core::Metrics>,
 ) {
+    metrics.connection_opened();
     let mut read = read;
     let mut read_buf = Vec::new();
     let mut tmp_buf = [0u8; 8192];
@@ -369,12 +371,14 @@ pub async fn run_connection(
         let frames = match decode_frames_drain(&mut read_buf, protocol) {
             Ok(f) => f,
             Err(e) => {
+                metrics.decode_error(protocol);
                 error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "frame decode: {e}");
                 break;
             }
         };
 
         for frame in frames {
+            metrics.inbound_frame(protocol, frame.command_id);
             let conn_arc = conn.clone();
             
             let handle_result = match protocol {
@@ -422,6 +426,7 @@ pub async fn run_connection(
                         let acc_pool = pool.get_or_create(&acc).await;
                         let _ = acc_pool.add_connection(conn_arc.clone()).await;
                         conn_arc.set_account_connections(Some(acc_pool.clone())).await;
+                        metrics.connection_authenticated(&acc);
                         tracing::info!(conn_id = conn_arc.id, remote_ip = %conn_arc.remote_ip(), remote_port = conn_arc.remote_port(), account = %acc, "registered connection to account pool");
                         
                         if let Some(ref provider) = account_config_provider {
@@ -454,6 +459,7 @@ pub async fn run_connection(
     }
 
     conn.mark_disconnected().await;
+    metrics.connection_closed();
 
     if let Some(ref handler) = event_handler {
         handler.on_disconnected(conn_id, account.as_deref()).await;

@@ -8,7 +8,7 @@ use rsms_connector::{
 use rsms_connector::client::{ClientContext, ClientConfig};
 use rsms_business::BusinessHandler;
 use rsms_business::InboundContext;
-use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Frame, Result};
+use rsms_core::{ConnectionInfo, Metrics, Protocol, RawPdu, EndpointConfig, Frame, Result};
 // 窄腰统一模型：编解码全程经 CmppAdapter（decode→UnifiedMessage / encode UnifiedMessage→字节）。
 // compute_connect_auth 是 MD5 鉴权工具（非裸消息构造），保留。
 use rsms_codec_cmpp::adapter::CmppAdapter;
@@ -443,6 +443,91 @@ async fn test_connect_with_valid_password() {
     assert_eq!(client_handler.get_connect_status(), Some(0), "认证成功状态码应为0");
     assert!(client_handler.is_connected(), "应该已连接");
     assert_eq!(auth.auth_success_count(), 1, "应该认证成功1次");
+
+    handle.abort();
+}
+
+/// 计数型 Metrics 测试桩：用原子计数验证框架在关键点回调了指标钩子。
+#[derive(Default)]
+struct CountingMetrics {
+    opened: AtomicUsize,
+    authenticated: AtomicUsize,
+    inbound: AtomicUsize,
+    decode_error: AtomicUsize,
+}
+
+impl Metrics for CountingMetrics {
+    fn connection_opened(&self) {
+        self.opened.fetch_add(1, Ordering::Relaxed);
+    }
+    fn connection_authenticated(&self, _account: &str) {
+        self.authenticated.fetch_add(1, Ordering::Relaxed);
+    }
+    fn inbound_frame(&self, _protocol: Protocol, _command_id: u32) {
+        self.inbound.fetch_add(1, Ordering::Relaxed);
+    }
+    fn decode_error(&self, _protocol: Protocol) {
+        self.decode_error.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+async fn start_test_server_with_metrics(
+    auth_handler: Arc<dyn AuthHandler>,
+    biz_handler: Arc<dyn BusinessHandler>,
+    metrics: Arc<dyn Metrics>,
+) -> Result<(u16, tokio::task::JoinHandle<()>)> {
+    let cfg = Arc::new(EndpointConfig::new("metrics-server", "127.0.0.1", 0, 8, 30));
+    let server = ServerBuilder::new(cfg)
+        .handlers(vec![biz_handler])
+        .auth_handler(auth_handler)
+        .account_config_provider(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>)
+        .metrics(metrics)
+        .serve()
+        .await
+        .expect("bind");
+    let port = server.local_addr.port();
+    let handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    Ok((port, handle))
+}
+
+#[tokio::test]
+async fn test_metrics_hooks_fired() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .try_init();
+
+    let auth = Arc::new(PasswordAuthHandler::new().add_account("106900", "password123"));
+    let biz = Arc::new(TestBusinessHandler::new());
+    let metrics = Arc::new(CountingMetrics::default());
+    let (port, handle) =
+        start_test_server_with_metrics(auth.clone(), biz.clone(), metrics.clone() as Arc<dyn Metrics>)
+            .await
+            .unwrap();
+
+    let endpoint = Arc::new(EndpointConfig::new("metrics-client", "127.0.0.1", port, 8, 30));
+    let client_handler = Arc::new(TestClientHandler::new());
+    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+        .client_config(ClientConfig::new())
+        .connect()
+        .await
+        .expect("connect");
+
+    // 发一帧 Connect：服务端 accept → connection_opened；解码该帧 → inbound_frame；
+    // 认证成功并注册账号池 → connection_authenticated。
+    let connect_pdu = client_handler.build_connect_pdu("106900", "password123");
+    conn.send_request(connect_pdu).await.expect("send connect");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert!(metrics.opened.load(Ordering::Relaxed) >= 1, "connection_opened 应被调用");
+    assert!(metrics.inbound.load(Ordering::Relaxed) >= 1, "inbound_frame 应被调用");
+    assert_eq!(metrics.authenticated.load(Ordering::Relaxed), 1, "connection_authenticated 应被调用 1 次");
+    assert_eq!(metrics.decode_error.load(Ordering::Relaxed), 0, "正常帧不应触发 decode_error");
+    // connection_closed 与 connection_opened 在 run_connection 同处对称埋点（收尾必调），
+    // 客户端无公开 close API、整测断连时序不稳，故其覆盖交由 rsms-core 的 Metrics 单测 +
+    // 接线对称性保证，此处不做时序敏感断言。
 
     handle.abort();
 }
