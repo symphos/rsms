@@ -139,7 +139,7 @@ Exit 包有 1 字节 `reserve` body（总长 21 字节，比其他协议多 1 �
 
 ## 服务端完整示例
 
-参考：`examples/smgp-endpoint/src/server.rs`
+参考：`examples/smgp_server/src/main.rs`
 
 ```rust
 use rsms_core::Protocol;
@@ -154,7 +154,7 @@ let server = ServerBuilder::new(config)
 
 ## 客户端完整示例
 
-参考：`examples/smgp-endpoint/src/client.rs`
+参考：`examples/smgp_client/src/main.rs`
 
 ```rust
 let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 500, 60)
@@ -173,8 +173,8 @@ conn.write_frame(login_pdu.as_bytes()).await?;
 
 | 测试文件 | 说明 |
 |----------|------|
-| `examples/smgp-endpoint/tests/mod.rs` | 集成测试（9 个） |
-| `examples/smgp-endpoint/tests/stress_test.rs` | 单账号压测 |
-| `examples/smgp-endpoint/tests/multi_account_stress_test.rs` | 多账号压测（5×5，300s） |
-| `examples/smgp-endpoint/tests/smgp_longmsg_test.rs` | 长短信测试 |
-| `examples/smgp-endpoint/tests/dynamic_connection_test.rs` | 动态连接数调整测试 |
+| `tests/smgp/integration.rs`（`smgp-integration`） | 集成测试（9 个） |
+| `tests/smgp/stress_test.rs`（`smgp-stress-test`） | 单账号压测 |
+| `tests/smgp/multi_account_stress_test.rs`（`smgp-multi-account-stress-test`） | 多账号压测（5×5，300s） |
+| `tests/smgp/smgp_longmsg_test.rs`（`smgp-longmsg-test`） | 长短信测试 |
+| `tests/smgp/dynamic_connection_test.rs`（`smgp-dynamic-connection-test`） | 动态连接数调整测试 |

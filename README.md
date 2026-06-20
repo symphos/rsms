@@ -251,6 +251,10 @@ cargo test -p rsms-tests --test cmpp-longmsg-test -- --nocapture
 cargo test -p rsms-tests --test cmpp-dynamic-connection-test -- --nocapture
 ```
 
+## 鸣谢
+
+感谢 [**lihuanghe/SMSGate**](https://github.com/Lihuanghe/SMSGate)（Java 多协议短信网关）—— 开发期间以它作为联调对端，帮助验证了 rsms 的协议线路兼容性。
+
 ## License
 
 Apache-2.0

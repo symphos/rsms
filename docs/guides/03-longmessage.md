@@ -135,9 +135,11 @@ msg_source.push_group("900001", items).await;
 
 ## 参考测试
 
-| 协议 | 测试文件 | 测试数 |
+| 协议 | 测试文件（统一在 `rsms-tests` 包） | 测试数 |
 |------|----------|--------|
-| CMPP | `examples/cmpp-endpoint/tests/cmpp_longmsg_test.rs` | 11（V2.0 + V3.0） |
-| SMGP | `examples/smgp-endpoint/tests/smgp_longmsg_test.rs` | 7 |
-| SMPP | `examples/smpp-endpoint/tests/smpp_longmsg_test.rs` | 11（V3.4 + V5.0） |
-| SGIP | `examples/sgip-endpoint/tests/sgip_longmsg_test.rs` | 7 |
+| CMPP | `tests/cmpp/cmpp_longmsg_test.rs` | 11（V2.0 + V3.0） |
+| SMGP | `tests/smgp/smgp_longmsg_test.rs` | 7 |
+| SMPP | `tests/smpp/smpp_longmsg_test.rs` | 11（V3.4 + V5.0） |
+| SGIP | `tests/sgip/sgip_longmsg_test.rs` | 7 |
+
+运行：`cargo test -p rsms-tests --test cmpp-longmsg-test -- --nocapture`（各协议 `<proto>-longmsg-test`）。
