@@ -26,6 +26,16 @@ pub(crate) fn msg_id_to_string(id: &MessageId) -> String {
     }
 }
 
+/// SGIP 关联键：取 20B 头部中的 12 字节 sequence(node_id+timestamp+number,各 4B 大端,offset 8..20)
+/// 的十六进制串。该值与 SGIP 报告 `seq_to_msg_id(submit_sequence)` 的编码一致,且 submit/resp/report
+/// 三方携带同值,故用作 SGIP 交付链路的唯一关联键（避开 seq_offset 只取 timestamp 在突发同秒下冲突）。
+fn sgip_seq_key(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 20 {
+        return None;
+    }
+    Some(bytes[8..20].iter().map(|x| format!("{x:02x}")).collect())
+}
+
 /// 出站 command_id 是否为该协议的 Submit（发侧登记只需识别 Submit，不必整包解码，
 /// 从而避开 CMPP V2.0/V3.0 版本感知解码的脆弱性）。
 fn is_submit(protocol: Protocol, command_id: u32) -> bool {
@@ -46,8 +56,18 @@ pub(crate) async fn drive_inbound(tm: &TransactionManager, protocol: Protocol, f
     };
     match msg {
         UnifiedMessage::SubmitResp(r) => {
-            tm.on_submit_resp(frame.sequence_id, Some(msg_id_to_string(&r.msg_id)), r.status)
-                .await;
+            if protocol == Protocol::Sgip {
+                // SGIP SubmitResp 不含 msg_id：用 number(bytes[16..20]) 找事务、rekey 到 12B sequence
+                // hex(=报告将携带的 msg_id)，复用 on_submit_resp 的改键 + 乱序冲刷。
+                let raw = frame.data.as_bytes_ref();
+                if let Some(key) = sgip_seq_key(raw) {
+                    let number = u32::from_be_bytes([raw[16], raw[17], raw[18], raw[19]]);
+                    tm.on_submit_resp(number, Some(key), r.status).await;
+                }
+            } else {
+                tm.on_submit_resp(frame.sequence_id, Some(msg_id_to_string(&r.msg_id)), r.status)
+                    .await;
+            }
         }
         UnifiedMessage::Report(rep) => {
             tm.on_report(ReportInfo {
@@ -83,6 +103,26 @@ pub(crate) async fn register_outbound(tm: &TransactionManager, protocol: Protoco
     if !is_submit(protocol, command_id) {
         return false;
     }
+
+    if protocol == Protocol::Sgip {
+        // SGIP：用唯一的 number(bytes[16..20]) 作初始 seq 键（避开 seq_offset 取 timestamp 在突发
+        // 同秒下冲突），resp 时再 rekey 到 12B sequence hex(=报告 msg_id)。复用 on_submit_resp/on_report
+        // 的改键 + 乱序暂存机制，使 Resp/Report 任意顺序均能触发两个回调。
+        if raw.len() < 20 {
+            return false;
+        }
+        let number = u32::from_be_bytes([raw[16], raw[17], raw[18], raw[19]]);
+        tm.add_submit_transaction(SubmitInfo::new(
+            number,
+            String::new(),
+            String::new(),
+            raw.to_vec(),
+            protocol.as_str(),
+        ))
+        .await;
+        return true;
+    }
+
     let sequence_id = u32::from_be_bytes([
         raw[seq_offset],
         raw[seq_offset + 1],
@@ -122,8 +162,8 @@ mod tests {
     use crate::transaction::MessageCallback;
     use rsms_core::RawPdu;
     use rsms_model::{
-        Address, CmppExtra, DeliveryStatus, Encoding, ProtocolExtra, Sequence, UnifiedReport,
-        UnifiedSubmit, UnifiedSubmitResp,
+        Address, CmppExtra, DeliveryStatus, Encoding, ProtocolExtra, Sequence, SgipExtra,
+        UnifiedReport, UnifiedSubmit, UnifiedSubmitResp,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -259,6 +299,52 @@ mod tests {
             drain_pending(&tm, Duration::from_millis(200)).await,
             "Resp 追平后应返回 true"
         );
+    }
+
+    /// SGIP：SubmitResp 无 msg_id，按 sequence 关联——出站按 number 登记，resp 时 rekey 到 12B
+    /// sequence hex，报告(submit_sequence 同序列)按该 hex 关联。真机联调 cmos SGIP 验证。
+    #[tokio::test]
+    async fn sgip_resp_report_correlate_by_sequence() {
+        let tm = TransactionManager::new(10);
+        let spy = Arc::new(Spy::default());
+        tm.set_callback(Some(spy.clone() as Arc<dyn MessageCallback>)).await;
+
+        let seq = Sequence::Sgip { node_id: 1, timestamp: 0x1234_5678, number: 42 };
+        let enc = |m: &UnifiedMessage| {
+            adapter_for(Protocol::Sgip).encode(m, seq).expect("sgip encode")
+        };
+
+        // 出站 Submit：按 number(42) 登记。
+        let submit = UnifiedMessage::Submit(UnifiedSubmit {
+            src: Address::plain("106900"),
+            dests: vec![Address::plain("13800138000")],
+            content: b"hi".to_vec(),
+            encoding: Encoding::Ascii,
+            want_report: true,
+            concat: None,
+            extra: ProtocolExtra::Sgip(SgipExtra::default()),
+            tlvs: vec![],
+        });
+        assert!(register_outbound(&tm, Protocol::Sgip, &enc(&submit)).await);
+
+        // SubmitResp(无 msg_id)：按 number 找、rekey 到 12B sequence hex → on_submit_resp_ok。
+        let resp = enc(&UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+            msg_id: MessageId::Text(String::new()),
+            status: 0,
+        }));
+        drive_inbound(&tm, Protocol::Sgip, &frame_of(resp)).await;
+        assert_eq!(spy.resp_ok.load(Ordering::Relaxed), 1, "SGIP SubmitResp 应触发 on_submit_resp_ok");
+
+        // Report(submit_sequence = 同序列 12B)：按 12B hex 关联到原 Submit → on_report。
+        let report = enc(&UnifiedMessage::Report(UnifiedReport {
+            msg_id: MessageId::Binary(vec![0, 0, 0, 1, 0x12, 0x34, 0x56, 0x78, 0, 0, 0, 42]),
+            status: DeliveryStatus::Delivered,
+            src: Address::plain(""),
+            dest: Address::plain("13800138000"),
+            raw: vec![],
+        }));
+        drive_inbound(&tm, Protocol::Sgip, &frame_of(report)).await;
+        assert_eq!(spy.reports.load(Ordering::Relaxed), 1, "SGIP 报告应按 sequence 关联到原 Submit");
     }
 
     /// 收侧：status!=0 的 SubmitResp 应走 error 回调。
