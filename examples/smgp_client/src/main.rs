@@ -269,7 +269,7 @@ impl SmgpClientHandler {
                 Some(udh.clone()),
             );
             let mut merger = self.mo_merger.lock().unwrap();
-            match merger.add_frame(frame) {
+            match merger.add_frame(src, frame) {
                 Ok(Some(merged)) => tracing::info!(
                     "长短信 MO 合包完成: src={}, dest={}, content={}",
                     src,

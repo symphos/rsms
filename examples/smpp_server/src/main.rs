@@ -414,7 +414,7 @@ impl SmppBusinessHandler {
                 udh,
             );
             let mut merger = self.merger.lock().unwrap();
-            match merger.add_frame(lm_frame) {
+            match merger.add_frame(&phone, lm_frame) {
                 Ok(Some(merged)) => {
                     // 合包完成后按实际编码解码（UCS2→UTF-16BE，否则 UTF-8）
                     let content = decode_text(&merged, submit.encoding);

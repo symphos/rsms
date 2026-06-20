@@ -428,7 +428,7 @@ impl SgipBusinessHandler {
             let mut merger = self.merger.lock().unwrap();
             let seg = frame_lm.segment_number;
             let total = frame_lm.total_segments;
-            match merger.add_frame(frame_lm) {
+            match merger.add_frame(&phone, frame_lm) {
                 Ok(Some(complete)) => {
                     // 长短信合包后按 submit.encoding 正确解码（UCS2 → UTF-16BE）。
                     let content = decode_text(&complete, submit.encoding);

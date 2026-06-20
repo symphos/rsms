@@ -366,7 +366,7 @@ impl SmgpBusinessHandler {
                 None,
             );
             let mut merger = self.merger.lock().unwrap();
-            match merger.add_frame(lm_frame) {
+            match merger.add_frame(&phone, lm_frame) {
                 Ok(Some(complete)) => {
                     // 合包完成后按编码解码全文（UCS2 走 UTF-16BE，其余宽容 UTF-8）
                     let content = decode_text(&complete, submit.encoding);

@@ -449,7 +449,7 @@ impl CmppBusinessHandler {
             let mut merger = self.merger.lock().unwrap();
             let seg = frame_lm.segment_number;
             let total = frame_lm.total_segments;
-            match merger.add_frame(frame_lm) {
+            match merger.add_frame(&phone, frame_lm) {
                 Ok(Some(complete)) => {
                     // 长短信合包完成后按 encoding 正确解码（UCS2→UTF-16BE，否则 UTF-8）
                     let content = decode_text(&complete, submit.encoding);

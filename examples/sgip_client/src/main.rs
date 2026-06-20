@@ -298,7 +298,7 @@ impl SgipClientHandler {
             let udh = UdhParser::extract_udh(&seg).map(|(h, _)| h);
             let frame = LongMessageFrame::new(c.reference, c.total, c.sequence, seg, true, udh);
             let mut merger = self.mo_merger.lock().unwrap();
-            match merger.add_frame(frame) {
+            match merger.add_frame(src, frame) {
                 Ok(Some(merged)) => tracing::info!(
                     "长短信 MO 合包完成: src={}, 内容={}",
                     src,
