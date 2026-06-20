@@ -119,6 +119,12 @@
 - **已修复（仅测试代码，分支 `fix/cmpp-stress-harness`）**：client 改 `decode_with_version(frame, 本连接版本)`；服务端 `UnifiedReport.msg_id` 填真实 8B msgId；client 按解码后 `r.msg_id` 结构化匹配。单/多账号两份 harness 同改。
 - **验证（60s/WARN）**：cmpp-stress 3 passed（CMPP3.0 Report 2500）、cmpp-multi 1 passed（Report 12713）；四协议单+多账号全绿、零丢失、MT 2500/12700 TPS。
 
+### 15. msg_id / sequence / 长短信 隔离性审计与加固
+- **审计结论**：msg_id（服务端出站，`IdGenerator`）按账号独立实例、账号间物理隔离；sequence_id 由业务构造 PDU 时填、框架不代生成；滑动窗口与 pending_responses **按连接隔离**（同步响应匹配不串）；`TransactionManager` **按账号共享**、以 sequence_id 为键（回执走 msg_id 键、连接无关）。
+- **🔴 真缺陷已修**：`LongMessageMerger` 此前仅按 `(reference,total)` 分组（`frame.unique_id()`、不含发送方），不同发送方 reference 撞号（16-bit、各自从小值起）会串合/丢段。已改 `add_frame(sender, frame)`、键带发送方；四协议示例服务端传 phone、客户端传 src；新增 `different_senders_same_reference_do_not_cross_merge` 回归（去掉 sender 维度即 FAILED）。
+- **🟢 出站 reference 加固**：`ReferenceIdGenerator::new()` 种子改为进程级分发器（一次性纳秒时间基 + 黄金比例素数步长），保证「每条长短信新建 splitter」时多个生成器**起始 reference 互不相同**（`fresh_generators_have_distinct_starting_references`）。理想仍是每账号持久生成器（`with_generator`）。
+- **🟢 sequence 契约文档化**：同账号多连接的 sequence_id **须账号内唯一**（否则共享 TM 按 seq 键会互相覆盖）；框架已提供正解——同账号多连接共用一个 `IdGenerator`，用 `account_connections.id_generator().next_sequence_id()` 取值即可。已在 `client.rs::send_request` 与 `TransactionManager::add_submit_transaction` 注明。**不**采用「TM 键带 conn_id」（会破坏从其他连接回来的回执匹配）。
+
 ## Accomplished
 
 ### CMPP（✅ 全部完成）

@@ -145,6 +145,10 @@ impl TransactionManager {
         *self.inner.callback.write().await = callback;
     }
 
+    /// 登记一条 Submit 事务。主表按 `sequence_id` 为初始键（收到 Resp 后改键 `msg_id`）。
+    /// **本 TM 按账号共享**（回执可能从账号的任意连接回来，故不能按连接隔离）；因此
+    /// **调用方须保证 sequence_id 在账号内唯一**（如取自账号共享的 `IdGenerator::next_sequence_id`），
+    /// 否则同账号多连接用相同 sequence 会在此覆盖彼此的事务。
     pub async fn add_submit_transaction(&self, info: SubmitInfo) {
         let key = info.sequence_id.to_string();
         let entry = TransactionEntry {
