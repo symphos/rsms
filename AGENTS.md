@@ -146,18 +146,19 @@
 
 ## 重构方向 / 技术债（待办，非缺陷）
 
-> 来源：PR #15（CMPP 2.0 版本感知 + 服务端事件回调）code-review。以下均为「真实存在但与该 PR 主题正交」或「架构方向」，当前代码功能正确，未在该 PR 内改动，留作后续独立 PR。
+> 来源：PR #16（CMPP 2.0 版本感知 + 服务端事件回调）code-review。以下均为「真实存在但与该 PR 主题正交」或「架构方向」，当前代码功能正确，未在该 PR 内改动，留作后续独立 PR。
 
 ### R1. CMPP 回执编码去重（codec 风险区，需测试先行）✅ 已完成（702cbb8）
-> `to_bytes`/`to_bytes_v20` 已抽为参数化 `to_fixed_bytes(dest_width)`；先补 71B 字节级表征测试锁布局再重构，逐字节等价、全测试绿。adapter 的 Submit/Deliver/Report V20/V30 臂去重仍可后续做（见下方原始记录）。
+> `to_bytes`/`to_bytes_v20` 已抽为参数化 `to_fixed_bytes(dest_width)`；先补 71B 字节级表征测试锁布局再重构，逐字节等价、全测试绿。
+> adapter 的 **Report 臂** V20/V30 已去重：重复的 `CmppReport` 合成字面量抽为 `report_body(is_v20)` 闭包，两分支已有 60B/71B roundtrip 测试护航（在 `refactor/cmpp-adapter-report-arms` 分支）。Submit/Deliver(MO) 两臂因 `SubmitV20`/`Submit`、`DeliverV20`/`Deliver` 字段集本就不同，强行去重低价值，按设计保留。
 
 - `datatypes/deliver.rs` 的 `to_bytes` / `to_bytes_v20` 重复同一 `fixed()` 闭包，函数体仅 `Dest_terminal_Id` 宽度不同（V3.0=32 / V2.0=21），其余 `Msg_Id/Stat/时间/SMSC_sequence` 一致。
 - `adapter.rs` 的 Submit/Deliver/Report 各有 V20/V30 近重复臂，可抽 builder。
-- **不在 PR #15 内做的原因**：定长二进制回执（60B/71B）字节布局直接影响真机（cmos）解析，是该 PR 刚联调修好的高风险区；合并前应先补「V2.0/V3.0 回执逐字节对拍」单测，再做参数化合并，保证逐字节等价。
+- **不在 PR #16 内做的原因**：定长二进制回执（60B/71B）字节布局直接影响真机（cmos）解析，是该 PR 刚联调修好的高风险区；合并前应先补「V2.0/V3.0 回执逐字节对拍」单测，再做参数化合并，保证逐字节等价。
 
 ### R2. 版本表示统一（跨 crate，影响 trait 签名）
 - 当前版本有三套表示：`ProtocolConnection::protocol_version() -> Option<u8>`（裸字节）、codec 的 `CmppVersion` enum、handler 里的 `matches!(v, 0x20|0x00|0x01)`。
-- PR #15 已用 `handlers/cmpp.rs::is_cmpp_v2()` 收口连接器侧最常被复制的判定；彻底统一（让 `CmppVersion` 贯穿全链路、消灭裸 `u8`）需改 `ProtocolConnection` trait，影响面大，单独做。
+- PR #16 已用 `handlers/cmpp.rs::is_cmpp_v2()` 收口连接器侧最常被复制的判定；彻底统一（让 `CmppVersion` 贯穿全链路、消灭裸 `u8`）需改 `ProtocolConnection` trait，影响面大，单独做。
 
 ### R3. `encode_message` V2.0 手写路径下沉到 `Pdu` 层
 - `message.rs` 顶部对 SubmitResp/DeliverResp/ConnectResp 的 V2.0 形态手写 12B 头 + 1 字节 Result/Status body，与下方 `Pdu::*.to_pdu_bytes`（写 u32）双路径并存。
@@ -166,10 +167,11 @@
 ### R4. 预定 MO 版本感知能力的归属
 - `examples/cmpp_server` 的 `FileMessageSource` 用 `raw_mo`/`mo_enqueued` 在**应用层**实现「按连接版本延迟编码」。作为演示代码这是其职责所在。
 - 若多应用都需要，可考虑框架层抽象 `VersionAwareMessageSource` 包装或 adapter 提供 `encode_auto_version`——属产品决策，不在 example 内定。
-- 关联：PR #15（fae4322）已把去重键由 `account` 改为 `account#version`，修掉换版本重连发错形态的问题；**仍未定的语义**：同账号同版本重连是否应再次补发预定 MO（当前为「种子语义」只发一次）。
+- 关联：PR #16（fae4322）已把去重键由 `account` 改为 `account#version`，修掉换版本重连发错形态的问题。
+- **语义决定（推荐保持）**：预定 MO 采用「种子语义」——同账号同版本仅入队下发一次。推荐保持该语义：预定 MO 本质是「开机种子消息」，按种子语义可避免每次断线重连重复下发同一批。换版本重连的正确性已由 fae4322 覆盖。若后续确有「每连接补发」需求，再单独把去重改为连接级即可。
 
 ### R5. `ServerEventHandler` 文档注释欠账（既有代码，非本 PR 引入）✅ 已完成（b56b1c5）
-- `crates/rsms-connector/src/protocol.rs` 的 `on_connected` / `on_disconnected` / `on_authenticated` 缺 `///` 文档注释。该 trait 是既有代码，PR #15 仅首次调用它们、未改 `protocol.rs`，故未在该 PR 内补；可单开 docs 改动补齐（CLAUDE.md 要求公开 API 必须有文档注释）。
+- `crates/rsms-connector/src/protocol.rs` 的 `on_connected` / `on_disconnected` / `on_authenticated` 缺 `///` 文档注释。该 trait 是既有代码，PR #16 仅首次调用它们、未改 `protocol.rs`，故未在该 PR 内补；可单开 docs 改动补齐（CLAUDE.md 要求公开 API 必须有文档注释）。
 
 ## Relevant files / directories
 
