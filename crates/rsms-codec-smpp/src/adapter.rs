@@ -77,6 +77,15 @@ fn join_udh(concat: &Option<Concat>, content: &[u8], esm_class: u8) -> (Vec<u8>,
     }
 }
 
+/// 从 SMPP 投递回执正文（形如 `id:XXXX sub:.. stat:DELIVRD ..`）解析 `id:` 段。
+/// 用于 receipted_message_id TLV 缺失时回退取关联用 msg_id。找不到/空返回 None。
+fn receipt_id_from_text(text: &[u8]) -> Option<String> {
+    let s = String::from_utf8_lossy(text);
+    let pos = s.find("id:")?;
+    let v: String = s[pos + 3..].chars().take_while(|c| !c.is_whitespace()).collect();
+    if v.is_empty() { None } else { Some(v) }
+}
+
 fn submit_to_unified(s: SubmitSm) -> UnifiedSubmit {
     // 级联长短信：esm_class bit6(0x40)=UDHI 表示正文以 UDH 开头。剥离 UDH → concat 承载分段信息、
     // content 为纯 payload；非 UDHI 或无有效级联 UDH 时 concat=None、content 原样。
@@ -118,12 +127,17 @@ fn deliver_to_unified(d: DeliverSm) -> UnifiedMessage {
         npi: Some(d.dest_addr_npi),
     };
     if d.esm_class & 0x04 != 0 {
-        // 投递回执：receipted_message_id TLV(0x001E) 优先，否则空
+        // 投递回执 msg_id：receipted_message_id TLV(0x001E) 优先；缺失/空时回退解析 short_message
+        // 回执正文的 "id:" 段——真机(cmos)联调实测其 deliver_sm 回执不带该 TLV，msg_id 只在正文
+        // id: 字段，不回退则 UnifiedReport.msg_id 为空、Resp↔Report 永不关联（on_report 全丢）。
         let msg_id = d
             .tlvs
             .iter()
             .find(|t| t.tag == 0x001E)
-            .map(|t| MessageId::Text(String::from_utf8_lossy(&t.value).trim_end_matches('\0').to_string()))
+            .map(|t| String::from_utf8_lossy(&t.value).trim_end_matches('\0').to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| receipt_id_from_text(&d.short_message))
+            .map(MessageId::Text)
             .unwrap_or_else(|| MessageId::Text(String::new()));
         UnifiedMessage::Report(UnifiedReport {
             msg_id,
@@ -465,6 +479,43 @@ mod tests {
             SmppAdapter.decode(&frame_of(bytes)).unwrap(),
             UnifiedMessage::Report(_)
         ));
+    }
+
+    #[test]
+    fn report_msg_id_falls_back_to_receipt_text_when_no_tlv() {
+        // 真机(cmos)联调暴露：deliver_sm 投递回执常**不带** receipted_message_id TLV(0x001E)，
+        // msg_id 只在回执正文 short_message 的 "id:" 段。须回退解析，否则 UnifiedReport.msg_id 为空、
+        // 无法与 SubmitSmResp(message_id) 关联。
+        let mut d = DeliverSm {
+            service_type: String::new(),
+            source_addr_ton: 0,
+            source_addr_npi: 0,
+            source_addr: "1065900000".to_string(),
+            dest_addr_ton: 0,
+            dest_addr_npi: 0,
+            destination_addr: "13800138000".to_string(),
+            esm_class: 0x04,
+            protocol_id: 0,
+            priority_flag: 0,
+            schedule_delivery_time: String::new(),
+            validity_period: String::new(),
+            registered_delivery: 0,
+            replace_if_present_flag: 0,
+            data_coding: 0,
+            sm_default_msg_id: 0,
+            short_message: b"id:0620155538080677202838 stat:DELIVRD".to_vec(),
+            tlvs: vec![], // 关键：无 receipted_message_id TLV
+        };
+        d.esm_class = 0x04;
+        let bytes = Pdu::from(d).to_pdu_bytes(9).to_vec();
+        match SmppAdapter.decode(&frame_of(bytes)).unwrap() {
+            UnifiedMessage::Report(r) => assert_eq!(
+                r.msg_id,
+                MessageId::Text("0620155538080677202838".to_string()),
+                "无 TLV 时应从回执正文 id: 段取 msg_id"
+            ),
+            other => panic!("expected Report, got {other:?}"),
+        }
     }
 
     #[test]

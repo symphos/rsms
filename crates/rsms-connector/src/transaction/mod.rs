@@ -110,6 +110,10 @@ struct Inner {
     // 主表的键在 resp 前为 sequence_id 字符串、resp 后改为 msg_id。
     transactions: DashMap<String, TransactionEntry>,
     seq_to_msg_id: DashMap<u32, String>,
+    // 乱序报告暂存：报告先于其 Submit 的 Resp 到达时（如 cmos SMGP），此刻事务还按 sequence
+    // 登记、msg_id 映射尚不存在，无法关联——按 msg_id 暂存，待 on_submit_resp 改键后冲刷。
+    // 附 Instant 供 check_timeouts 清理孤儿（Submit 始终未收到 Resp 的暂存报告）。
+    pending_reports: DashMap<String, (ReportInfo, Instant)>,
     check_interval: Duration,
     resp_timeout: Duration,
     running: Arc<RwLock<bool>>,
@@ -128,6 +132,7 @@ impl TransactionManager {
             inner: Arc::new(Inner {
                 transactions: DashMap::new(),
                 seq_to_msg_id: DashMap::new(),
+                pending_reports: DashMap::new(),
                 check_interval: Duration::from_secs(1),
                 resp_timeout: Duration::from_secs(resp_timeout_secs),
                 running: Arc::new(RwLock::new(false)),
@@ -151,7 +156,7 @@ impl TransactionManager {
 
     pub async fn on_submit_resp(&self, sequence_id: u32, msg_id: Option<String>, result: u32) {
         let key = sequence_id.to_string();
-        let entry = if let Some(mid) = msg_id {
+        let (entry, rekeyed_msg_id) = if let Some(mid) = msg_id {
             // 取出当前 entry 的克隆并释放分片锁，然后**先按 msg_id 落键、再删 seq 键**，
             // 保证不存在“两键瞬时都不在”的窗口，避免并发 on_report 漏匹配。
             let Some(mut tx) = self.inner.transactions.get(&key).map(|r| r.clone()) else {
@@ -160,25 +165,35 @@ impl TransactionManager {
             tx.info.msg_id = Some(mid.clone());
             tx.status = TransactionStatus::RespReceived;
             self.inner.seq_to_msg_id.insert(sequence_id, mid.clone());
-            self.inner.transactions.insert(mid, tx.clone());
+            self.inner.transactions.insert(mid.clone(), tx.clone());
             self.inner.transactions.remove(&key);
-            tx
+            (tx, Some(mid))
         } else {
             // 没有 msg_id：原地更新状态，仍以 sequence_id 为键
             let Some(mut r) = self.inner.transactions.get_mut(&key) else {
                 return;
             };
             r.status = TransactionStatus::RespReceived;
-            r.clone()
+            (r.clone(), None)
         };
 
-        let callback = self.inner.callback.read().await;
-        if let Some(ref cb) = *callback {
-            if result == 0 {
-                cb.on_submit_resp_ok(&entry.info).await;
-            } else {
-                cb.on_submit_resp_error(&entry.info, result).await;
+        {
+            let callback = self.inner.callback.read().await;
+            if let Some(ref cb) = *callback {
+                if result == 0 {
+                    cb.on_submit_resp_ok(&entry.info).await;
+                } else {
+                    cb.on_submit_resp_error(&entry.info, result).await;
+                }
             }
+        }
+
+        // 冲刷乱序报告：若该 msg_id 有先到被暂存的报告，此刻事务已按 msg_id 落键，
+        // 复用 on_report 完成匹配与回调（解决“报告先于 Resp 到达”的关联失败，见 cmos SMGP）。
+        if let Some(mid) = rekeyed_msg_id
+            && let Some((_, (report, _))) = self.inner.pending_reports.remove(&mid)
+        {
+            self.on_report(report).await;
         }
     }
 
@@ -220,6 +235,12 @@ impl TransactionManager {
             if let Some(ref cb) = *callback {
                 cb.on_report(&report, &entry.info).await;
             }
+        } else {
+            // 报告先于其 Submit 的 Resp 到达（事务尚按 sequence 登记、msg_id 映射未建）：
+            // 按 msg_id 暂存，待 on_submit_resp 改键到该 msg_id 时冲刷触发。check_timeouts 清理孤儿。
+            self.inner
+                .pending_reports
+                .insert(report.msg_id.clone(), (report, Instant::now()));
         }
     }
 
@@ -277,6 +298,17 @@ impl TransactionManager {
             if let Some(ref cb) = *callback {
                 cb.on_submit_resp_timeout(&info).await;
             }
+        }
+
+        // 清理孤儿乱序报告：其 Submit 始终未收到 Resp（msg_id 映射永远建不起来），超期丢弃防泄漏。
+        let stale: Vec<String> = inner
+            .pending_reports
+            .iter()
+            .filter(|e| now.duration_since(e.value().1) > inner.resp_timeout)
+            .map(|e| e.key().clone())
+            .collect();
+        for k in stale {
+            inner.pending_reports.remove(&k);
         }
     }
 
@@ -344,6 +376,25 @@ mod tests {
         assert_eq!(cb.reports.load(Ordering::Relaxed), 1, "报告应按 msg_id 匹配成功");
         // 报告匹配后应清理该条目（修复内存泄漏），事务表清空
         assert_eq!(tm.transaction_count().await, 0, "报告匹配后应清理事务条目");
+    }
+
+    #[tokio::test]
+    async fn report_before_resp_still_fires_after_resp() {
+        // 真机(cmos SMGP)联调暴露：报告可能先于 SubmitResp 到达。此时事务还按 sequence 登记、
+        // msg_id 映射未建，on_report 无法关联——应暂存，待 Resp 改键到该 msg_id 时冲刷触发。
+        let tm = TransactionManager::new(10);
+        let cb = Arc::new(CountingCallback::default());
+        tm.set_callback(Some(cb.clone() as Arc<dyn MessageCallback>)).await;
+
+        tm.add_submit_transaction(submit_info(1)).await;
+        // 报告先到：暂存，暂不触发。
+        tm.on_report(report("MSGID-1")).await;
+        assert_eq!(cb.reports.load(Ordering::Relaxed), 0, "报告先到应暂存、暂不触发");
+        // Resp 后到：改键 + 冲刷暂存报告。
+        tm.on_submit_resp(1, Some("MSGID-1".to_string()), 0).await;
+        assert_eq!(cb.resp_ok.load(Ordering::Relaxed), 1);
+        assert_eq!(cb.reports.load(Ordering::Relaxed), 1, "Resp 改键后应冲刷先到的报告");
+        assert_eq!(tm.transaction_count().await, 0, "冲刷匹配后事务条目应清理");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

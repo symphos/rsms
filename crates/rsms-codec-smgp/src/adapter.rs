@@ -168,8 +168,14 @@ fn deliver_to_unified(d: Deliver) -> UnifiedMessage {
     if d.is_report != 0 {
         // SMGP 报告正文为文本（形如 id:.. stat:DELIVRD ..），解析 stat 段 → DeliveryStatus。
         let status = DeliveryStatus::from_receipt_text(&d.msg_content);
+        // 关联用的 Msg_Id 取**报告正文 "id:" 段**里的 10 字节（= 原 submit 的 MsgId，SubmitResp
+        // 回的那个），而非 Deliver 信封 d.msg_id（信封是这条 Deliver 自身的 id，与原 submit 无关——
+        // 真机 cmos 联调实测信封 ≠ submit，用信封会导致 Resp↔Report 永不关联）。解析失败回退信封。
+        let report_msg_id = crate::datatypes::SmgpReport::parse(&d.msg_content)
+            .map(|r| r.msg_id.to_vec())
+            .unwrap_or_else(|| d.msg_id.bytes.to_vec());
         UnifiedMessage::Report(UnifiedReport {
-            msg_id: MessageId::Binary(d.msg_id.bytes.to_vec()),
+            msg_id: MessageId::Binary(report_msg_id),
             status,
             // 报告源地址：SMGP Deliver-报告的 src_term_id（构造下行回执需要）。
             src: Address::plain(d.src_term_id.clone()),
@@ -677,6 +683,35 @@ mod tests {
         }
         let reencoded = SmgpAdapter.encode(&unified, Sequence::Plain(31)).unwrap();
         assert_eq!(reencoded, original, "级联 Deliver(MO) 经统一模型往返字节应无损一致");
+    }
+
+    #[test]
+    fn report_msg_id_taken_from_content_not_envelope() {
+        // 真机(cmos)联调暴露：SMGP 报告关联 Msg_Id 在正文 "id:" 后 10 字节（= 原 submit 的 MsgId）；
+        // Deliver 信封 msg_id 是这条 Deliver 自身的 id（≠ submit）。UnifiedReport.msg_id 须取正文体的。
+        let content_msg_id = *b"ABCDE12345";
+        let mut content = Vec::new();
+        content.extend_from_slice(b"id:");
+        content.extend_from_slice(&content_msg_id);
+        content.extend_from_slice(
+            b" sub:001 dlvrd:001 submit date:2606201538 done date:2606201538 stat:DELIVRD err:000 text:",
+        );
+        content.resize(140, b' '); // 补齐到 ≥ 报告定长（含全字段）
+
+        let mut d = crate::datatypes::Deliver::new();
+        d.is_report = 1;
+        d.msg_id = crate::datatypes::SmgpMsgId::new([0x99; 10]); // 信封 id（与正文不同）
+        d.dest_term_id = "1065900000".to_string();
+        d.msg_content = content;
+        let bytes = Pdu::from(d).to_pdu_bytes(14).to_vec();
+        match SmgpAdapter.decode(&frame_of(bytes)).unwrap() {
+            UnifiedMessage::Report(r) => assert_eq!(
+                r.msg_id,
+                MessageId::Binary(content_msg_id.to_vec()),
+                "报告关联 Msg_Id 应取正文 id: 段（原 submit），非 Deliver 信封"
+            ),
+            other => panic!("expected Report, got {other:?}"),
+        }
     }
 
     #[test]
