@@ -9,7 +9,7 @@ use rsms_core::{Metrics, NoopMetrics, Result};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
@@ -143,9 +143,10 @@ impl BoundServer {
             let account_pool2 = Arc::clone(&self.account_pool);
             let account_config = account_config_provider.clone();
             let metrics_clone = Arc::clone(&self.metrics);
+            let shutdown_clone = Arc::clone(&self.shutdown_flag);
 
             tokio::spawn(async move {
-                inbound_fetcher_task(source_clone, account_pool2, account_config, metrics_clone).await;
+                inbound_fetcher_task(source_clone, account_pool2, account_config, metrics_clone, shutdown_clone).await;
             });
         }
         
@@ -184,6 +185,7 @@ impl BoundServer {
             let auth_handler_clone = self.auth_handler.clone();
             let event_handler_clone = self.event_handler.clone();
             let metrics_clone = Arc::clone(&self.metrics);
+            let shutdown_clone = Arc::clone(&self.shutdown_flag);
             let id = conn.id;
             let protocol = self.config.protocol;
 
@@ -193,7 +195,7 @@ impl BoundServer {
                 conn.mark_connected().await;
                 conn.mark_ready().await;
                 pool2.add(Arc::clone(&conn)).await;
-                run_connection(read, Arc::clone(&conn), h, Some(account_pool2), account_config_provider, auth_handler_clone, protocol, event_handler_clone, metrics_clone).await;
+                run_connection(read, Arc::clone(&conn), h, Some(account_pool2), account_config_provider, auth_handler_clone, protocol, event_handler_clone, metrics_clone, shutdown_clone).await;
                 pool2.remove(id).await;
             });
         }
@@ -213,18 +215,69 @@ impl BoundServer {
         self.shutdown_flag.store(true, Ordering::Release);
     }
 
+    /// 取一个可在 `run()` 之后（`run` 取走 self）调用的优雅停机句柄。
+    /// 典型用法：`let sd = server.shutdown_handle(); spawn(server.run()); … sd.shutdown(t).await;`
+    pub fn shutdown_handle(&self) -> ServerShutdown {
+        ServerShutdown {
+            shutdown_flag: Arc::clone(&self.shutdown_flag),
+            account_pool: Arc::clone(&self.account_pool),
+            pool: Arc::clone(&self.pool),
+        }
+    }
+
+    /// 优雅停机（`run()` 之前持有 self 时可用；之后请用 [`BoundServer::shutdown_handle`]）。
+    /// 默认 drain 上限 10s。
     pub async fn shutdown(&self) {
-        self.close();
-        
-        let accounts = self.account_pool.all_accounts().await;
-        for account in accounts {
-            if let Some(acc) = self.account_pool.get(&account).await {
-                let connections = acc.get_connections_for_check().await;
-                for conn in connections {
-                    conn.mark_disconnected().await;
+        self.shutdown_handle().shutdown(Duration::from_secs(10)).await;
+    }
+}
+
+/// 服务端优雅停机句柄。在 `run()` 取走 `BoundServer` 之前由 [`BoundServer::shutdown_handle`] 取得，
+/// 之后可独立触发停机。
+#[derive(Clone)]
+pub struct ServerShutdown {
+    shutdown_flag: Arc<AtomicBool>,
+    account_pool: Arc<AccountPool>,
+    pool: Arc<ConnectionPool>,
+}
+
+impl ServerShutdown {
+    /// 是否已进入停机。
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutdown_flag.load(Ordering::Acquire)
+    }
+
+    /// 优雅停机（零丢，尽力）：① 置停机标志（accept 循环不再接新连、各连接读循环 ≤1s 收尾、
+    /// inbound fetcher 停取）→ ② 停健康检查 → ③ drain：等各账号出站在途（inflight）降为 0
+    /// （上限 `timeout`）→ ④ 关闭全部连接（发协议关闭包 + shutdown 写半边）。
+    pub async fn shutdown(&self, timeout: Duration) {
+        self.shutdown_flag.store(true, Ordering::Release);
+        // 快照全部连接：即便读循环随后因标志退出而从池移除，仍能逐个关闭。
+        let conns = self.pool.all().await;
+
+        self.account_pool.stop_health_check().await;
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            let mut inflight = 0usize;
+            for account in self.account_pool.all_accounts().await {
+                if let Some(acc) = self.account_pool.get(&account).await {
+                    inflight += acc.inflight().await;
                 }
             }
+            if inflight == 0 || Instant::now() >= deadline {
+                if inflight > 0 {
+                    tracing::warn!(inflight, "server shutdown drain 超时：仍有出站在途");
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
+
+        for conn in conns {
+            conn.close().await;
+        }
+        info!("server graceful shutdown complete");
     }
 }
 
@@ -233,12 +286,16 @@ async fn inbound_fetcher_task(
     account_pool: Arc<AccountPool>,
     account_config_provider: Option<Arc<dyn AccountConfigProvider>>,
     metrics: Arc<dyn Metrics>,
+    shutdown: Arc<AtomicBool>,
 ) {
     let mut account_thread_counts: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
-    
+
     loop {
+        if shutdown.load(Ordering::Acquire) {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(500)).await;
-        
+
         let accounts = account_pool.all_accounts().await;
         let active_accounts: Vec<String> = accounts.clone();
         
@@ -258,9 +315,10 @@ async fn inbound_fetcher_task(
                 let interval_ms = config.fetch_interval_ms;
                 let account_clone = account.clone();
                 let metrics_clone = Arc::clone(&metrics);
+                let shutdown_clone = Arc::clone(&shutdown);
 
                 tokio::spawn(async move {
-                    inbound_fetch_loop(account_clone, source_clone, account_pool_clone, interval_ms, metrics_clone).await;
+                    inbound_fetch_loop(account_clone, source_clone, account_pool_clone, interval_ms, metrics_clone, shutdown_clone).await;
                 });
                 
                 account_thread_counts.insert(account.clone(), current_threads + 1);
@@ -283,13 +341,17 @@ async fn inbound_fetch_loop(
     account_pool: Arc<AccountPool>,
     interval_ms: u32,
     metrics: Arc<dyn Metrics>,
+    shutdown: Arc<AtomicBool>,
 ) {
     let interval = Duration::from_millis(interval_ms as u64);
     let account_str = account.as_str();
-    
+
     loop {
+        if shutdown.load(Ordering::Acquire) {
+            break;
+        }
         tokio::time::sleep(interval).await;
-        
+
         if let Some(acc) = account_pool.get(account_str).await
             && let Ok(conn) = acc.fetch_available_connection().await {
                 if !conn.ready_for_fetch() {
