@@ -137,6 +137,19 @@ impl ConnectRespV20 {
     pub const BODY_SIZE: usize = 1 + 16 + 1;
 }
 
+impl Encodable for ConnectRespV20 {
+    fn encode(&self, buf: &mut BytesMut) -> Result<(), CodecError> {
+        buf.put_u8(self.status);
+        buf.put_slice(&self.authenticator_ismg);
+        buf.put_u8(self.version);
+        Ok(())
+    }
+
+    fn encoded_size(&self) -> usize {
+        Self::BODY_SIZE
+    }
+}
+
 impl Decodable for ConnectRespV20 {
     fn decode(header: PduHeader, buf: &mut Cursor<&[u8]>) -> Result<Self, CodecError> {
         if header.total_length != (PduHeader::SIZE + Self::BODY_SIZE) as u32 {
