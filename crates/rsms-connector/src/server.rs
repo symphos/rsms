@@ -5,7 +5,7 @@ use crate::protocol::{
     MessageSource, ServerEventHandler,
 };
 use rsms_business::BusinessHandler;
-use rsms_core::Result;
+use rsms_core::{Metrics, NoopMetrics, Result};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -24,6 +24,7 @@ pub struct BoundServer {
     message_source: Option<Arc<dyn MessageSource>>,
     event_handler: Option<Arc<dyn ServerEventHandler>>,
     auth_handler: Option<Arc<dyn AuthHandler>>,
+    metrics: Arc<dyn Metrics>,
     shutdown_flag: Arc<AtomicBool>,
 }
 
@@ -44,6 +45,7 @@ pub struct ServerBuilder {
     message_source: Option<Arc<dyn MessageSource>>,
     account_config_provider: Option<Arc<dyn AccountConfigProvider>>,
     event_handler: Option<Arc<dyn ServerEventHandler>>,
+    metrics: Option<Arc<dyn Metrics>>,
     account_pool_config: Option<AccountPoolConfig>,
 }
 
@@ -56,6 +58,7 @@ impl ServerBuilder {
             message_source: None,
             account_config_provider: None,
             event_handler: None,
+            metrics: None,
             account_pool_config: None,
         }
     }
@@ -92,6 +95,12 @@ impl ServerBuilder {
         self
     }
 
+    /// 注入指标记录器（可观测性）。不设置时使用 `NoopMetrics`（不记录）。
+    pub fn metrics(mut self, metrics: Arc<dyn Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
     pub fn account_pool_config(mut self, config: AccountPoolConfig) -> Self {
         self.account_pool_config = Some(config);
         self
@@ -119,6 +128,7 @@ impl ServerBuilder {
             message_source: self.message_source,
             event_handler: self.event_handler,
             auth_handler: self.auth_handler,
+            metrics: self.metrics.unwrap_or_else(|| Arc::new(NoopMetrics)),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -172,6 +182,7 @@ impl BoundServer {
             let account_config_provider = account_config_provider.clone();
             let auth_handler_clone = self.auth_handler.clone();
             let event_handler_clone = self.event_handler.clone();
+            let metrics_clone = Arc::clone(&self.metrics);
             let id = conn.id;
             let protocol = self.config.protocol;
 
@@ -181,7 +192,7 @@ impl BoundServer {
                 conn.mark_connected().await;
                 conn.mark_ready().await;
                 pool2.add(Arc::clone(&conn)).await;
-                run_connection(read, Arc::clone(&conn), h, Some(account_pool2), account_config_provider, auth_handler_clone, protocol, event_handler_clone).await;
+                run_connection(read, Arc::clone(&conn), h, Some(account_pool2), account_config_provider, auth_handler_clone, protocol, event_handler_clone, metrics_clone).await;
                 pool2.remove(id).await;
             });
         }
