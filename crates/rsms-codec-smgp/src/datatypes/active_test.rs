@@ -38,18 +38,18 @@ impl Decodable for ActiveTest {
     }
 }
 
+/// SMGP 3.0.3 Active_Test_Resp **无 body**（12B PDU，同 Active_Test）。
+/// 旧实现多 1 字节 reserved(13B) 不合规——真实网关(cmos)按定长解码会 ArrayIndexOutOfBounds、
+/// 打断连接（真机联调暴露：服务端心跳应答 13B 致 cmos 长连接每次心跳即断）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActiveTestResp {
-    pub reserved: u8,
-}
+pub struct ActiveTestResp;
 
 impl ActiveTestResp {
-    pub const BODY_SIZE: usize = 1;
+    pub const BODY_SIZE: usize = 0;
 }
 
 impl Encodable for ActiveTestResp {
-    fn encode(&self, buf: &mut BytesMut) -> Result<(), CodecError> {
-        buf.put_u8(self.reserved);
+    fn encode(&self, _buf: &mut BytesMut) -> Result<(), CodecError> {
         Ok(())
     }
 
@@ -59,7 +59,7 @@ impl Encodable for ActiveTestResp {
 }
 
 impl Decodable for ActiveTestResp {
-    fn decode(header: PduHeader, buf: &mut Cursor<&[u8]>) -> Result<Self, CodecError> {
+    fn decode(header: PduHeader, _buf: &mut Cursor<&[u8]>) -> Result<Self, CodecError> {
         if header.total_length != (PduHeader::SIZE + Self::BODY_SIZE) as u32 {
             return Err(CodecError::InvalidPduLength {
                 length: header.total_length,
@@ -67,11 +67,7 @@ impl Decodable for ActiveTestResp {
                 max: (PduHeader::SIZE + Self::BODY_SIZE) as u32,
             });
         }
-        if !buf.has_remaining() {
-            return Err(CodecError::Incomplete);
-        }
-        let reserved = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
-        Ok(ActiveTestResp { reserved })
+        Ok(ActiveTestResp)
     }
 
     fn command_id() -> CommandId {
@@ -172,10 +168,12 @@ mod tests {
 
     #[test]
     fn active_test_resp_roundtrip() {
-        let resp = ActiveTestResp { reserved: 5 };
+        let resp = ActiveTestResp;
         let bytes = Pdu::from(resp.clone()).to_pdu_bytes(1);
+        // SMGP Active_Test_Resp 合规为 12B（无 body）。
+        assert_eq!(bytes.len(), 12, "SMGP ActiveTestResp 应为 12B（无保留字节）");
         let decoded = decode_pdu::<ActiveTestResp>(&bytes.as_slice()).unwrap();
-        assert_eq!(decoded.reserved, resp.reserved);
+        assert_eq!(decoded, resp);
     }
 
     #[test]

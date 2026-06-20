@@ -119,11 +119,13 @@ impl crate::protocol::ProtocolHandler for SmgpHandler {
             SmgpMessage::ActiveTest { sequence_id } => {
                 tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "收到SMGP活性检测: seq_id={}", sequence_id);
                 
-                let resp = ActiveTestResp { reserved: 0 };
+                // SMGP Active_Test_Resp 无 body（12B）。ActiveTestResp 现为 unit struct、BODY_SIZE=0，
+                // body 为空 → 12B PDU（旧 13B 含保留字节不合规，cmos 解码越界断连）。
+                let resp = ActiveTestResp;
                 let mut body = BytesMut::new();
                 resp.encode(&mut body)
                     .map_err(|e| rsms_core::RsmsError::Codec(e.to_string()))?;
-                
+
                 let mut pdu = encode_pdu_header(CommandId::ActiveTestResp, sequence_id, body.len());
                 pdu.extend_from_slice(&body);
                 conn.write_frame(&pdu).await?;
