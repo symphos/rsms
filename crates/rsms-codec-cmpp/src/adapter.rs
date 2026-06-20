@@ -133,13 +133,23 @@ fn submit_v20_to_unified(s: SubmitV20) -> UnifiedSubmit {
 
 fn deliver_v30_to_unified(d: Deliver) -> UnifiedMessage {
     if d.registered_delivery == 1 {
-        // 报告投递状态：CMPP 报告正文是定长二进制（stat 在 [8..15]），用 CmppReport::parse 取
-        // stat 7 字符码 → DeliveryStatus；解析失败（正文过短/非标准）回退 Unknown。
-        let status = crate::datatypes::CmppReport::parse(&d.msg_content)
+        // 报告投递状态：CMPP 报告正文是定长二进制（msg_id 在 [0..8]、stat 在 [8..15]），
+        // 用 CmppReport::parse 取。解析失败（正文过短/非标准）回退 Unknown。
+        let parsed = crate::datatypes::CmppReport::parse(&d.msg_content);
+        let status = parsed
+            .as_ref()
             .map(|r| DeliveryStatus::from_stat_code(&r.stat))
             .unwrap_or(DeliveryStatus::Unknown);
+        // 关联用的 Msg_Id 取**报告正文体**里的原 submit Msg_Id（CmppReport.msg_id），
+        // 而非 Deliver 信封 d.msg_id（信封是这条 Deliver 自身的 id，与原 submit 无关——
+        // 真机 cmos 联调实测信封 = submit_id+1，用信封会导致 Resp↔Report 永不关联）。
+        // 解析失败时回退信封 id（保持短正文等退化场景的字节往返）。
+        let report_msg_id = parsed
+            .as_ref()
+            .map(|r| r.msg_id.to_vec())
+            .unwrap_or_else(|| d.msg_id.to_vec());
         UnifiedMessage::Report(UnifiedReport {
-            msg_id: MessageId::Binary(d.msg_id.to_vec()),
+            msg_id: MessageId::Binary(report_msg_id),
             status,
             // 新增 src 字段：报告源地址取 src_terminal_id（dest 仍取 dest_id）。
             src: Address::plain(d.src_terminal_id.clone()),
@@ -166,11 +176,18 @@ fn deliver_v30_to_unified(d: Deliver) -> UnifiedMessage {
 /// 否则为 MO 上行(→Deliver，extra.version=0x20 供 encode 回产 DeliverV20)。
 fn deliver_v20_to_unified(d: DeliverV20) -> UnifiedMessage {
     if d.registered_delivery == 1 {
-        let status = crate::datatypes::CmppReport::parse(&d.msg_content)
+        let parsed = crate::datatypes::CmppReport::parse(&d.msg_content);
+        let status = parsed
+            .as_ref()
             .map(|r| DeliveryStatus::from_stat_code(&r.stat))
             .unwrap_or(DeliveryStatus::Unknown);
+        // 同 V3.0：关联 Msg_Id 取正文体（原 submit id），非 Deliver 信封 id。
+        let report_msg_id = parsed
+            .as_ref()
+            .map(|r| r.msg_id.to_vec())
+            .unwrap_or_else(|| d.msg_id.to_vec());
         UnifiedMessage::Report(UnifiedReport {
-            msg_id: MessageId::Binary(d.msg_id.to_vec()),
+            msg_id: MessageId::Binary(report_msg_id),
             status,
             src: Address::plain(d.src_terminal_id),
             dest: Address::plain(d.dest_id),
@@ -544,6 +561,36 @@ mod tests {
         assert!(matches!(unified, UnifiedMessage::Deliver(_)));
         let reencoded = CmppAdapter.encode(&unified, Sequence::Plain(5)).unwrap();
         assert_eq!(reencoded, original, "CMPP Deliver(MO) 经统一模型往返后字节应无损一致");
+    }
+
+    #[test]
+    fn report_msg_id_taken_from_content_not_envelope() {
+        // 真机(cmos)联调暴露：CMPP 状态报告的**关联** Msg_Id 在正文体 [0..8]（= 原 submit 的
+        // Msg_Id，SubmitResp 回的那个）；Deliver 信封 Msg_Id 是这条 Deliver 自身的 id（≠ submit，
+        // cmos 实测为 submit_id+1）。UnifiedReport.msg_id 必须取正文体的，否则 Resp↔Report 无法关联。
+        let content_msg_id = [0x67u8, 0x05, 0xf1, 0x03, 0x24, 0x66, 0x2f, 0x03];
+        let mut body = Vec::new();
+        body.extend_from_slice(&content_msg_id); // [0..8] 原 submit Msg_Id
+        body.extend_from_slice(b"DELIVRD"); // [8..15] stat
+        body.extend_from_slice(b"2606200730"); // [15..25] submit_time
+        body.extend_from_slice(b"2606200731"); // [25..35] done_time
+
+        let mut d = Deliver::new();
+        d.registered_delivery = 1;
+        d.msg_id = [0x11; 8]; // 信封 Msg_Id（与正文体不同）
+        d.src_terminal_id = "10086".to_string();
+        d.dest_id = "1065900000".to_string();
+        d.msg_content = body;
+        let bytes = Pdu::from(d).to_pdu_bytes(9).to_vec();
+
+        match CmppAdapter.decode(&frame_of(bytes)).unwrap() {
+            UnifiedMessage::Report(r) => assert_eq!(
+                r.msg_id,
+                MessageId::Binary(content_msg_id.to_vec()),
+                "报告关联 Msg_Id 应取正文体[0..8]（原 submit id），而非 Deliver 信封 id"
+            ),
+            other => panic!("expected Report, got {other:?}"),
+        }
     }
 
     #[test]
