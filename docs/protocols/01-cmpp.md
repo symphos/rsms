@@ -179,6 +179,61 @@ V2.0 与 V3.0 的应答包/状态报告字段宽度不同，服务端按连接�
 
 > 客户端解码也须版本感知（`decode_with_version(frame, 本连接版本)`），否则按默认 V3.0 解 V2.0 应答会失败。
 
+## CMPP 2.0 / 3.0 对接示例
+
+同一套服务端可同时对接 V2.0 与 V3.0 客户端：版本由客户端 Connect 的 `version` 字节协商，服务端据此对**每条连接**分别按版本编/解码。下面是最小骨架（完整可跑见 `examples/cmpp_server/src/main.rs`、`tests/cmpp/cmpp20_test.rs` 与 `tests/cmpp/stress_test.rs` 的 `cmpp20_*`/`cmpp30_*`）。
+
+### 客户端：以指定版本接入
+
+版本只体现在 `UnifiedBind.version` 一个字节，其余收发代码两版本通用。**唯一要点：入站帧必须按本连接版本解码**。
+
+```rust
+use rsms_codec_cmpp::CmppVersion;
+use rsms_codec_cmpp::adapter::CmppAdapter;
+use rsms_model::{ProtocolAdapter, Sequence, UnifiedBind, UnifiedMessage};
+
+// 1) 连接：把握手版本写进 version 字节（0x20 = V2.0 / 0x30 = V3.0）
+let ver: u8 = 0x20; // 改成 0x30 即接入 V3.0
+let bind = UnifiedMessage::Bind(UnifiedBind {
+    version: ver, // ← 版本只体现在这一个字节
+    client_id: account.to_string(),
+    authenticator: auth.to_vec(), // 已算好的 16B MD5
+    timestamp,
+    system_type: None,
+    mode: rsms_model::BindMode::default(),
+    login_mode: None,
+});
+conn.write_frame(&CmppAdapter.encode(&bind, Sequence::Plain(seq))?).await?;
+
+// 2) 入站解码按本连接版本：V2.0 的 ConnectResp/SubmitResp/回执字段宽度与 V3.0 不同，
+//    用默认（V3.0）解码会令 V2.0 应答解码失败。
+let cv = CmppVersion::from_wire(ver).unwrap_or(CmppVersion::V30);
+match CmppAdapter.decode_with_version(frame, cv)? {
+    UnifiedMessage::BindResp(r) if r.status == 0 => { /* 连接成功 */ }
+    UnifiedMessage::SubmitResp(r) => { /* 用 r.msg_id 关联业务 */ }
+    UnifiedMessage::Report(r) => { /* 用 r.msg_id 关联回执 */ }
+    _ => {}
+}
+```
+
+### 服务端：按连接版本应答
+
+服务端无需为两版本写两套逻辑——握手时框架已记录协商版本，业务取出后用 `encode_with_version` 编码应答即可。ConnectResp 由框架版本感知自动回，SubmitResp/状态报告由业务回。
+
+```rust
+// 取本连接协商版本（未握手为 None，回落 V3.0）
+let cv = ctx.conn.protocol_version().await
+    .and_then(|b| CmppVersion::from_wire(b).ok())
+    .unwrap_or(CmppVersion::V30);
+
+// 回 SubmitResp：按版本编码（V2.0 产 9B body / V3.0 产 12B body）
+let resp = UnifiedMessage::SubmitResp(/* UnifiedSubmitResp { msg_id, status } */);
+let bytes = CmppAdapter.encode_with_version(&resp, CmppAdapter.sequence_of(frame), cv)?;
+ctx.conn.write_frame(&bytes).await?;
+```
+
+> 状态报告同理：`encode_with_version` 按版本产 60B(V2.0)/71B(V3.0) 定长回执。不带版本的 `encode` 默认按 V3.0 编码，仅适用于纯 V3.0 链路。
+
 ## 服务端完整示例
 
 参考：`examples/cmpp_server/src/main.rs`
