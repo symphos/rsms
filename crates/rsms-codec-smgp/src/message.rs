@@ -162,7 +162,7 @@ pub fn encode_message(msg: &SmgpMessage) -> Result<Vec<u8>, RsmsError> {
         SmgpMessage::DeliverResp { resp, .. } => crate::codec::Pdu::DeliverResp(resp.clone()),
         SmgpMessage::ActiveTest { .. } => crate::codec::Pdu::ActiveTest(ActiveTest),
         SmgpMessage::ActiveTestResp { .. } => {
-            crate::codec::Pdu::ActiveTestResp(ActiveTestResp { reserved: 0 })
+            crate::codec::Pdu::ActiveTestResp(ActiveTestResp)
         }
         SmgpMessage::Exit { .. } => crate::codec::Pdu::Exit(Exit),
         SmgpMessage::ExitResp { .. } => crate::codec::Pdu::ExitResp(ExitResp),
