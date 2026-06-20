@@ -269,8 +269,9 @@ fn unified_to_cmpp(msg: &UnifiedMessage, seq: Sequence) -> Result<CmppMessage> {
 }
 
 /// 版本感知编码：应答类（SubmitResp/DeliverResp/ConnectResp）与状态报告的字段宽度/
-/// 正文长度在 CMPP 2.0 与 3.0 不同。`version` 决定产 V2.0 还是 V3.0 形态；
-/// Submit/Deliver(MO) 仍按各自 `extra.version` 自决（与原行为一致）。
+/// 正文长度在 CMPP 2.0 与 3.0 不同，由 `version` 参数决定 V2.0/V3.0 形态。
+/// Submit/Deliver(MO) 取 `version` 参数与方言 `extra.version` 的并集（任一为 V2.0 即产 V2.0）：
+/// 既支持调用方经 encode_with_version 显式指定，又保留经 extra.version 自决的旧行为。
 fn unified_to_cmpp_with_version(
     msg: &UnifiedMessage,
     seq: Sequence,
@@ -286,9 +287,9 @@ fn unified_to_cmpp_with_version(
             };
             // 有 concat 则前置级联 UDH 到正文并置 tp_udhi=1；否则正文原样、tp_udhi 沿用 extra。
             let (udh_body, tpudhi) = join_udh(&s.concat, &s.content, extra.tpudhi);
-            // version=0x20 产 SubmitV20（V2.0 比 V3.0 少 fee_terminal_type/dest_terminal_type/link_id）；
-            // 否则（0/0x30）产 SubmitV30。
-            if extra.version == 0x20 {
+            // V2.0 产 SubmitV20（比 V3.0 少 fee_terminal_type/dest_terminal_type/link_id）；
+            // 由 encode_with_version 的 `version` 参数或方言 extra.version 任一决定，否则产 SubmitV30。
+            if version == CmppVersion::V20 || extra.version == 0x20 {
                 let mut sub = SubmitV20::new();
                 sub.msg_id = extra.msg_id;
                 sub.pk_total = extra.pk_total;
@@ -380,12 +381,13 @@ fn unified_to_cmpp_with_version(
         UnifiedMessage::Deliver(d) => {
             // 有 concat 则前置级联 UDH 到正文并置 tp_udhi=1；否则正文原样、tp_udhi=0。
             let (udh_body, tpudhi) = join_udh(&d.concat, &d.content, 0);
-            let version = match &d.extra {
+            let extra_version = match &d.extra {
                 ProtocolExtra::Cmpp(e) => e.version,
                 _ => 0,
             };
-            // MO 上行：registered_delivery=0。version=0x20 产 DeliverV20，否则 DeliverV30。
-            if version == 0x20 {
+            // MO 上行：registered_delivery=0。V2.0 形态由 encode_with_version 的 `version` 参数
+            // 或方言 `extra.version` 任一决定（参数优先支持调用方显式指定，extra 保持旧自决行为）。
+            if version == CmppVersion::V20 || extra_version == 0x20 {
                 let mut dl = DeliverV20::new();
                 dl.registered_delivery = 0;
                 dl.src_terminal_id = d.src.number.clone();
@@ -888,5 +890,33 @@ mod tests {
         }
         let reencoded = CmppAdapter.encode(&unified, Sequence::Plain(8)).unwrap();
         assert_eq!(reencoded, bytes, "V2.0 Deliver(MO) 经统一模型往返字节应无损一致");
+    }
+
+    #[test]
+    fn deliver_mo_encode_with_version_v20_param_overrides_default_extra() {
+        // 关键回归：extra 不带版本（CmppExtra::default()，version=0）时，仅凭 encode_with_version 的
+        // `version` 参数也必须产 DeliverV20。此前 Deliver 臂只看 extra.version、遮蔽了参数，
+        // 导致 V3.0 形态 Deliver 发给 V2.0 客户端 → 字段错位、正文丢失（真机 ArrayIndexOutOfBounds）。
+        let deliver = UnifiedMessage::Deliver(UnifiedDeliver {
+            src: Address::plain("13800138000"),
+            dest: Address::plain("900001"),
+            content: b"hi-mo".to_vec(),
+            encoding: Encoding::Ascii,
+            concat: None,
+            extra: ProtocolExtra::Cmpp(CmppExtra::default()), // version=0，不靠 extra 自决
+            tlvs: vec![],
+        });
+        let bytes = CmppAdapter
+            .encode_with_version(&deliver, Sequence::Plain(7), CmppVersion::V20)
+            .unwrap();
+        // 必须是 DeliverV20 形态（含尾部 Reserved(8)、无 src_terminal_type）。
+        match decode_message_with_version(&bytes, Some(0x20)).unwrap() {
+            CmppMessage::DeliverV20 { deliver, .. } => {
+                assert_eq!(deliver.registered_delivery, 0);
+                assert_eq!(deliver.src_terminal_id, "13800138000");
+                assert_eq!(deliver.msg_content, b"hi-mo");
+            }
+            other => panic!("encode_with_version(V20) 应产 DeliverV20，得到 {other:?}"),
+        }
     }
 }

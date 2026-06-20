@@ -339,6 +339,14 @@ pub async fn run_connection(
     shutdown: Arc<AtomicBool>,
 ) {
     metrics.connection_opened();
+
+    // 连接建立事件：此前该回调声明却从未被服务端调用。在进入读循环前触发一次。
+    if let Some(ref handler) = event_handler {
+        handler
+            .on_connected(&(conn.clone() as Arc<dyn crate::protocol::ProtocolConnection>))
+            .await;
+    }
+
     let mut read = read;
     let mut read_buf = Vec::new();
     let mut tmp_buf = [0u8; 8192];
@@ -453,6 +461,18 @@ pub async fn run_connection(
                                     tracing::warn!(conn_id = conn_arc.id, remote_ip = %conn_arc.remote_ip(), remote_port = conn_arc.remote_port(), account = %acc, "failed to get config: {}", e);
                                 }
                             }
+                        }
+
+                        // 认证成功事件：此处是连接首次完成账号注册（即认证通过）的唯一时刻，
+                        // 协商版本/账号均已就绪。此前该回调声明却从未被服务端调用（仅 on_disconnected
+                        // 被触发），业务无法在认证后做按连接初始化（如按协商版本下发预定消息）。
+                        if let Some(ref handler) = event_handler {
+                            handler
+                                .on_authenticated(
+                                    &(conn_arc.clone() as Arc<dyn crate::protocol::ProtocolConnection>),
+                                    &acc,
+                                )
+                                .await;
                         }
                     } else {
                         tracing::warn!(conn_id = conn_arc.id, remote_ip = %conn_arc.remote_ip(), remote_port = conn_arc.remote_port(), "no authenticated account, skipping pool registration");
