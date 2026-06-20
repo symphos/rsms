@@ -29,6 +29,7 @@ use tracing::{error, info, instrument};
 
 use crate::protocol::{ClientEventHandler, FrameDecoder, MessageItem, MessageSource, ProtocolConnection, SubmitLimiter};
 use crate::pool::AccountConnections;
+use crate::transaction::{MessageCallback, TransactionManager, drive_inbound, register_outbound};
 
 /// ResponseFuture - 用于等待服务端响应的 Future
 /// 封装 oneshot::Receiver，实现 Future trait
@@ -215,13 +216,16 @@ pub struct ClientConnection {
     pending_queue: Mutex<VecDeque<RawPdu>>,
     account_connections: Mutex<Option<Arc<AccountConnections>>>,
     remote_addr: Option<std::net::SocketAddr>,
+    /// 交付链路管理器。设置 `MessageCallback` 时由 `ClientBuilder` 注入并自动驱动
+    /// （读循环按帧分发 Resp/Report/MO，发侧登记 Submit）；未设置时为 `None`，相关路径零成本。
+    tm: Option<Arc<TransactionManager>>,
 }
 
 impl ClientConnection {
-    async fn new(stream: TcpStream, endpoint: Arc<EndpointConfig>, config: ClientConfig, decoder: Arc<tokio::sync::Mutex<Box<dyn FrameDecoder>>>) -> Arc<Self> {
+    async fn new(stream: TcpStream, endpoint: Arc<EndpointConfig>, config: ClientConfig, decoder: Arc<tokio::sync::Mutex<Box<dyn FrameDecoder>>>, tm: Option<Arc<TransactionManager>>) -> Arc<Self> {
         let remote_addr = stream.peer_addr().ok();
         let (read_half, write_half) = stream.into_split();
-        
+
         let window_config = WindowConfig::new(endpoint.window_size as usize, endpoint.timeout);
         let window = Window::new(window_config);
 
@@ -242,7 +246,13 @@ impl ClientConnection {
             pending_queue: Mutex::new(VecDeque::new()),
             account_connections: Mutex::new(None),
             remote_addr,
+            tm,
         })
+    }
+
+    /// 交付链路管理器（设置了 `MessageCallback` 时存在）。
+    pub fn delivery_manager(&self) -> Option<&Arc<TransactionManager>> {
+        self.tm.as_ref()
     }
 
     pub async fn set_event_tx(&self, tx: mpsc::Sender<ConnectionEvent>) {
@@ -420,14 +430,24 @@ impl ClientConnection {
             let mut pending = self.pending_responses.lock().await;
             pending.insert(sequence_id, tx);
         }
-        
+
+        // 发侧自动登记：必须在写出**之前**登记，否则极快返回的 SubmitResp 可能在读循环里
+        // 早于本处执行，导致 on_submit_resp 找不到事务而丢回调（仅 TM 启用、且帧为 Submit 时生效）。
+        if let Some(tm) = &self.tm {
+            register_outbound(tm, self.endpoint.protocol, pdu_slice).await;
+        }
+
         if let Err(e) = self.write_frame(pdu_slice).await {
             error!(conn_id = self.id, remote_ip = %self.remote_ip(), remote_port = self.remote_port(), "write_frame failed, sequence_id={}: {}", sequence_id, e);
             let _ = window.cancel(&sequence_id).await;
             let _ = self.pending_responses.lock().await.remove(&sequence_id);
+            // 写失败：撤销登记并告警（未登记则为 no-op）
+            if let Some(tm) = &self.tm {
+                tm.on_send_failed(sequence_id, &e.to_string()).await;
+            }
             return Err(e);
         }
-        
+
         Ok(ResponseFuture::new(rx))
     }
 }
@@ -521,6 +541,7 @@ pub struct ClientBuilder<D: FrameDecoder + Send + Sync + 'static> {
     message_source: Option<Arc<dyn MessageSource>>,
     event_handler: Option<Arc<dyn ClientEventHandler>>,
     metrics: Option<Arc<dyn Metrics>>,
+    message_callback: Option<Arc<dyn MessageCallback>>,
 }
 
 impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
@@ -537,12 +558,21 @@ impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
             message_source: None,
             event_handler: None,
             metrics: None,
+            message_callback: None,
         }
     }
 
     /// 注入指标记录器（可观测性）。不设置时使用 `NoopMetrics`。
     pub fn metrics(mut self, metrics: Arc<dyn Metrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// 注入交付链路回调（at-least-once 使能原语）。设置后框架自动驱动：
+    /// 出站 Submit 自动登记，收到 SubmitResp/Report/MO 自动回调，并启动 Resp 超时检查器。
+    /// 不设置时交付链路完全不启用，相关路径零成本。
+    pub fn message_callback(mut self, callback: Arc<dyn MessageCallback>) -> Self {
+        self.message_callback = Some(callback);
         self
     }
 
@@ -571,6 +601,7 @@ impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
             message_source,
             event_handler,
             metrics,
+            message_callback,
         } = self;
         let metrics: Arc<dyn Metrics> = metrics.unwrap_or_else(|| Arc::new(NoopMetrics));
         let config = client_config.unwrap_or_default();
@@ -579,7 +610,18 @@ impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
     let stream = TcpStream::connect(&addr).await.map_err(RsmsError::Io)?;
     let decoder: Arc<tokio::sync::Mutex<Box<dyn FrameDecoder>>> = Arc::new(tokio::sync::Mutex::new(Box::new(decoder)));
     let decoder_for_conn = Arc::clone(&decoder);
-    let conn = ClientConnection::new(stream, endpoint.clone(), config, decoder_for_conn).await;
+
+    // 配置了 MessageCallback 即启用交付链路：建 TM、挂回调、启动 Resp 超时检查器。
+    let tm = if let Some(cb) = message_callback {
+        let tm = Arc::new(TransactionManager::new(endpoint.timeout.as_secs().max(1)));
+        tm.set_callback(Some(cb)).await;
+        Arc::clone(&tm).start_timeout_checker().await;
+        Some(tm)
+    } else {
+        None
+    };
+
+    let conn = ClientConnection::new(stream, endpoint.clone(), config, decoder_for_conn, tm).await;
 
     if let Some(window) = &conn.window {
         window.start_monitor();
@@ -640,7 +682,8 @@ pub(crate) async fn connect_with_pool(
     let decoder: Arc<tokio::sync::Mutex<Box<dyn FrameDecoder>>> = Arc::new(tokio::sync::Mutex::new(create_decoder(endpoint.protocol)));
     let decoder_for_conn = Arc::clone(&decoder);
     let config = client_config.unwrap_or_default();
-    let conn = ClientConnection::new(stream, endpoint.clone(), config, decoder_for_conn).await;
+    // ClientPool 路径：交付链路沿用 AccountConnections 上的 TM（手动驱动），此处直连字段置 None。
+    let conn = ClientConnection::new(stream, endpoint.clone(), config, decoder_for_conn, None).await;
     conn.set_event_tx(event_tx).await;
 
     if let Some(window) = &conn.window {
@@ -774,6 +817,12 @@ async fn run_client_read_loop(
                 });
             }
 
+            // 收侧自动驱动交付链路：SubmitResp/Report/MO 自动回调到用户的 MessageCallback
+            // （仅 TM 启用时）。与窗口/ResponseFuture 的同步匹配相互独立、互不干扰。
+            if let Some(tm) = &conn.tm {
+                drive_inbound(tm, conn.endpoint.protocol, &frame).await;
+            }
+
             let ctx = ClientContext {
                 endpoint: &conn.endpoint,
                 conn: &conn,
@@ -868,6 +917,13 @@ async fn run_outbound_fetcher(
             Ok(_) => {
                 for _ in 0..slices.len() {
                     metrics.outbound_frame();
+                }
+                // 主出站路径发侧登记：经 MessageSource 发出的 Submit 也纳入交付链路追踪
+                // （此前主路径不走 window，零交付追踪；仅 TM 启用时生效）。
+                if let Some(tm) = &conn.tm {
+                    for s in slices.iter().copied() {
+                        register_outbound(tm, conn.endpoint.protocol, s).await;
+                    }
                 }
                 if conn.endpoint.log_level.is_none_or(|max| tracing::Level::TRACE <= max) {
                     tracing::trace!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), batch = slices.len(), "send batch success");
