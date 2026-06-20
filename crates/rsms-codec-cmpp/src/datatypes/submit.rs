@@ -335,6 +335,18 @@ impl SubmitRespV20 {
     pub const BODY_SIZE: usize = 8 + 1;
 }
 
+impl Encodable for SubmitRespV20 {
+    fn encode(&self, buf: &mut BytesMut) -> Result<(), CodecError> {
+        buf.put_slice(&self.msg_id);
+        buf.put_u8(self.result);
+        Ok(())
+    }
+
+    fn encoded_size(&self) -> usize {
+        Self::BODY_SIZE
+    }
+}
+
 impl Decodable for SubmitRespV20 {
     fn decode(header: PduHeader, buf: &mut Cursor<&[u8]>) -> Result<Self, CodecError> {
         if header.total_length != (PduHeader::SIZE + Self::BODY_SIZE) as u32 {

@@ -160,9 +160,10 @@
 - 当前版本有三套表示：`ProtocolConnection::protocol_version() -> Option<u8>`（裸字节）、codec 的 `CmppVersion` enum、handler 里的 `matches!(v, 0x20|0x00|0x01)`。
 - PR #16 已用 `handlers/cmpp.rs::is_cmpp_v2()` 收口连接器侧最常被复制的判定；彻底统一（让 `CmppVersion` 贯穿全链路、消灭裸 `u8`）需改 `ProtocolConnection` trait，影响面大，单独做。
 
-### R3. `encode_message` V2.0 手写路径下沉到 `Pdu` 层
-- `message.rs` 顶部对 SubmitResp/DeliverResp/ConnectResp 的 V2.0 形态手写 12B 头 + 1 字节 Result/Status body，与下方 `Pdu::*.to_pdu_bytes`（写 u32）双路径并存。
-- 当前是必要特例（V2.0 Result/Status 是 1 字节，与 trait 的 u32 序列化不兼容）；理想是让各 `Pdu` 变体按版本字段自裁字节宽度，但需给每个变体引入版本感知，属更大的 codec 重构。
+### R3. `encode_message` V2.0 手写路径下沉 ✅ 已完成（分支 `refactor/cmpp-v20-resp-encodable`）
+> **复核发现**：`SubmitRespV20`/`DeliverRespV20`/`ConnectRespV20` 类型早已存在（有 `BODY_SIZE` + `Decodable` + `From`→收敛到共享 `Pdu::*Resp`），**唯独缺 `Encodable`**——这正是 `encode_message` 不得不手写 V2.0 应答字节的根因，是 `Decodable`/`Encodable` 的真实不对称。
+> **已做**：补三者的 `Encodable`（与 decode 对称，字节宽度知识入数据类型层）；`encode_message` 的手写早 return + 本地 `write_header` 改为泛型 `encode_v20_pdu` 委托。先补 DeliverResp V20 表征测试（Submit/Connect 已有），重构后三条 V2.0 应答字节级测试逐字节不变、codec-cmpp 72 passed、cmpp-integration 20 passed、clippy 零警告。
+> **未做（按设计）**：不新增 `Pdu::*RespV20` 变体——应答类型按既有设计 decode 后收敛到共享 `Pdu::*Resp`，加 encode-only 变体会破坏该对称，故 encode 直接走类型的 `Encodable`。
 
 ### R4. 预定 MO 版本感知能力的归属
 - `examples/cmpp_server` 的 `FileMessageSource` 用 `raw_mo`/`mo_enqueued` 在**应用层**实现「按连接版本延迟编码」。作为演示代码这是其职责所在。
