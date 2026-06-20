@@ -79,6 +79,20 @@ impl DeliveryStatus {
         }
     }
 
+    /// 语义状态 → 标准 7 字符投递状态码（`from_stat_code` 的反向，构造回执正文用）。
+    /// `Other` 取其原文（调用方负责按协议字段宽度截断/补齐）。
+    pub fn to_stat_code(&self) -> &str {
+        match self {
+            DeliveryStatus::Delivered => "DELIVRD",
+            DeliveryStatus::Expired => "EXPIRED",
+            DeliveryStatus::Undeliverable => "UNDELIV",
+            DeliveryStatus::Accepted => "ACCEPTD",
+            DeliveryStatus::Rejected => "REJECTD",
+            DeliveryStatus::Unknown => "UNKNOWN",
+            DeliveryStatus::Other(s) => s.as_str(),
+        }
+    }
+
     /// 从投递回执文本（形如 `id:.. stat:DELIVRD err:..`）解析状态；
     /// SMPP/SMGP 回执正文为该格式。找不到 `stat:` 段时返回 `Unknown`。
     pub fn from_receipt_text(text: &[u8]) -> DeliveryStatus {

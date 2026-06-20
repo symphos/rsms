@@ -394,16 +394,33 @@ fn unified_to_cmpp(msg: &UnifiedMessage, seq: Sequence) -> Result<CmppMessage> {
             }
         }
         UnifiedMessage::Report(r) => {
-            // 状态报告下行：以 Deliver(registered_delivery=1) 承载。
+            // 状态报告下行：以 Deliver(registered_delivery=1) 承载。正文须是 CMPP 3.0 定长二进制
+            // 回执(71B)，否则真实网关(cmos)按定长解析会字段错位（length 119 should be 71）。
             let mut dl = Deliver::new();
             dl.registered_delivery = 1;
+            let mut mid = [0u8; 8];
             if let MessageId::Binary(b) = &r.msg_id {
                 let n = b.len().min(8);
-                dl.msg_id[..n].copy_from_slice(&b[..n]);
+                mid[..n].copy_from_slice(&b[..n]);
             }
+            dl.msg_id = mid;
             dl.dest_id = r.dest.number.clone();
             dl.src_terminal_id = r.src.number.clone();
-            dl.msg_content = r.raw.clone();
+            // raw 恰为 71B 合规回执（解码后再编码/代理转发）则原样透传；否则从结构化字段
+            // (msg_id + status + 终端号) 合成合规 71B 二进制回执——业务无需手拼定长正文。
+            dl.msg_content = if r.raw.len() == 71 {
+                r.raw.clone()
+            } else {
+                crate::datatypes::CmppReport {
+                    msg_id: mid,
+                    stat: r.status.to_stat_code().to_string(),
+                    submit_time: String::new(),
+                    done_time: String::new(),
+                    dest_terminal_id: r.src.number.clone(),
+                    smsc_sequence: 0,
+                }
+                .to_bytes()
+            };
             CmppMessage::DeliverV30 { sequence_id: seq, deliver: dl }
         }
         UnifiedMessage::BindResp(r) => {
@@ -595,22 +612,55 @@ mod tests {
 
     #[test]
     fn report_byte_roundtrip_via_unified() {
-        // Report：registered_delivery=1。统一 UnifiedReport 承载 msg_id/src/dest/raw，
-        // 不承载 service_id/link_id 等方言字段，故原始 PDU 这些字段须保持默认（空）方可字节一致。
-        // 注意 status 解码恒为 Unknown（有损点），但 encode 不读 status（仅 registered_delivery 标志），
-        // 故字节往返仍可一致。
+        // Report 正文须是 CMPP 3.0 定长 71B 二进制（Msg_Id8+Stat7+Submit10+Done10+Dest32+SMSC4）。
+        // 信封 Msg_Id 与正文体 [0..8] 同值 → decode 取正文体 msg_id、encode 透传 71B 正文且信封同值
+        // → 字节往返无损。（正文非 71B 时 encode 会从字段合成，属另一路径，见 report_encode_synthesizes_*）
+        let mid = [0x67u8, 0x05, 0xf1, 0x03, 0x24, 0x66, 0x2f, 0x02];
+        let mut content = Vec::with_capacity(71);
+        content.extend_from_slice(&mid); // [0..8] Msg_Id
+        content.extend_from_slice(b"DELIVRD"); // [8..15] Stat
+        content.extend_from_slice(b"2601010000"); // [15..25] Submit_time
+        content.extend_from_slice(b"2601010001"); // [25..35] Done_time
+        content.resize(67, 0); // [35..67] Dest_terminal_Id(32) 补零
+        content.extend_from_slice(&0u32.to_be_bytes()); // [67..71] SMSC_sequence
+        assert_eq!(content.len(), 71);
+
         let mut d = Deliver::new();
         d.registered_delivery = 1;
-        d.msg_id = [0x67, 0x05, 0xf1, 0x03, 0x24, 0x66, 0x2f, 0x02];
+        d.msg_id = mid;
         d.src_terminal_id = "10086".to_string();
         d.dest_id = "1065900000".to_string();
-        d.msg_content = b"DELIVRD report body".to_vec();
+        d.msg_content = content;
         let original = Pdu::from(d).to_pdu_bytes(9).to_vec();
 
         let unified = CmppAdapter.decode(&frame_of(original.clone())).unwrap();
         assert!(matches!(unified, UnifiedMessage::Report(_)));
         let reencoded = CmppAdapter.encode(&unified, Sequence::Plain(9)).unwrap();
-        assert_eq!(reencoded, original, "CMPP Report 经统一模型往返后字节应无损一致");
+        assert_eq!(reencoded, original, "CMPP Report(合规 71B 正文)经统一模型往返字节应无损一致");
+    }
+
+    #[test]
+    fn report_encode_synthesizes_spec_71b_content() {
+        // 真机(cmos)联调暴露：业务构造 Report 时若 raw 非合规 71B（如自由文本/空），encode 须从
+        // 结构化字段(msg_id+status+终端号)合成 CMPP 3.0 定长 71B 二进制回执，否则对端按定长解析错位。
+        let report = UnifiedMessage::Report(UnifiedReport {
+            msg_id: MessageId::Binary(vec![1, 2, 3, 4, 5, 6, 7, 8]),
+            status: DeliveryStatus::Delivered,
+            src: Address::plain("13800138000"), // 终端号 → 正文 Dest_terminal_Id
+            dest: Address::plain("900001"),
+            raw: b"MsgId:.. Stat:DELIVRD ..".to_vec(), // 非 71B 自由文本 → 触发合成
+        });
+        let bytes = CmppAdapter.encode(&report, Sequence::Plain(1)).unwrap();
+        // 解出 Deliver 正文应为 71B，且 [0..8]=msg_id、[8..15]=DELIVRD。
+        let decoded = CmppAdapter.decode(&frame_of(bytes)).unwrap();
+        match decoded {
+            UnifiedMessage::Report(r) => {
+                assert_eq!(r.msg_id, MessageId::Binary(vec![1, 2, 3, 4, 5, 6, 7, 8]));
+                assert_eq!(r.status, DeliveryStatus::Delivered, "合成回执 stat 应为 DELIVRD");
+                assert_eq!(r.raw.len(), 71, "合成回执正文应为定长 71B");
+            }
+            other => panic!("expected Report, got {other:?}"),
+        }
     }
 
     #[test]

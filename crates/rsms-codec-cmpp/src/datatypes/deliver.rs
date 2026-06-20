@@ -251,6 +251,27 @@ impl CmppReport {
             smsc_sequence,
         })
     }
+
+    /// 编码为 CMPP 3.0 状态报告正文（定长 71 字节二进制）：
+    /// Msg_Id(8) + Stat(7) + Submit_time(10) + Done_time(10) + Dest_terminal_Id(32) + SMSC_sequence(4)。
+    /// 字符串字段按字节截断/补 0 到定长。真实 CMPP 网关（如 lihuanghe/SMSGate）按此定长解析；
+    /// 旧 example 发自由文本（119B）会被对端按定长解致字段错位（cmos WARN: length 119 should be 71）。
+    pub fn to_bytes(&self) -> Vec<u8> {
+        fn fixed(src: &[u8], n: usize) -> Vec<u8> {
+            let mut v = vec![0u8; n];
+            let len = src.len().min(n);
+            v[..len].copy_from_slice(&src[..len]);
+            v
+        }
+        let mut b = Vec::with_capacity(71);
+        b.extend_from_slice(&self.msg_id);
+        b.extend_from_slice(&fixed(self.stat.as_bytes(), 7));
+        b.extend_from_slice(&fixed(self.submit_time.as_bytes(), 10));
+        b.extend_from_slice(&fixed(self.done_time.as_bytes(), 10));
+        b.extend_from_slice(&fixed(self.dest_terminal_id.as_bytes(), 32));
+        b.extend_from_slice(&self.smsc_sequence.to_be_bytes());
+        b
+    }
 }
 
 #[cfg(test)]
