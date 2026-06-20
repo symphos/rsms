@@ -9,7 +9,7 @@ use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Frame, Result};
 // 窄腰统一模型：编解码经 CmppAdapter；V2.0 Submit 构造（SubmitV20）adapter 无法表达，保留裸 codec。
 // compute_connect_auth 为鉴权工具，保留。
 use rsms_codec_cmpp::adapter::CmppAdapter;
-use rsms_codec_cmpp::{Pdu, SubmitV20};
+use rsms_codec_cmpp::{CmppVersion, Pdu, SubmitV20};
 use rsms_codec_cmpp::auth::compute_connect_auth;
 use rsms_model::{
     Address, CmppExtra, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra,
@@ -121,7 +121,10 @@ impl ClientHandler for ClientState {
 
     async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
         // 统一模型分支：BindResp/SubmitResp（取 8B 二进制 MsgId 入待匹配队列）/Report|Deliver（回 DeliverResp）。
-        let unified = match CmppAdapter.decode(frame) {
+        // 按本连接协商版本解码：CMPP 2.0 的 ConnectResp/SubmitResp/回执字段宽度与 3.0 不同，
+        // 用版本无关默认（V3.0）解码会令 V2.0 应答解码失败 → 永不置 connected/收不到回执。
+        let version = CmppVersion::from_wire(self.version).unwrap_or(CmppVersion::V30);
+        let unified = match CmppAdapter.decode_with_version(frame, version) {
             Ok(m) => m,
             Err(_) => return Ok(()),
         };
@@ -146,9 +149,23 @@ impl ClientHandler for ClientState {
                     self.stats.submit_errors.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            // 状态报告（Deliver registered_delivery=1）→ Report。
+            // 状态报告（Deliver registered_delivery=1）→ Report。按解码后的结构化 msg_id 匹配：
+            // 回执经 adapter 编码为定长二进制，正文文本被丢弃，故不能再从正文解析 msgId。
             UnifiedMessage::Report(r) => {
-                self.handle_deliver(&1, &r.raw, &r.src.number);
+                self.stats.report_received.fetch_add(1, Ordering::Relaxed);
+                if let MessageId::Binary(b) = &r.msg_id {
+                    let mut report_msg_id = [0u8; 8];
+                    let n = b.len().min(8);
+                    report_msg_id[..n].copy_from_slice(&b[..n]);
+                    if !self.matched_msg_ids.lock().unwrap().contains(&report_msg_id) {
+                        let mut pending = self.msg_ids.write().unwrap();
+                        if let Some(pos) = pending.iter().position(|&id| id == report_msg_id) {
+                            pending.remove(pos);
+                            self.matched_msg_ids.lock().unwrap().insert(report_msg_id);
+                            self.stats.report_matched.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
                 let resp_bytes = CmppAdapter.encode(&UnifiedMessage::DeliverResp, CmppAdapter.sequence_of(frame))?;
                 ctx.conn.write_frame(&resp_bytes).await?;
             }
@@ -354,9 +371,10 @@ async fn report_generator_task(
                     );
 
                     // 状态报告：统一 Report（adapter 编码为 Deliver registered_delivery=1）。
-                    // msg_id 字段置 0（与原 Deliver.msg_id=[0;8] 一致）；真正的回执 msgId 在 raw 文本里。
+                    // msg_id 必须填真实 8B 回执 MsgId：adapter 在 raw 非合规 71B 时从结构化字段合成
+                    // 定长二进制回执，若 msg_id=0 则 client 无法按 msgId 关联（report_matched=0）。
                     let report = UnifiedMessage::Report(UnifiedReport {
-                        msg_id: MessageId::Binary(vec![0u8; 8]),
+                        msg_id: MessageId::Binary(item.msg_id.to_vec()),
                         status: DeliveryStatus::Delivered,
                         src: Address::plain("13800138000"),
                         dest: Address::plain(item.dest_id),
