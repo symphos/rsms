@@ -11,7 +11,7 @@ pub mod sgip;
 pub mod smpp;
 mod drive;
 
-pub(crate) use drive::{drive_inbound, register_outbound};
+pub(crate) use drive::{drain_pending, drive_inbound, register_outbound};
 
 pub use cmpp::{CmppSubmit, CmppDeliver, CmppTransactionManager};
 pub use smgp::{SmgpSubmit, SmgpDeliver, SmgpTransactionManager};

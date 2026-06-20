@@ -887,6 +887,52 @@ async fn test_deliver_report() {
     handle.abort();
 }
 
+/// 客户端优雅停机（Phase B1）：在途 Resp 已追平时 `shutdown` 应快速返回，并停发停收。
+#[tokio::test]
+async fn test_client_graceful_shutdown() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .try_init();
+
+    let auth = Arc::new(PasswordAuthHandler::new().add_account("106900", "password123"));
+    let biz = Arc::new(TestBusinessHandler::new());
+    let evt = Arc::new(TestEventHandler::new());
+    let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30)
+        .await
+        .unwrap();
+
+    let spy = Arc::new(DeliverySpy::default());
+    let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
+    let client_handler = Arc::new(TestClientHandler::new());
+    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+        .client_config(ClientConfig::new())
+        .message_callback(spy.clone() as Arc<dyn MessageCallback>)
+        .connect()
+        .await
+        .expect("connect");
+
+    let connect_pdu = client_handler.build_connect_pdu("106900", "password123");
+    conn.send_request(connect_pdu).await.expect("send connect");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(client_handler.is_connected(), "连接失败");
+
+    // 发一条 Submit 并等其 Resp 回来 → 在途 Pending 追平为 0。
+    let submit_pdu = client_handler.build_submit_pdu("13800138000", "106900", "Hello");
+    conn.send_request(submit_pdu).await.expect("send submit");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(spy.resp_ok.load(Ordering::Relaxed), 1, "Resp 应已追平");
+
+    // 在途已清空，优雅停机应快速返回（drain 不阻塞），并停发停收。
+    let started = std::time::Instant::now();
+    conn.shutdown(Duration::from_secs(5)).await;
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(3), "在途为 0 时停机应快速返回，实际 {:?}", elapsed);
+    assert!(!conn.is_sending(), "停机后应停止出站发送");
+    assert!(!conn.ready_for_fetch(), "停机后应停止收发就绪");
+
+    handle.abort();
+}
+
 struct RateLimitConfigProvider {
     max_qps: u64,
     window_size_ms: u64,
