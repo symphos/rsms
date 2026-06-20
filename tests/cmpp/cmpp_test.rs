@@ -8,7 +8,7 @@ use rsms_connector::{
 use rsms_connector::client::{ClientContext, ClientConfig};
 use rsms_business::BusinessHandler;
 use rsms_business::InboundContext;
-use rsms_core::{ConnectionInfo, Metrics, Protocol, RawPdu, EndpointConfig, Frame, Result};
+use rsms_core::{ConnectionInfo, EncodedPdu, Metrics, Protocol, RawPdu, EndpointConfig, Frame, Result};
 // 窄腰统一模型：编解码全程经 CmppAdapter（decode→UnifiedMessage / encode UnifiedMessage→字节）。
 // compute_connect_auth 是 MD5 鉴权工具（非裸消息构造），保留。
 use rsms_codec_cmpp::adapter::CmppAdapter;
@@ -453,6 +453,7 @@ struct CountingMetrics {
     opened: AtomicUsize,
     authenticated: AtomicUsize,
     inbound: AtomicUsize,
+    outbound: AtomicUsize,
     decode_error: AtomicUsize,
 }
 
@@ -466,8 +467,30 @@ impl Metrics for CountingMetrics {
     fn inbound_frame(&self, _protocol: Protocol, _command_id: u32) {
         self.inbound.fetch_add(1, Ordering::Relaxed);
     }
+    fn outbound_frame(&self) {
+        self.outbound.fetch_add(1, Ordering::Relaxed);
+    }
     fn decode_error(&self, _protocol: Protocol) {
         self.decode_error.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// 单发 MessageSource 测试桩:首次 fetch 返回一个 CMPP ActiveTest PDU,之后空。用于验证出站埋点。
+struct OneShotSource {
+    sent: AtomicBool,
+}
+
+#[async_trait]
+impl MessageSource for OneShotSource {
+    async fn fetch(&self, _account: &str, _batch: usize) -> Result<Vec<MessageItem>> {
+        if self.sent.swap(true, Ordering::Relaxed) {
+            return Ok(vec![]);
+        }
+        // CMPP ActiveTest(12B):total_len=0x0C, command_id=0x08, sequence=1。
+        let pdu = vec![0, 0, 0, 0x0C, 0, 0, 0, 0x08, 0, 0, 0, 1];
+        Ok(vec![MessageItem::Single(
+            Arc::new(RawPdu::from_vec(pdu)) as Arc<dyn EncodedPdu>,
+        )])
     }
 }
 
@@ -528,6 +551,42 @@ async fn test_metrics_hooks_fired() {
     // connection_closed 与 connection_opened 在 run_connection 同处对称埋点（收尾必调），
     // 客户端无公开 close API、整测断连时序不稳，故其覆盖交由 rsms-core 的 Metrics 单测 +
     // 接线对称性保证，此处不做时序敏感断言。
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn test_client_metrics_and_outbound() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .try_init();
+
+    // 服务端(普通,不关心其指标)
+    let auth = Arc::new(PasswordAuthHandler::new().add_account("106900", "password123"));
+    let biz = Arc::new(TestBusinessHandler::new());
+    let evt = Arc::new(TestEventHandler::new());
+    let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30).await.unwrap();
+
+    // 客户端:注入指标 + 单发 MessageSource(出站一帧)
+    let client_metrics = Arc::new(CountingMetrics::default());
+    let endpoint = Arc::new(EndpointConfig::new("metrics-client", "127.0.0.1", port, 8, 30));
+    let client_handler = Arc::new(TestClientHandler::new());
+    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+        .client_config(ClientConfig::new())
+        .metrics(client_metrics.clone() as Arc<dyn Metrics>)
+        .message_source(Arc::new(OneShotSource { sent: AtomicBool::new(false) }) as Arc<dyn MessageSource>)
+        .connect()
+        .await
+        .expect("connect");
+
+    // 发 Connect 触发收到 ConnectResp(入站埋点);出站 fetcher 会把单发 PDU 写出(出站埋点)。
+    let connect_pdu = client_handler.build_connect_pdu("106900", "password123");
+    conn.send_request(connect_pdu).await.expect("send connect");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    assert!(client_metrics.opened.load(Ordering::Relaxed) >= 1, "客户端 connection_opened 应被调用");
+    assert!(client_metrics.inbound.load(Ordering::Relaxed) >= 1, "客户端 inbound_frame 应被调用(收到 ConnectResp)");
+    assert!(client_metrics.outbound.load(Ordering::Relaxed) >= 1, "客户端 outbound_frame 应被调用(出站 fetcher 发送)");
 
     handle.abort();
 }

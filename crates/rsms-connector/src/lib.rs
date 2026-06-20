@@ -32,7 +32,7 @@ pub use pool::{ConnectionPool, AccountPool, AccountConnections};
 pub use id_generator::SimpleIdGenerator;
 pub use rsms_core::IdGenerator;
 pub use rsms_core::Protocol;
-pub use rsms_core::{Metrics, NoopMetrics};
+pub use rsms_core::{ErrorKind, Metrics, NoopMetrics};
 pub use protocol::{
     ProtocolHandler, ProtocolConnection, AuthHandler, AuthCredentials, AuthResult,
     AccountConfig, AccountPoolConfig, AccountConfigProvider,
