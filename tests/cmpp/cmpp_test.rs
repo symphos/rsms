@@ -4,6 +4,7 @@ use rsms_connector::{
     ClientEventHandler, ClientHandler, MessageSource, MessageItem, ProtocolConnection,
     ServerEventHandler, AccountConfig, AccountConfigProvider,
     CmppDecoder,
+    MessageCallback, SubmitInfo, ReportInfo, MoInfo,
 };
 use rsms_connector::client::{ClientContext, ClientConfig};
 use rsms_business::BusinessHandler;
@@ -1260,4 +1261,81 @@ fn test_compute_auth() {
 use rsms_codec_cmpp::auth::compute_connect_auth;
     let auth = compute_connect_auth("900001", "pwd", 0);
     assert_eq!(auth.len(), 16);
+}
+
+/// 交付链路回调测试桩：原子计数验证框架自动驱动了对应回调。
+#[derive(Default)]
+struct DeliverySpy {
+    resp_ok: AtomicUsize,
+    resp_err: AtomicUsize,
+    reports: AtomicUsize,
+    send_failed: AtomicUsize,
+}
+
+#[async_trait]
+impl MessageCallback for DeliverySpy {
+    async fn on_submit_resp_ok(&self, _: &SubmitInfo) {
+        self.resp_ok.fetch_add(1, Ordering::Relaxed);
+    }
+    async fn on_submit_resp_error(&self, _: &SubmitInfo, _: u32) {
+        self.resp_err.fetch_add(1, Ordering::Relaxed);
+    }
+    async fn on_submit_resp_timeout(&self, _: &SubmitInfo) {}
+    async fn on_send_failed(&self, _: u32, _: &str) {
+        self.send_failed.fetch_add(1, Ordering::Relaxed);
+    }
+    async fn on_report(&self, _: &ReportInfo, _: &SubmitInfo) {
+        self.reports.fetch_add(1, Ordering::Relaxed);
+    }
+    async fn on_mo(&self, _: &MoInfo) {}
+}
+
+/// 交付链路自动驱动（Phase A 核心）：客户端只 `impl MessageCallback`，框架即自动
+/// 登记出站 Submit、收到 SubmitResp/Report 自动回调，无需在 ClientHandler 里手工解析驱动 TM。
+#[tokio::test]
+async fn test_delivery_callback_autowire() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .try_init();
+
+    let auth = Arc::new(PasswordAuthHandler::new().add_account("106900", "password123"));
+    let biz = Arc::new(TestBusinessHandler::new());
+    let evt = Arc::new(TestEventHandler::new());
+    let (port, pool, handle) = start_test_server_with_pool(auth.clone(), biz.clone(), evt.clone(), 30)
+        .await
+        .unwrap();
+
+    let spy = Arc::new(DeliverySpy::default());
+    let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
+    let client_handler = Arc::new(TestClientHandler::new());
+    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+        .client_config(ClientConfig::new())
+        .message_callback(spy.clone() as Arc<dyn MessageCallback>)
+        .connect()
+        .await
+        .expect("connect");
+
+    let connect_pdu = client_handler.build_connect_pdu("106900", "password123");
+    conn.send_request(connect_pdu).await.expect("send connect");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(client_handler.is_connected(), "连接失败");
+
+    // 发 Submit：框架自动 register_outbound；服务端回 SubmitResp(msg_id=[0;8], status=0)，
+    // 读循环 drive_inbound → on_submit_resp_ok（并把事务键 seq 改写为 msg_id）。
+    let submit_pdu = client_handler.build_submit_pdu("13800138000", "106900", "Hello");
+    conn.send_request(submit_pdu).await.expect("send submit");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(spy.resp_ok.load(Ordering::Relaxed), 1, "应自动回调 on_submit_resp_ok 一次");
+    assert_eq!(spy.send_failed.load(Ordering::Relaxed), 0, "正常路径不应触发 on_send_failed");
+
+    // 服务端主动发状态报告（msg_id 与 SubmitResp 一致=[0;8]）→ drive_inbound 按 msg_id 关联 → on_report。
+    let msg_id: [u8; 8] = [0u8; 8];
+    if let Some(server_conn) = get_conn_from_pool(&pool).await {
+        let report_pdu = build_deliver_report(200, &msg_id, "106900");
+        server_conn.write_frame(report_pdu.as_slice()).await.expect("send report");
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(spy.reports.load(Ordering::Relaxed), 1, "应自动回调 on_report 并按 msg_id 关联到原 Submit");
+
+    handle.abort();
 }
