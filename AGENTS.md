@@ -166,7 +166,8 @@
 ### R4. 预定 MO 版本感知能力的归属
 - `examples/cmpp_server` 的 `FileMessageSource` 用 `raw_mo`/`mo_enqueued` 在**应用层**实现「按连接版本延迟编码」。作为演示代码这是其职责所在。
 - 若多应用都需要，可考虑框架层抽象 `VersionAwareMessageSource` 包装或 adapter 提供 `encode_auto_version`——属产品决策，不在 example 内定。
-- 关联：PR #16（fae4322）已把去重键由 `account` 改为 `account#version`，修掉换版本重连发错形态的问题；**仍未定的语义**：同账号同版本重连是否应再次补发预定 MO（当前为「种子语义」只发一次）。
+- 关联：PR #16（fae4322）已把去重键由 `account` 改为 `account#version`，修掉换版本重连发错形态的问题。
+- **语义决定（推荐保持）**：预定 MO 采用「种子语义」——同账号同版本仅入队下发一次。推荐保持该语义：预定 MO 本质是「开机种子消息」，按种子语义可避免每次断线重连重复下发同一批。换版本重连的正确性已由 fae4322 覆盖。若后续确有「每连接补发」需求，再单独把去重改为连接级即可。
 
 ### R5. `ServerEventHandler` 文档注释欠账（既有代码，非本 PR 引入）✅ 已完成（b56b1c5）
 - `crates/rsms-connector/src/protocol.rs` 的 `on_connected` / `on_disconnected` / `on_authenticated` 缺 `///` 文档注释。该 trait 是既有代码，PR #16 仅首次调用它们、未改 `protocol.rs`，故未在该 PR 内补；可单开 docs 改动补齐（CLAUDE.md 要求公开 API 必须有文档注释）。
