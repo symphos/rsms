@@ -418,47 +418,37 @@ impl SgipBusinessHandler {
         let resp_bytes = SgipAdapter.encode(&resp, SgipAdapter.sequence_of(frame))?;
         ctx.conn.write_frame(&resp_bytes).await?;
 
-        // 取 SGIP 方言字段（tpudhi 等）以判断长短信。
-        let tpudhi = match &submit.extra {
-            ProtocolExtra::Sgip(e) => e.tpudhi,
-            _ => 0,
-        };
-
-        if tpudhi == 1 {
-            if let Some((udh, _)) = UdhParser::extract_udh(&submit.content) {
-                let seg_num = udh.segment_number;
-                let seg_total = udh.total_segments;
-                let frame_part = LongMessageFrame::new(
-                    udh.reference_id,
-                    seg_total,
-                    seg_num,
-                    submit.content.clone(),
-                    true,
-                    Some(udh),
-                );
-                let mut merger = self.merger.lock().unwrap();
-                match merger.add_frame(frame_part) {
-                    Ok(Some(complete)) => {
-                        // 长短信合包后按 submit.encoding 正确解码（UCS2 → UTF-16BE）。
-                        let content = decode_text(&complete, submit.encoding);
-                        tracing::info!(
-                            conn_id = ctx.conn.id(),
-                            phone = %phone,
-                            content = %content,
-                            "长短信合包完成"
-                        );
-                    }
-                    Ok(None) => {
-                        tracing::info!(
-                            conn_id = ctx.conn.id(),
-                            phone = %phone,
-                            seg = seg_num,
-                            total = seg_total,
-                            "长短信分段接收"
-                        );
-                    }
-                    Err(e) => tracing::warn!(conn_id = ctx.conn.id(), "长短信合包错误: {}", e),
+        // 处理长短信合包（窄腰）：adapter 已把级联 UDH 剥进 submit.concat、content 为纯载荷，
+        // 业务不再读 SGIP tp_udhi / 手剥 UDH（与 cmpp/smgp/smpp server example 同范式）。
+        // 据 concat 重建含 UDH 段喂 merger（merger 内部对多段 strip_udh 取纯载荷拼接）。
+        if let Some(c) = submit.concat {
+            let mut seg_bytes = c.to_udh_prefix();
+            seg_bytes.extend_from_slice(&submit.content);
+            let frame_lm = LongMessageFrame::new(c.reference, c.total, c.sequence, seg_bytes, true, None);
+            let mut merger = self.merger.lock().unwrap();
+            let seg = frame_lm.segment_number;
+            let total = frame_lm.total_segments;
+            match merger.add_frame(frame_lm) {
+                Ok(Some(complete)) => {
+                    // 长短信合包后按 submit.encoding 正确解码（UCS2 → UTF-16BE）。
+                    let content = decode_text(&complete, submit.encoding);
+                    tracing::info!(
+                        conn_id = ctx.conn.id(),
+                        phone = %phone,
+                        content = %content,
+                        "长短信合包完成"
+                    );
                 }
+                Ok(None) => {
+                    tracing::info!(
+                        conn_id = ctx.conn.id(),
+                        phone = %phone,
+                        seg = seg,
+                        total = total,
+                        "长短信分段接收"
+                    );
+                }
+                Err(e) => tracing::warn!(conn_id = ctx.conn.id(), "长短信合包错误: {}", e),
             }
         } else {
             // 按 submit.encoding 正确解码内容（UCS2 → UTF-16BE，否则 UTF-8 宽容解）。
