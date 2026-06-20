@@ -251,7 +251,57 @@ pub fn decode_message_with_version(
 ///
 /// `Unknown` 变体会将原始 body 原样写回，不做任何校验。
 pub fn encode_message(msg: &CmppMessage) -> Result<Vec<u8>, RsmsError> {
+    use crate::datatypes::CommandId;
+
     let seq = msg.sequence_id();
+
+    // ── 版本感知早 return：CMPP 2.0 应答类 PDU 的 Result/Status 仅 1 字节，
+    // 字段宽度与 V3.0 不同（无法走公共 Pdu::*.to_pdu_bytes，后者写 u32）。
+    // 仿 Unknown 臂手写 12B 头 + V2.0 定长 body。version 非 V20 时落入下方常规路径。──
+    fn write_header(out: &mut Vec<u8>, command_id: u32, seq: u32, body_len: usize) {
+        let total = (PduHeader::SIZE + body_len) as u32;
+        out.extend_from_slice(&total.to_be_bytes());
+        out.extend_from_slice(&command_id.to_be_bytes());
+        out.extend_from_slice(&seq.to_be_bytes());
+    }
+    match msg {
+        CmppMessage::SubmitResp {
+            version: CmppVersion::V20,
+            resp,
+            ..
+        } => {
+            let mut v = Vec::with_capacity(PduHeader::SIZE + 9);
+            write_header(&mut v, CommandId::SubmitResp as u32, seq, 9);
+            v.extend_from_slice(&resp.msg_id);
+            v.push(resp.result as u8);
+            return Ok(v);
+        }
+        CmppMessage::DeliverResp {
+            version: CmppVersion::V20,
+            resp,
+            ..
+        } => {
+            let mut v = Vec::with_capacity(PduHeader::SIZE + 9);
+            write_header(&mut v, CommandId::DeliverResp as u32, seq, 9);
+            v.extend_from_slice(&resp.msg_id);
+            v.push(resp.result as u8);
+            return Ok(v);
+        }
+        CmppMessage::ConnectResp {
+            version: CmppVersion::V20,
+            resp,
+            ..
+        } => {
+            let mut v = Vec::with_capacity(PduHeader::SIZE + 18);
+            write_header(&mut v, CommandId::ConnectResp as u32, seq, 18);
+            v.push(resp.status as u8);
+            v.extend_from_slice(&resp.authenticator_ismg);
+            v.push(resp.version);
+            return Ok(v);
+        }
+        _ => {}
+    }
+
     let pdu = match msg {
         CmppMessage::Connect { connect, .. } => crate::codec::Pdu::Connect(connect.clone()),
         CmppMessage::ConnectResp { resp, .. } => crate::codec::Pdu::ConnectResp(resp.clone()),
@@ -432,6 +482,67 @@ mod tests {
             }
             _ => panic!("expected SubmitV30 message"),
         }
+    }
+
+    #[test]
+    fn encode_submit_resp_v20_is_21b_total() {
+        // V2.0 SubmitResp：body = Msg_Id(8) + Result(1) = 9B，总长 12+9 = 21B。
+        let msg = CmppMessage::SubmitResp {
+            version: CmppVersion::V20,
+            sequence_id: 7,
+            resp: SubmitResp {
+                msg_id: [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+                result: 9, // 由 u32 截到 u8 写线路
+            },
+        };
+        let bytes = encode_message(&msg).unwrap();
+        assert_eq!(bytes.len(), 21, "V2.0 SubmitResp 总长应为 21B（9B body）");
+        // total_length 头字段。
+        assert_eq!(&bytes[0..4], &21u32.to_be_bytes());
+        assert_eq!(&bytes[4..8], &(crate::datatypes::CommandId::SubmitResp as u32).to_be_bytes());
+        assert_eq!(&bytes[8..12], &7u32.to_be_bytes());
+        // body：msg_id(8) + result(1)。
+        assert_eq!(&bytes[12..20], &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+        assert_eq!(bytes[20], 9);
+        // 版本感知 decode 回来应是 SubmitResp，result 提升回 u32。
+        let back = decode_message_with_version(&bytes, Some(0x20)).unwrap();
+        match back {
+            CmppMessage::SubmitResp { resp, .. } => assert_eq!(resp.result, 9u32),
+            other => panic!("expected SubmitResp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_connect_resp_v20_is_30b_total() {
+        // V2.0 ConnectResp：body = Status(1) + ISMG(16) + Version(1) = 18B，总长 30B。
+        let msg = CmppMessage::ConnectResp {
+            version: CmppVersion::V20,
+            sequence_id: 1,
+            resp: ConnectResp {
+                status: 0,
+                authenticator_ismg: [0u8; 16],
+                version: 0x20,
+            },
+        };
+        let bytes = encode_message(&msg).unwrap();
+        assert_eq!(bytes.len(), 30, "V2.0 ConnectResp 总长应为 30B（18B body）");
+        assert_eq!(bytes[12], 0); // status u8
+        assert_eq!(bytes[29], 0x20); // version
+    }
+
+    #[test]
+    fn encode_submit_resp_v30_stays_24b() {
+        // 回归：V3.0 SubmitResp 不受影响，仍 12+12 = 24B（Result u32）。
+        let msg = CmppMessage::SubmitResp {
+            version: CmppVersion::V30,
+            sequence_id: 7,
+            resp: SubmitResp {
+                msg_id: [0u8; 8],
+                result: 0,
+            },
+        };
+        let bytes = encode_message(&msg).unwrap();
+        assert_eq!(bytes.len(), 24, "V3.0 SubmitResp 总长应仍为 24B（12B body）");
     }
 
     #[test]

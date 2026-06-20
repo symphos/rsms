@@ -304,6 +304,10 @@ impl BusinessProtocolConnection for Connection {
             Arc::new(SubmitLimiterAdapter { inner: limiter }) as Arc<dyn RateLimiter>
         })
     }
+
+    async fn protocol_version(&self) -> Option<u8> {
+        self.ctx.lock().await.protocol_version()
+    }
 }
 
 struct SubmitLimiterAdapter {

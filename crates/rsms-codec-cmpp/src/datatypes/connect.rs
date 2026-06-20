@@ -120,6 +120,62 @@ impl Decodable for ConnectResp {
     }
 }
 
+/// CMPP 2.0 Connect 响应（Status 为 1 字节）。
+///
+/// 与 V3.0 `ConnectResp`（Status u32，body=21B）的唯一区别：Status 占 1 字节，
+/// body = Status(1) + Authenticator_ISMG(16) + Version(1) = 18B，总长 30B。解码后
+/// 提升为公共 `ConnectResp`（status 用 `as u32`），供注册表覆盖 V3.0 解码器、
+/// 统一走 `Pdu::ConnectResp`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectRespV20 {
+    pub status: u8,
+    pub authenticator_ismg: [u8; 16],
+    pub version: u8,
+}
+
+impl ConnectRespV20 {
+    pub const BODY_SIZE: usize = 1 + 16 + 1;
+}
+
+impl Decodable for ConnectRespV20 {
+    fn decode(header: PduHeader, buf: &mut Cursor<&[u8]>) -> Result<Self, CodecError> {
+        if header.total_length != (PduHeader::SIZE + Self::BODY_SIZE) as u32 {
+            return Err(CodecError::InvalidPduLength {
+                length: header.total_length,
+                min: (PduHeader::SIZE + Self::BODY_SIZE) as u32,
+                max: (PduHeader::SIZE + Self::BODY_SIZE) as u32,
+            });
+        }
+        if buf.remaining() < Self::BODY_SIZE {
+            return Err(CodecError::Incomplete);
+        }
+        let status = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        let mut authenticator_ismg = [0u8; 16];
+        buf.try_copy_to_slice(&mut authenticator_ismg)
+            .map_err(|_| CodecError::Incomplete)?;
+        let version = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        Ok(ConnectRespV20 {
+            status,
+            authenticator_ismg,
+            version,
+        })
+    }
+
+    fn command_id() -> CommandId {
+        CommandId::ConnectResp
+    }
+}
+
+impl From<ConnectRespV20> for crate::codec::Pdu {
+    fn from(v20: ConnectRespV20) -> Self {
+        crate::codec::Pdu::ConnectResp(ConnectResp {
+            status: v20.status as u32,
+            authenticator_ismg: v20.authenticator_ismg,
+            version: v20.version,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +185,41 @@ mod tests {
         let mut cursor = Cursor::new(bytes);
         let header = PduHeader::decode(&mut cursor)?;
         T::decode(header, &mut cursor)
+    }
+
+    #[test]
+    fn connect_resp_v20_decode_18b_body() {
+        // V2.0 ConnectResp：body = Status(1) + Authenticator_ISMG(16) + Version(1) = 18B，总长 30B。
+        let ismg = [0xABu8; 16];
+        let total_len = (PduHeader::SIZE + 18) as u32;
+        let mut pdu = Vec::with_capacity(total_len as usize);
+        pdu.extend_from_slice(&total_len.to_be_bytes());
+        pdu.extend_from_slice(&(CommandId::ConnectResp as u32).to_be_bytes());
+        pdu.extend_from_slice(&5u32.to_be_bytes());
+        pdu.push(0); // status
+        pdu.extend_from_slice(&ismg);
+        pdu.push(0x20); // version
+        let decoded = decode_pdu::<ConnectRespV20>(&pdu).unwrap();
+        assert_eq!(decoded.status, 0);
+        assert_eq!(decoded.authenticator_ismg, ismg);
+        assert_eq!(decoded.version, 0x20);
+    }
+
+    #[test]
+    fn connect_resp_v20_into_pdu_promotes_status() {
+        let v20 = ConnectRespV20 {
+            status: 1,
+            authenticator_ismg: [0xCD; 16],
+            version: 0x20,
+        };
+        match Pdu::from(v20) {
+            Pdu::ConnectResp(r) => {
+                assert_eq!(r.status, 1u32, "status 应由 u8 提升为 u32");
+                assert_eq!(r.authenticator_ismg, [0xCD; 16]);
+                assert_eq!(r.version, 0x20);
+            }
+            other => panic!("expected Pdu::ConnectResp, got {other:?}"),
+        }
     }
 
     #[test]

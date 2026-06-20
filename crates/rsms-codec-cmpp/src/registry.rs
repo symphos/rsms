@@ -3,9 +3,9 @@ use std::sync::OnceLock;
 
 use crate::codec::{CodecError, Decodable, Pdu, PduHeader};
 use crate::datatypes::{
-    ActiveTest, ActiveTestResp, Cancel, CancelResp, CmppVersion, Connect, ConnectResp, Deliver,
-    DeliverResp, DeliverV20, Query, QueryResp, Submit, SubmitResp, SubmitV20, Terminate,
-    TerminateResp,
+    ActiveTest, ActiveTestResp, Cancel, CancelResp, CmppVersion, Connect, ConnectResp,
+    ConnectRespV20, Deliver, DeliverResp, DeliverRespV20, DeliverV20, Query, QueryResp, Submit,
+    SubmitResp, SubmitRespV20, SubmitV20, Terminate, TerminateResp,
 };
 
 /// 按 command_id 分发的 PDU 解码函数
@@ -73,6 +73,12 @@ impl PduRegistry {
             CmppVersion::V20 => {
                 self.register::<SubmitV20>();
                 self.register::<DeliverV20>();
+                // 响应类 PDU 的 V2.0 字段宽度与 V3.0 不同（Result/Status 1 字节）。
+                // 注册表按 command_id 用 HashMap 存储，同 command_id 后注册覆盖前者，
+                // 故这三行覆盖掉公共注册的 V3.0 解码器（仅 V2.0 分支生效）。
+                self.register::<SubmitRespV20>();
+                self.register::<DeliverRespV20>();
+                self.register::<ConnectRespV20>();
             }
             CmppVersion::V30 => {
                 self.register::<Submit>();

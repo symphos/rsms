@@ -47,6 +47,17 @@ async fn send_connect_resp(
     version: u8,
     status: u32,
 ) -> Result<()> {
+    // CMPP 2.0 的 ConnectResp Status 仅 1 字节（body=1+16+1=18B），与 V3.0 的 Status u32
+    // （body=4+16+1=21B）不同。V2.0（0x20/0x00/0x01）手写 18B body；否则走 V3.0 codec。
+    let is_v2 = matches!(version, CMPP_VERSION_2_0 | 0x00 | 0x01);
+    if is_v2 {
+        let body_len = 1 + 16 + 1;
+        let mut pdu = encode_pdu_header(CommandId::ConnectResp, sequence_id, body_len);
+        pdu.push(status as u8);
+        pdu.extend_from_slice(&[0u8; 16]);
+        pdu.push(version);
+        return conn.write_frame(&pdu).await;
+    }
     let resp = ConnectResp {
         status,
         authenticator_ismg: [0u8; 16],

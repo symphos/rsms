@@ -320,6 +320,54 @@ impl Decodable for SubmitResp {
     }
 }
 
+/// CMPP 2.0 Submit 响应（Result 为 1 字节）。
+///
+/// 与 V3.0 `SubmitResp`（Result u32，body=12B）的唯一区别：Result 占 1 字节，
+/// body = Msg_Id(8) + Result(1) = 9B，总长 21B。解码后提升为公共 `SubmitResp`
+/// （result 用 `as u32`），供注册表覆盖 V3.0 解码器、统一走 `Pdu::SubmitResp`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitRespV20 {
+    pub msg_id: [u8; 8],
+    pub result: u8,
+}
+
+impl SubmitRespV20 {
+    pub const BODY_SIZE: usize = 8 + 1;
+}
+
+impl Decodable for SubmitRespV20 {
+    fn decode(header: PduHeader, buf: &mut Cursor<&[u8]>) -> Result<Self, CodecError> {
+        if header.total_length != (PduHeader::SIZE + Self::BODY_SIZE) as u32 {
+            return Err(CodecError::InvalidPduLength {
+                length: header.total_length,
+                min: (PduHeader::SIZE + Self::BODY_SIZE) as u32,
+                max: (PduHeader::SIZE + Self::BODY_SIZE) as u32,
+            });
+        }
+        if buf.remaining() < Self::BODY_SIZE {
+            return Err(CodecError::Incomplete);
+        }
+        let mut msg_id = [0u8; 8];
+        buf.try_copy_to_slice(&mut msg_id)
+            .map_err(|_| CodecError::Incomplete)?;
+        let result = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        Ok(SubmitRespV20 { msg_id, result })
+    }
+
+    fn command_id() -> CommandId {
+        CommandId::SubmitResp
+    }
+}
+
+impl From<SubmitRespV20> for crate::codec::Pdu {
+    fn from(v20: SubmitRespV20) -> Self {
+        crate::codec::Pdu::SubmitResp(SubmitResp {
+            msg_id: v20.msg_id,
+            result: v20.result as u32,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +377,51 @@ mod tests {
         let mut cursor = Cursor::new(bytes);
         let header = PduHeader::decode(&mut cursor)?;
         T::decode(header, &mut cursor)
+    }
+
+    fn build_v20_resp_pdu(command_id: u32, seq: u32, msg_id: &[u8; 8], result: u8) -> Vec<u8> {
+        let total_len = (PduHeader::SIZE + 9) as u32;
+        let mut pdu = Vec::with_capacity(total_len as usize);
+        pdu.extend_from_slice(&total_len.to_be_bytes());
+        pdu.extend_from_slice(&command_id.to_be_bytes());
+        pdu.extend_from_slice(&seq.to_be_bytes());
+        pdu.extend_from_slice(msg_id);
+        pdu.push(result);
+        pdu
+    }
+
+    #[test]
+    fn submit_resp_v20_decode_9b_body() {
+        // V2.0 SubmitResp：body = Msg_Id(8) + Result(1) = 9B，总长 21B。
+        let msg_id = [0x12u8, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
+        let pdu = build_v20_resp_pdu(CommandId::SubmitResp as u32, 7, &msg_id, 5);
+        let decoded = decode_pdu::<SubmitRespV20>(&pdu).unwrap();
+        assert_eq!(decoded.msg_id, msg_id);
+        assert_eq!(decoded.result, 5);
+    }
+
+    #[test]
+    fn submit_resp_v20_into_pdu_promotes_result() {
+        let v20 = SubmitRespV20 {
+            msg_id: [0xAA; 8],
+            result: 9,
+        };
+        match Pdu::from(v20) {
+            Pdu::SubmitResp(r) => {
+                assert_eq!(r.msg_id, [0xAA; 8]);
+                assert_eq!(r.result, 9u32, "result 应由 u8 提升为 u32");
+            }
+            other => panic!("expected Pdu::SubmitResp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submit_resp_v20_rejects_v30_length() {
+        // V3.0 SubmitResp 总长 24B（body 12B），用 V20 解码器解必须按长度校验拒绝。
+        let mut pdu = build_v20_resp_pdu(CommandId::SubmitResp as u32, 1, &[0u8; 8], 0);
+        // 篡改 total_length 为 24（V3.0），body 仍 9B → 长度校验失败。
+        pdu[0..4].copy_from_slice(&24u32.to_be_bytes());
+        assert!(decode_pdu::<SubmitRespV20>(&pdu).is_err());
     }
 
     #[test]

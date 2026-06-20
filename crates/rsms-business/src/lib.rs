@@ -86,6 +86,10 @@ pub trait ProtocolConnection: Send + Sync {
     async fn write_frame(&self, data: &[u8]) -> Result<()>;
     async fn authenticated_account(&self) -> Option<String>;
     async fn rate_limiter(&self) -> Option<Arc<dyn RateLimiter>>;
+    /// 握手协商的协议版本字节（如 CMPP 2.0 = `0x20`、3.0 = `0x30`）；未握手或协议无版本概念时为 `None`。
+    ///
+    /// 业务方据此做版本感知的解码/编码（CMPP 2.0 与 3.0 命令字相同但字段宽度不同）。
+    async fn protocol_version(&self) -> Option<u8>;
 }
 
 pub async fn run_chain(

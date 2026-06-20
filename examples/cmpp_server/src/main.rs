@@ -30,6 +30,7 @@ use rsms_business::InboundContext;
 // compute_connect_auth 是 MD5 加密工具（握手鉴权用），非消息 PDU 构造，保留。
 use rsms_codec_cmpp::adapter::CmppAdapter;
 use rsms_codec_cmpp::compute_connect_auth;
+use rsms_codec_cmpp::CmppVersion;
 use rsms_connector::{
     AccountConfig, AccountConfigProvider, AccountPoolConfig, AuthCredentials, AuthHandler,
     AuthResult, BoundServer, MessageItem, MessageSource, ProtocolConnection, ServerBuilder,
@@ -347,7 +348,15 @@ impl BusinessHandler for CmppBusinessHandler {
     }
 
     async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        let unified = match CmppAdapter.decode(frame) {
+        // 握手协商的协议版本：V2.0/V3.0 命令字相同、仅字段布局不同，须按版本解码。
+        // protocol_version() 返回握手时记录的版本字节（CMPP 2.0 = 0x20）。
+        let version = ctx.conn.protocol_version().await;
+        let decoded = if version == Some(0x20) {
+            CmppAdapter.decode_with_version(frame, CmppVersion::V20)
+        } else {
+            CmppAdapter.decode(frame)
+        };
+        let unified = match decoded {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(conn_id = ctx.conn.id(), "消息解码失败: {}", e);
@@ -357,7 +366,7 @@ impl BusinessHandler for CmppBusinessHandler {
 
         match unified {
             UnifiedMessage::Submit(submit) => {
-                self.handle_submit(ctx, frame, submit).await?;
+                self.handle_submit(ctx, frame, submit, version).await?;
             }
             UnifiedMessage::Ping => {
                 tracing::debug!(conn_id = ctx.conn.id(), "收到 ActiveTest（心跳）");
@@ -374,6 +383,7 @@ impl CmppBusinessHandler {
         ctx: &InboundContext,
         frame: &Frame,
         submit: rsms_model::UnifiedSubmit,
+        version: Option<u8>,
     ) -> Result<()> {
         let phone = submit
             .dests
@@ -395,7 +405,12 @@ impl CmppBusinessHandler {
             msg_id: MessageId::Binary(msg_id.to_vec()),
             status: 0,
         });
-        let resp_bytes = CmppAdapter.encode(&resp, CmppAdapter.sequence_of(frame))?;
+        // V2.0 时用版本感知编码（SubmitResp Result 1 字节，总长 21B）；否则默认 V3.0。
+        let resp_bytes = if version == Some(0x20) {
+            CmppAdapter.encode_with_version(&resp, CmppAdapter.sequence_of(frame), CmppVersion::V20)?
+        } else {
+            CmppAdapter.encode(&resp, CmppAdapter.sequence_of(frame))?
+        };
         ctx.conn.write_frame(&resp_bytes).await?;
 
         // 处理长短信合包（窄腰）：adapter 已把 UDH 剥成 submit.concat、content 为纯载荷。
@@ -450,7 +465,7 @@ impl CmppBusinessHandler {
         // 需要状态报告 → 通过 MessageSource 异步发送。
         if submit.want_report {
             if let Some(account) = ctx.conn.authenticated_account().await {
-                let report = build_deliver_report(&account, &msg_id, &phone);
+                let report = build_deliver_report(&account, &msg_id, &phone, version);
                 self.msg_source.push(&account, report).await;
             }
         }
@@ -468,7 +483,7 @@ impl CmppBusinessHandler {
 // 此处保持 Sequence::Plain(0) 以维持原行为。
 // ============================================================================
 
-fn build_deliver_report(account: &str, msg_id: &[u8; 8], phone: &str) -> RawPdu {
+fn build_deliver_report(account: &str, msg_id: &[u8; 8], phone: &str, version: Option<u8>) -> RawPdu {
     let msg_id_hex: String = msg_id.iter().map(|b| format!("{:02x}", b)).collect();
     let now = chrono_now_str();
 
@@ -486,9 +501,16 @@ fn build_deliver_report(account: &str, msg_id: &[u8; 8], phone: &str) -> RawPdu 
         dest: Address::plain(account),
         raw: report_content.into_bytes(),
     });
-    let bytes = CmppAdapter
-        .encode(&report, Sequence::Plain(0))
-        .expect("encode CMPP report");
+    // V2.0 时报告正文须 60B（Dest_terminal_Id 21B），否则 V3.0 71B。
+    let bytes = if version == Some(0x20) {
+        CmppAdapter
+            .encode_with_version(&report, Sequence::Plain(0), CmppVersion::V20)
+            .expect("encode CMPP report (V2.0)")
+    } else {
+        CmppAdapter
+            .encode(&report, Sequence::Plain(0))
+            .expect("encode CMPP report")
+    };
     RawPdu::from(bytes)
 }
 
