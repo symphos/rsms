@@ -9,10 +9,10 @@ mod v20;
 
 pub use active_test::{ActiveTest, ActiveTestResp};
 pub use command_id::{CmppVersion, CommandId, CommandStatus};
-pub use connect::{Connect, ConnectResp};
-pub use deliver::{CmppReport, Deliver, DeliverResp};
+pub use connect::{Connect, ConnectResp, ConnectRespV20};
+pub use deliver::{CmppReport, Deliver, DeliverResp, DeliverRespV20};
 pub use query::{Cancel, CancelResp, Query, QueryResp};
-pub use submit::{Submit, SubmitResp};
+pub use submit::{Submit, SubmitResp, SubmitRespV20};
 pub use terminate::{Terminate, TerminateResp};
 pub use v20::{
     decode_deliver_v20, decode_submit_v20, encode_pdu_deliver_v20,

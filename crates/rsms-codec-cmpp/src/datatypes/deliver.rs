@@ -190,6 +190,54 @@ impl Decodable for DeliverResp {
     }
 }
 
+/// CMPP 2.0 Deliver 响应（Result 为 1 字节）。
+///
+/// 与 V3.0 `DeliverResp`（Result u32，body=12B）的唯一区别：Result 占 1 字节，
+/// body = Msg_Id(8) + Result(1) = 9B，总长 21B。解码后提升为公共 `DeliverResp`
+/// （result 用 `as u32`），供注册表覆盖 V3.0 解码器、统一走 `Pdu::DeliverResp`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliverRespV20 {
+    pub msg_id: [u8; 8],
+    pub result: u8,
+}
+
+impl DeliverRespV20 {
+    pub const BODY_SIZE: usize = 8 + 1;
+}
+
+impl Decodable for DeliverRespV20 {
+    fn decode(header: PduHeader, buf: &mut Cursor<&[u8]>) -> Result<Self, CodecError> {
+        if header.total_length != (PduHeader::SIZE + Self::BODY_SIZE) as u32 {
+            return Err(CodecError::InvalidPduLength {
+                length: header.total_length,
+                min: (PduHeader::SIZE + Self::BODY_SIZE) as u32,
+                max: (PduHeader::SIZE + Self::BODY_SIZE) as u32,
+            });
+        }
+        if buf.remaining() < Self::BODY_SIZE {
+            return Err(CodecError::Incomplete);
+        }
+        let mut msg_id = [0u8; 8];
+        buf.try_copy_to_slice(&mut msg_id)
+            .map_err(|_| CodecError::Incomplete)?;
+        let result = buf.try_get_u8().map_err(|_| CodecError::Incomplete)?;
+        Ok(DeliverRespV20 { msg_id, result })
+    }
+
+    fn command_id() -> CommandId {
+        CommandId::DeliverResp
+    }
+}
+
+impl From<DeliverRespV20> for crate::codec::Pdu {
+    fn from(v20: DeliverRespV20) -> Self {
+        crate::codec::Pdu::DeliverResp(DeliverResp {
+            msg_id: v20.msg_id,
+            result: v20.result as u32,
+        })
+    }
+}
+
 /// CMPP 状态报告（从 Deliver 的 msg_content 二进制解析）
 ///
 /// CMPP 状态报告是**固定二进制结构**（非文本 key:value）：
@@ -269,6 +317,26 @@ impl CmppReport {
         b.extend_from_slice(&fixed(self.submit_time.as_bytes(), 10));
         b.extend_from_slice(&fixed(self.done_time.as_bytes(), 10));
         b.extend_from_slice(&fixed(self.dest_terminal_id.as_bytes(), 32));
+        b.extend_from_slice(&self.smsc_sequence.to_be_bytes());
+        b
+    }
+
+    /// 编码为 CMPP 2.0 状态报告正文（定长 60 字节二进制）：
+    /// Msg_Id(8) + Stat(7) + Submit_time(10) + Done_time(10) + Dest_terminal_Id(21) + SMSC_sequence(4)。
+    /// 与 `to_bytes()`（V3.0/71B）的唯一区别：Dest_terminal_Id 定长 21 字节（V3.0 为 32）。
+    pub fn to_bytes_v20(&self) -> Vec<u8> {
+        fn fixed(src: &[u8], n: usize) -> Vec<u8> {
+            let mut v = vec![0u8; n];
+            let len = src.len().min(n);
+            v[..len].copy_from_slice(&src[..len]);
+            v
+        }
+        let mut b = Vec::with_capacity(60);
+        b.extend_from_slice(&self.msg_id);
+        b.extend_from_slice(&fixed(self.stat.as_bytes(), 7));
+        b.extend_from_slice(&fixed(self.submit_time.as_bytes(), 10));
+        b.extend_from_slice(&fixed(self.done_time.as_bytes(), 10));
+        b.extend_from_slice(&fixed(self.dest_terminal_id.as_bytes(), 21));
         b.extend_from_slice(&self.smsc_sequence.to_be_bytes());
         b
     }
@@ -364,5 +432,61 @@ mod tests {
     #[test]
     fn deliver_status_report_invalid() {
         assert!(CmppReport::parse(b"short").is_none());
+    }
+
+    #[test]
+    fn deliver_resp_v20_decode_9b_body() {
+        // V2.0 DeliverResp：body = Msg_Id(8) + Result(1) = 9B，总长 21B。
+        let msg_id = [0x87u8, 0x65, 0x43, 0x21, 0x00, 0x11, 0x22, 0x33];
+        let total_len = (PduHeader::SIZE + 9) as u32;
+        let mut pdu = Vec::with_capacity(total_len as usize);
+        pdu.extend_from_slice(&total_len.to_be_bytes());
+        pdu.extend_from_slice(&(CommandId::DeliverResp as u32).to_be_bytes());
+        pdu.extend_from_slice(&3u32.to_be_bytes());
+        pdu.extend_from_slice(&msg_id);
+        pdu.push(0);
+        let decoded = decode_pdu::<DeliverRespV20>(&pdu).unwrap();
+        assert_eq!(decoded.msg_id, msg_id);
+        assert_eq!(decoded.result, 0);
+    }
+
+    #[test]
+    fn deliver_resp_v20_into_pdu_promotes_result() {
+        let v20 = DeliverRespV20 {
+            msg_id: [0xCC; 8],
+            result: 4,
+        };
+        match Pdu::from(v20) {
+            Pdu::DeliverResp(r) => {
+                assert_eq!(r.msg_id, [0xCC; 8]);
+                assert_eq!(r.result, 4u32, "result 应由 u8 提升为 u32");
+            }
+            other => panic!("expected Pdu::DeliverResp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn report_to_bytes_v20_is_60b_with_dest21() {
+        // V2.0 报告正文：Msg_Id(8)+Stat(7)+Submit(10)+Done(10)+Dest(21)+SMSC(4)=60B。
+        let report = CmppReport {
+            msg_id: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+            stat: "DELIVRD".to_string(),
+            submit_time: "2601010000".to_string(),
+            done_time: "2601010001".to_string(),
+            dest_terminal_id: "13800138000".to_string(),
+            smsc_sequence: 42,
+        };
+        let bytes = report.to_bytes_v20();
+        assert_eq!(bytes.len(), 60, "V2.0 报告正文应为定长 60B");
+        // 字段位置校验。
+        assert_eq!(&bytes[0..8], &report.msg_id);
+        assert_eq!(&bytes[8..15], b"DELIVRD");
+        assert_eq!(&bytes[15..25], b"2601010000");
+        assert_eq!(&bytes[25..35], b"2601010001");
+        // Dest_terminal_Id 在 [35..56]（21B），含尾部补零。
+        assert_eq!(&bytes[35..46], b"13800138000");
+        assert_eq!(&bytes[46..56], &[0u8; 10]);
+        // SMSC_sequence 在 [56..60]。
+        assert_eq!(&bytes[56..60], &42u32.to_be_bytes());
     }
 }

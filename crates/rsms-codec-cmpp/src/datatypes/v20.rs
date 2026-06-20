@@ -258,6 +258,11 @@ pub struct DeliverV20 {
     pub src_terminal_id: String,
     pub registered_delivery: u8,
     pub msg_content: Vec<u8>,
+    /// CMPP 2.0 Deliver 尾部保留字段（OCTERSTRING, 8 字节）。
+    /// V3.0 Deliver 无此字段（改为 src_terminal_type/link_id）；真实 CMPP 2.0 网关
+    /// （lihuanghe/cmos Cmpp20DeliverRequestMessageCodec）解码时**无条件**读取该 8 字节，
+    /// 缺失会导致对端 StringIndexOutOfBounds。
+    pub reserve: [u8; 8],
 }
 
 impl DeliverV20 {
@@ -272,6 +277,7 @@ impl DeliverV20 {
             src_terminal_id: String::new(),
             registered_delivery: 0,
             msg_content: Vec::new(),
+            reserve: [0u8; 8],
         }
     }
 }
@@ -308,6 +314,13 @@ pub fn decode_deliver_v20(
     let mut msg_content = vec![0u8; msg_length];
     buf.try_copy_to_slice(&mut msg_content)
         .map_err(|_| CodecError::Incomplete)?;
+    // CMPP 2.0 Deliver 尾部 Reserved(8)，与 SubmitV20 对称。
+    if buf.remaining() < 8 {
+        return Err(CodecError::Incomplete);
+    }
+    let mut reserve = [0u8; 8];
+    buf.try_copy_to_slice(&mut reserve)
+        .map_err(|_| CodecError::Incomplete)?;
 
     Ok(DeliverV20 {
         msg_id,
@@ -319,6 +332,7 @@ pub fn decode_deliver_v20(
         src_terminal_id,
         registered_delivery,
         msg_content,
+        reserve,
     })
 }
 
@@ -351,7 +365,7 @@ impl Decodable for DeliverV20 {
 }
 
 pub fn encoded_size_deliver_v20(deliver: &DeliverV20) -> usize {
-    8 + 21 + 10 + 1 + 1 + 1 + 21 + 1 + 1 + deliver.msg_content.len()
+    8 + 21 + 10 + 1 + 1 + 1 + 21 + 1 + 1 + deliver.msg_content.len() + 8
 }
 
 pub fn encode_pdu_deliver_v20(buf: &mut BytesMut, deliver: &DeliverV20) -> Result<(), CodecError> {
@@ -376,6 +390,8 @@ pub fn encode_pdu_deliver_v20(buf: &mut BytesMut, deliver: &DeliverV20) -> Resul
     }
     buf.put_u8(deliver.msg_content.len() as u8);
     buf.put_slice(&deliver.msg_content);
+    // CMPP 2.0 Deliver 尾部 Reserved(8)，对端按定长无条件读取。
+    buf.put_slice(&deliver.reserve);
     Ok(())
 }
 
@@ -392,7 +408,7 @@ mod tests {
     }
 
     fn build_deliver_v20_pdu(seq_id: u32, deliver: &DeliverV20) -> Vec<u8> {
-        let body_size = 8 + 21 + 10 + 1 + 1 + 1 + 21 + 1 + 1 + deliver.msg_content.len();
+        let body_size = 8 + 21 + 10 + 1 + 1 + 1 + 21 + 1 + 1 + deliver.msg_content.len() + 8;
         let total_len = PduHeader::SIZE + body_size;
         let mut pdu = Vec::with_capacity(total_len);
         pdu.extend_from_slice(&(total_len as u32).to_be_bytes());
@@ -408,6 +424,7 @@ mod tests {
         pdu.push(deliver.registered_delivery);
         pdu.push(deliver.msg_content.len() as u8);
         pdu.extend_from_slice(&deliver.msg_content);
+        pdu.extend_from_slice(&deliver.reserve);
         pdu
     }
 
@@ -590,7 +607,43 @@ mod tests {
 
         assert_eq!(
             header.total_length as usize,
-            PduHeader::SIZE + 8 + 21 + 10 + 1 + 1 + 1 + 21 + 1 + 1 + 0
+            PduHeader::SIZE + 8 + 21 + 10 + 1 + 1 + 1 + 21 + 1 + 1 + 0 + 8
         );
+    }
+
+    #[test]
+    fn deliver_v20_encode_includes_trailing_reserve_8b() {
+        // CMPP 2.0 Deliver 必须带尾部 Reserved(8)；真实网关无条件读取该字段。
+        let mut deliver = DeliverV20::new();
+        deliver.dest_id = "900001".to_string();
+        deliver.src_terminal_id = "13800138000".to_string();
+        deliver.registered_delivery = 1;
+        deliver.msg_content = vec![0xABu8; 60]; // 模拟 60B 回执正文
+        deliver.reserve = [0u8; 8];
+
+        let mut buf = BytesMut::new();
+        encode_pdu_deliver_v20(&mut buf, &deliver).unwrap();
+        // body = 8+21+10+1+1+1+21+1+1+60+8 = 133
+        assert_eq!(buf.len(), 8 + 21 + 10 + 1 + 1 + 1 + 21 + 1 + 1 + 60 + 8);
+        assert_eq!(encoded_size_deliver_v20(&deliver), buf.len());
+        // 最后 8 字节是 reserve
+        assert_eq!(&buf[buf.len() - 8..], &[0u8; 8]);
+    }
+
+    #[test]
+    fn deliver_v20_roundtrip_preserves_reserve() {
+        let mut deliver = DeliverV20::new();
+        deliver.dest_id = "10086".to_string();
+        deliver.src_terminal_id = "13900001111".to_string();
+        deliver.registered_delivery = 0;
+        deliver.msg_content = b"hi".to_vec();
+        deliver.reserve = [1, 2, 3, 4, 5, 6, 7, 8];
+
+        let pdu_bytes = build_deliver_v20_pdu(7, &deliver);
+        let mut cursor = std::io::Cursor::new(pdu_bytes.as_slice());
+        let header = PduHeader::decode(&mut cursor).unwrap();
+        let decoded = decode_deliver_v20(header, &mut cursor).unwrap();
+        assert_eq!(decoded.reserve, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(decoded.msg_content, b"hi");
     }
 }

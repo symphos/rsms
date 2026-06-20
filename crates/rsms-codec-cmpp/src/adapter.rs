@@ -262,8 +262,20 @@ fn cmpp_to_unified(msg: CmppMessage) -> UnifiedMessage {
     }
 }
 
-// ── Encode 方向：UnifiedMessage → CmppMessage(V3.0) → encode_message ──
+// ── Encode 方向：UnifiedMessage → CmppMessage → encode_message ──
+/// 默认按 V3.0 编码（保持 `ProtocolAdapter::encode` trait 行为不变）。
 fn unified_to_cmpp(msg: &UnifiedMessage, seq: Sequence) -> Result<CmppMessage> {
+    unified_to_cmpp_with_version(msg, seq, CmppVersion::V30)
+}
+
+/// 版本感知编码：应答类（SubmitResp/DeliverResp/ConnectResp）与状态报告的字段宽度/
+/// 正文长度在 CMPP 2.0 与 3.0 不同。`version` 决定产 V2.0 还是 V3.0 形态；
+/// Submit/Deliver(MO) 仍按各自 `extra.version` 自决（与原行为一致）。
+fn unified_to_cmpp_with_version(
+    msg: &UnifiedMessage,
+    seq: Sequence,
+    version: CmppVersion,
+) -> Result<CmppMessage> {
     // CMPP 头部序列为单字段 u32；从统一 Sequence 退化取主序列号。
     let seq = seq.as_u32();
     let m = match msg {
@@ -334,13 +346,13 @@ fn unified_to_cmpp(msg: &UnifiedMessage, seq: Sequence) -> Result<CmppMessage> {
                 msg_id[..n].copy_from_slice(&b[..n]);
             }
             CmppMessage::SubmitResp {
-                version: CmppVersion::V30,
+                version,
                 sequence_id: seq,
                 resp: SubmitResp { msg_id, result: r.status },
             }
         }
         UnifiedMessage::DeliverResp => CmppMessage::DeliverResp {
-            version: CmppVersion::V30,
+            version,
             sequence_id: seq,
             // 统一模型 DeliverResp 不携带回执 MsgId，置默认；result=0 表示成功。
             resp: DeliverResp { msg_id: [0u8; 8], result: 0 },
@@ -394,34 +406,58 @@ fn unified_to_cmpp(msg: &UnifiedMessage, seq: Sequence) -> Result<CmppMessage> {
             }
         }
         UnifiedMessage::Report(r) => {
-            // 状态报告下行：以 Deliver(registered_delivery=1) 承载。正文须是 CMPP 3.0 定长二进制
-            // 回执(71B)，否则真实网关(cmos)按定长解析会字段错位（length 119 should be 71）。
-            let mut dl = Deliver::new();
-            dl.registered_delivery = 1;
+            // 状态报告下行：以 Deliver(registered_delivery=1) 承载。正文须是定长二进制回执
+            // （V3.0=71B / V2.0=60B），否则真实网关(cmos)按定长解析会字段错位
+            // （length 119 should be 71）。Dest_terminal_Id 宽度 V3.0=32 / V2.0=21。
             let mut mid = [0u8; 8];
             if let MessageId::Binary(b) = &r.msg_id {
                 let n = b.len().min(8);
                 mid[..n].copy_from_slice(&b[..n]);
             }
-            dl.msg_id = mid;
-            dl.dest_id = r.dest.number.clone();
-            dl.src_terminal_id = r.src.number.clone();
-            // raw 恰为 71B 合规回执（解码后再编码/代理转发）则原样透传；否则从结构化字段
-            // (msg_id + status + 终端号) 合成合规 71B 二进制回执——业务无需手拼定长正文。
-            dl.msg_content = if r.raw.len() == 71 {
-                r.raw.clone()
+            if version == CmppVersion::V20 {
+                let mut dl = DeliverV20::new();
+                dl.registered_delivery = 1;
+                dl.msg_id = mid;
+                dl.dest_id = r.dest.number.clone();
+                dl.src_terminal_id = r.src.number.clone();
+                // raw 恰为 60B 合规回执则原样透传；否则从结构化字段合成 V2.0 定长 60B。
+                dl.msg_content = if r.raw.len() == 60 {
+                    r.raw.clone()
+                } else {
+                    crate::datatypes::CmppReport {
+                        msg_id: mid,
+                        stat: r.status.to_stat_code().to_string(),
+                        submit_time: String::new(),
+                        done_time: String::new(),
+                        dest_terminal_id: r.src.number.clone(),
+                        smsc_sequence: 0,
+                    }
+                    .to_bytes_v20()
+                };
+                CmppMessage::DeliverV20 { sequence_id: seq, deliver: dl }
             } else {
-                crate::datatypes::CmppReport {
-                    msg_id: mid,
-                    stat: r.status.to_stat_code().to_string(),
-                    submit_time: String::new(),
-                    done_time: String::new(),
-                    dest_terminal_id: r.src.number.clone(),
-                    smsc_sequence: 0,
-                }
-                .to_bytes()
-            };
-            CmppMessage::DeliverV30 { sequence_id: seq, deliver: dl }
+                let mut dl = Deliver::new();
+                dl.registered_delivery = 1;
+                dl.msg_id = mid;
+                dl.dest_id = r.dest.number.clone();
+                dl.src_terminal_id = r.src.number.clone();
+                // raw 恰为 71B 合规回执（解码后再编码/代理转发）则原样透传；否则从结构化字段
+                // (msg_id + status + 终端号) 合成合规 71B 二进制回执——业务无需手拼定长正文。
+                dl.msg_content = if r.raw.len() == 71 {
+                    r.raw.clone()
+                } else {
+                    crate::datatypes::CmppReport {
+                        msg_id: mid,
+                        stat: r.status.to_stat_code().to_string(),
+                        submit_time: String::new(),
+                        done_time: String::new(),
+                        dest_terminal_id: r.src.number.clone(),
+                        smsc_sequence: 0,
+                    }
+                    .to_bytes()
+                };
+                CmppMessage::DeliverV30 { sequence_id: seq, deliver: dl }
+            }
         }
         UnifiedMessage::BindResp(r) => {
             // best-effort：统一模型不携带 ISMG 回鉴权，authenticator_ismg 用默认全 0、version 用默认 0。
@@ -467,8 +503,20 @@ impl CmppAdapter {
         frame: &Frame,
         version: CmppVersion,
     ) -> Result<UnifiedMessage> {
-        let msg = decode_message_with_version(frame.data_as_slice(), Some(version as u8))?;
+        let msg = decode_message_with_version(frame.data_as_slice(), Some(version.to_u8()))?;
         Ok(cmpp_to_unified(msg))
+    }
+
+    /// 版本感知编码：trait 的 `encode` 默认按 V3.0；V2.0 连接的回包方应调用本方法传入
+    /// `CmppVersion::V20`，以产出 V2.0 应答（Result/Status 1 字节）与 V2.0 状态报告正文（60B）。
+    pub fn encode_with_version(
+        &self,
+        msg: &UnifiedMessage,
+        seq: Sequence,
+        version: CmppVersion,
+    ) -> Result<Vec<u8>> {
+        let cmpp = unified_to_cmpp_with_version(msg, seq, version)?;
+        encode_message(&cmpp)
     }
 }
 
@@ -767,6 +815,50 @@ mod tests {
         }
         let reencoded = CmppAdapter.encode(&unified, Sequence::Plain(7)).unwrap();
         assert_eq!(reencoded, bytes, "V2.0 Submit 经统一模型往返字节应无损一致");
+    }
+
+    #[test]
+    fn report_encode_with_version_v20_is_60b() {
+        // V2.0 状态报告：encode_with_version(V20) 产 DeliverV20，正文定长 60B
+        // （Dest_terminal_Id 21B，对比 V3.0 的 71B/Dest 32B）。
+        let report = UnifiedMessage::Report(UnifiedReport {
+            msg_id: MessageId::Binary(vec![1, 2, 3, 4, 5, 6, 7, 8]),
+            status: DeliveryStatus::Delivered,
+            src: Address::plain("13800138000"),
+            dest: Address::plain("900001"),
+            raw: b"non-60b free text".to_vec(), // 非 60B → 触发合成
+        });
+        let bytes = CmppAdapter
+            .encode_with_version(&report, Sequence::Plain(1), CmppVersion::V20)
+            .unwrap();
+        // 版本感知 decode 回来应是 Report，且原始正文长度 60。
+        let decoded = CmppAdapter
+            .decode_with_version(&frame_of(bytes.clone()), CmppVersion::V20)
+            .unwrap();
+        match decoded {
+            UnifiedMessage::Report(r) => {
+                assert_eq!(r.msg_id, MessageId::Binary(vec![1, 2, 3, 4, 5, 6, 7, 8]));
+                assert_eq!(r.status, DeliveryStatus::Delivered);
+                assert_eq!(r.raw.len(), 60, "V2.0 报告正文应为定长 60B");
+            }
+            other => panic!("expected Report, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submit_resp_encode_with_version_v20_is_21b() {
+        // V2.0 SubmitResp：encode_with_version(V20) 产总长 21B（9B body）。
+        let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+            msg_id: MessageId::Binary(vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]),
+            status: 0,
+        });
+        let bytes = CmppAdapter
+            .encode_with_version(&resp, Sequence::Plain(7), CmppVersion::V20)
+            .unwrap();
+        assert_eq!(bytes.len(), 21, "V2.0 SubmitResp 总长应为 21B");
+        // 对比：默认 encode（V3.0）应为 24B。
+        let v30 = CmppAdapter.encode(&resp, Sequence::Plain(7)).unwrap();
+        assert_eq!(v30.len(), 24, "V3.0 SubmitResp 总长应为 24B（回归）");
     }
 
     #[test]
