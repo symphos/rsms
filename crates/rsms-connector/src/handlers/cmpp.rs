@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use bytes::BytesMut;
 use rsms_codec_cmpp::{
-    CmppMessage, CommandId, CommandStatus, ConnectResp, Encodable,
+    CmppMessage, CmppVersion, CommandId, CommandStatus, ConnectResp, Encodable,
     decode_message_with_version, encode_message,
 };
 use rsms_core::{Frame, Result};
@@ -12,7 +12,6 @@ use crate::protocol::{
     RESPONSE_COMMAND_MASK,
 };
 
-const CMPP_VERSION_2_0: u8 = 0x20;
 const CMPP_VERSION_3_0: u8 = 0x30;
 
 fn encode_pdu_header(command_id: CommandId, sequence_id: u32, body_len: usize) -> Vec<u8> {
@@ -36,13 +35,16 @@ fn encode_error_response(command_id: u32, sequence_id: u32, status: CommandStatu
     pdu
 }
 
+/// 握手版本字节是否受支持：已知 CMPP 版本（经 `CmppVersion::from_wire` 判定，含 2.0 的
+/// 历史标注 0x00/0x01）或通配 0x7F。版本字节集的唯一来源是 `CmppVersion::from_wire`。
 fn is_version_supported(version: u8) -> bool {
-    matches!(version, CMPP_VERSION_2_0 | CMPP_VERSION_3_0 | 0x00 | 0x01 | 0x7F)
+    CmppVersion::from_wire(version).is_ok() || version == 0x7F
 }
 
 /// CMPP 2.0 形态判定：2.0 及历史上以 0x00/0x01 标注的 2.0 实现，应答/回执按 V2.0 窄字段编码。
+/// 直接复用 `CmppVersion::from_wire` 的版本分类，不再自带平行的字节匹配。
 fn is_cmpp_v2(version: u8) -> bool {
-    matches!(version, CMPP_VERSION_2_0 | 0x00 | 0x01)
+    CmppVersion::from_wire(version).map(|v| v.is_v20()).unwrap_or(false)
 }
 
 /// 构造并发送 CMPP ConnectResp（version-unsupported 与三种认证结果共用）。
