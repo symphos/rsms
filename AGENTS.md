@@ -158,9 +158,9 @@
 
 ### R2. 版本表示统一 ✅ 已收口（重新界定范围）
 > **复核结论：原计划「让 `CmppVersion` 贯穿全链路、改 `ProtocolConnection` trait 签名」不应做。** `protocol_version()/set_protocol_version(u8)` 是四协议**共用**的泛型 API（**SMPP 也用它存 interface_version 0x34/0x50**，见 `handlers/smpp.rs`），定义在 `rsms-business`，**不能反向依赖 CMPP 专属的 `CmppVersion`**（否则破坏分层、拖累 SMPP/SMGP）。那个 `u8` 是正确的「跨协议线路版本字节」窄腰，保留。
-> **真正残余已收口**：`handlers/cmpp.rs` 的 `is_cmpp_v2` / `is_version_supported` 改为复用 `CmppVersion::from_wire`（版本字节集 0x20/0x00/0x01/0x30 的**唯一来源**），删除平行的 `matches!` 与冗余常量 `CMPP_VERSION_2_0`。CMPP codec 内部本就已用 `CmppVersion` enum，无散落裸字节。（分支 `refactor/cmpp-version-classify-consolidate`）
+> **真正残余已收口**：`handlers/cmpp.rs` 的 `is_cmpp_v2` / `is_version_supported` 改为复用 `CmppVersion::from_wire`（版本字节集 0x20/0x00/0x01/0x30 的**唯一来源**），删除平行的 `matches!` 与冗余常量 `CMPP_VERSION_2_0`。CMPP codec 内部本就已用 `CmppVersion` enum，无散落裸字节。（PR #19）
 
-### R3. `encode_message` V2.0 手写路径下沉 ✅ 已完成（分支 `refactor/cmpp-v20-resp-encodable`）
+### R3. `encode_message` V2.0 手写路径下沉 ✅ 已完成（PR #18）
 > **复核发现**：`SubmitRespV20`/`DeliverRespV20`/`ConnectRespV20` 类型早已存在（有 `BODY_SIZE` + `Decodable` + `From`→收敛到共享 `Pdu::*Resp`），**唯独缺 `Encodable`**——这正是 `encode_message` 不得不手写 V2.0 应答字节的根因，是 `Decodable`/`Encodable` 的真实不对称。
 > **已做**：补三者的 `Encodable`（与 decode 对称，字节宽度知识入数据类型层）；`encode_message` 的手写早 return + 本地 `write_header` 改为泛型 `encode_v20_pdu` 委托。先补 DeliverResp V20 表征测试（Submit/Connect 已有），重构后三条 V2.0 应答字节级测试逐字节不变、codec-cmpp 72 passed、cmpp-integration 20 passed、clippy 零警告。
 > **未做（按设计）**：不新增 `Pdu::*RespV20` 变体——应答类型按既有设计 decode 后收敛到共享 `Pdu::*Resp`，加 encode-only 变体会破坏该对称，故 encode 直接走类型的 `Encodable`。
