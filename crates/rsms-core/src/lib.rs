@@ -15,7 +15,7 @@ pub use connection_info::ConnectionInfo;
 pub use cstring::{decode_cstring, encode_cstring, CstringError};
 pub use encoded_pdu::{EncodedPdu, RawPdu};
 pub use endpoint::EndpointConfig;
-pub use error::{Result, RsmsError};
+pub use error::{ErrorKind, Result, RsmsError};
 pub use frame::Frame;
 pub use id_generator::IdGenerator;
 pub use metrics::{Metrics, NoopMetrics};
