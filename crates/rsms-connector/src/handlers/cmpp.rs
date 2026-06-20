@@ -40,6 +40,11 @@ fn is_version_supported(version: u8) -> bool {
     matches!(version, CMPP_VERSION_2_0 | CMPP_VERSION_3_0 | 0x00 | 0x01 | 0x7F)
 }
 
+/// CMPP 2.0 形态判定：2.0 及历史上以 0x00/0x01 标注的 2.0 实现，应答/回执按 V2.0 窄字段编码。
+fn is_cmpp_v2(version: u8) -> bool {
+    matches!(version, CMPP_VERSION_2_0 | 0x00 | 0x01)
+}
+
 /// 构造并发送 CMPP ConnectResp（version-unsupported 与三种认证结果共用）。
 async fn send_connect_resp(
     conn: &Arc<dyn ProtocolConnection>,
@@ -49,7 +54,7 @@ async fn send_connect_resp(
 ) -> Result<()> {
     // CMPP 2.0 的 ConnectResp Status 仅 1 字节（body=1+16+1=18B），与 V3.0 的 Status u32
     // （body=4+16+1=21B）不同。V2.0（0x20/0x00/0x01）手写 18B body；否则走 V3.0 codec。
-    let is_v2 = matches!(version, CMPP_VERSION_2_0 | 0x00 | 0x01);
+    let is_v2 = is_cmpp_v2(version);
     if is_v2 {
         let body_len = 1 + 16 + 1;
         let mut pdu = encode_pdu_header(CommandId::ConnectResp, sequence_id, body_len);
@@ -123,7 +128,7 @@ impl crate::protocol::ProtocolHandler for CmppHandler {
                 
                 conn.set_protocol_version(c.version).await;
                 
-                let is_v2 = matches!(c.version, CMPP_VERSION_2_0 | 0x00 | 0x01);
+                let is_v2 = is_cmpp_v2(c.version);
                 tracing::info!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "CMPP版本: {} (V2.0={})", c.version, is_v2);
                 
                 let credentials = AuthCredentials::Cmpp {
