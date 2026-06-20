@@ -29,7 +29,8 @@ use tracing::{error, info, instrument};
 
 use crate::protocol::{ClientEventHandler, FrameDecoder, MessageItem, MessageSource, ProtocolConnection, SubmitLimiter};
 use crate::pool::AccountConnections;
-use crate::transaction::{MessageCallback, TransactionManager, drive_inbound, register_outbound};
+use crate::transaction::{MessageCallback, TransactionManager, drain_pending, drive_inbound, register_outbound};
+use tokio::task::JoinHandle;
 
 /// ResponseFuture - 用于等待服务端响应的 Future
 /// 封装 oneshot::Receiver，实现 Future trait
@@ -219,6 +220,11 @@ pub struct ClientConnection {
     /// 交付链路管理器。设置 `MessageCallback` 时由 `ClientBuilder` 注入并自动驱动
     /// （读循环按帧分发 Resp/Report/MO，发侧登记 Submit）；未设置时为 `None`，相关路径零成本。
     tm: Option<Arc<TransactionManager>>,
+    /// 是否允许出站 fetcher 取新消息。优雅停机第一步置 false（先停发、后停收），
+    /// 与 `ready` 区分：停发后读循环仍在跑，以便在途 Resp 继续回来被 drain 等到。
+    sending: AtomicBool,
+    /// 本连接派生的后台 task 句柄（读循环 / keepalive / 出站 fetcher），供 `shutdown` 收尾 await。
+    tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl ClientConnection {
@@ -247,12 +253,50 @@ impl ClientConnection {
             account_connections: Mutex::new(None),
             remote_addr,
             tm,
+            sending: AtomicBool::new(true),
+            tasks: Mutex::new(Vec::new()),
         })
     }
 
     /// 交付链路管理器（设置了 `MessageCallback` 时存在）。
     pub fn delivery_manager(&self) -> Option<&Arc<TransactionManager>> {
         self.tm.as_ref()
+    }
+
+    /// 出站 fetcher 是否仍允许取新消息（优雅停机第一步置 false）。
+    pub fn is_sending(&self) -> bool {
+        self.sending.load(Ordering::Acquire)
+    }
+
+    /// 停止出站发送（不影响读循环，让在途 Resp 继续回来）。
+    pub fn stop_sending(&self) {
+        self.sending.store(false, Ordering::Release);
+    }
+
+    /// 登记一个后台 task 句柄，供 `shutdown` 收尾等待。
+    pub async fn register_task(&self, handle: JoinHandle<()>) {
+        self.tasks.lock().await.push(handle);
+    }
+
+    /// 优雅停机（零丢）：① 停出站发送 → ② 等在途 Submit 的 Resp 追平（有交付链路时，
+    /// 上限 `timeout`）→ ③ 断连（停读循环/keepalive、令在途 send_request 失败）→
+    /// ④ 等待后台 task 退出（每个上限 3s，keepalive 等慢则脱离，不阻塞收尾）。
+    pub async fn shutdown(&self, timeout: Duration) {
+        self.stop_sending();
+
+        if let Some(tm) = &self.tm
+            && !drain_pending(tm, timeout).await
+        {
+            tracing::warn!(conn_id = self.id, "shutdown drain 超时：仍有在途 Submit 未收到 Resp");
+        }
+
+        self.mark_disconnected().await;
+
+        let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *self.tasks.lock().await);
+        for h in handles {
+            let _ = tokio::time::timeout(Duration::from_secs(3), h).await;
+        }
+        info!(conn_id = self.id, "client connection shutdown complete");
     }
 
     pub async fn set_event_tx(&self, tx: mpsc::Sender<ConnectionEvent>) {
@@ -637,23 +681,26 @@ impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
 
     metrics.connection_opened();
     let metrics_for_read = Arc::clone(&metrics);
-    tokio::spawn(async move {
+    let read_handle = tokio::spawn(async move {
         run_client_read_loop(conn_clone, client_handler_clone, Arc::clone(&decoder), event_handler, metrics_for_read).await;
     });
+    conn.register_task(read_handle).await;
 
     // 启动 keepalive 任务
     let protocol = endpoint.protocol;
     let idle_timeout = endpoint.idle_time_sec as u32;
-    start_keepalive_task(Arc::clone(&conn), protocol, idle_timeout);
+    let keepalive_handle = start_keepalive_task(Arc::clone(&conn), protocol, idle_timeout);
+    conn.register_task(keepalive_handle).await;
 
     conn.mark_connected().await;
     info!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "connection established");
 
     if let Some(source) = message_source {
         let conn_clone = Arc::clone(&conn);
-        tokio::spawn(async move {
+        let fetch_handle = tokio::spawn(async move {
             run_outbound_fetcher(conn_clone, source, metrics).await;
         });
+        conn.register_task(fetch_handle).await;
     }
 
     Ok(conn)
@@ -701,23 +748,26 @@ pub(crate) async fn connect_with_pool(
     // ClientPool 管理的连接本期不接指标(用 Noop);池侧指标留作后续小增量。
     let metrics: Arc<dyn Metrics> = Arc::new(NoopMetrics);
     let metrics_for_read = Arc::clone(&metrics);
-    tokio::spawn(async move {
+    let read_handle = tokio::spawn(async move {
         run_client_read_loop(conn_clone, client_handler_clone, decoder, event_handler, metrics_for_read).await;
     });
+    conn.register_task(read_handle).await;
 
     // 启动 keepalive 任务
     let protocol = endpoint.protocol;
     let idle_timeout = endpoint.idle_time_sec as u32;
-    start_keepalive_task(Arc::clone(&conn), protocol, idle_timeout);
+    let keepalive_handle = start_keepalive_task(Arc::clone(&conn), protocol, idle_timeout);
+    conn.register_task(keepalive_handle).await;
 
     conn.mark_connected().await;
     info!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "connection established");
 
     if let Some(source) = message_source {
         let conn_clone = Arc::clone(&conn);
-        tokio::spawn(async move {
+        let fetch_handle = tokio::spawn(async move {
             run_outbound_fetcher(conn_clone, source, metrics).await;
         });
+        conn.register_task(fetch_handle).await;
     }
 
     Ok(conn)
@@ -877,7 +927,7 @@ async fn run_outbound_fetcher(
     metrics: Arc<dyn Metrics>,
 ) {
     loop {
-        if !conn.ready_for_fetch() {
+        if !conn.ready_for_fetch() || !conn.is_sending() {
             break;
         }
 
@@ -942,19 +992,26 @@ async fn run_outbound_fetcher(
     info!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "outbound fetcher stopped");
 }
 
-/// 启动客户端 keepalive 任务
-fn start_keepalive_task(conn: Arc<ClientConnection>, protocol: Protocol, idle_timeout: u32) {
+/// 启动客户端 keepalive 任务，返回 JoinHandle 供优雅停机收尾。
+///
+/// 检查节奏取 `min(keepalive_interval, 1s)`（下限 100ms 防零时长 panic），
+/// 据 `last_sent_elapsed >= keepalive_interval` 决定是否真正发心跳——既保留发送时序，
+/// 又能在 `mark_disconnected`（ready=false）后 ≤1s 内退出，不拖慢 `shutdown` 的 task await。
+fn start_keepalive_task(conn: Arc<ClientConnection>, protocol: Protocol, idle_timeout: u32) -> JoinHandle<()> {
     let keepalive_interval = Duration::from_secs(idle_timeout as u64 / 2);
+    let check_interval = keepalive_interval
+        .min(Duration::from_secs(1))
+        .max(Duration::from_millis(100));
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(keepalive_interval);
-        
+        let mut interval = tokio::time::interval(check_interval);
+
         loop {
             interval.tick().await;
-            
+
             if !conn.ready_for_fetch() {
                 break;
             }
-            
+
             let elapsed = conn.last_sent_elapsed();
             if elapsed >= keepalive_interval {
                 if let Err(e) = send_keepalive_packet(&conn, protocol).await {
@@ -964,9 +1021,9 @@ fn start_keepalive_task(conn: Arc<ClientConnection>, protocol: Protocol, idle_ti
                 }
             }
         }
-        
+
         info!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "keepalive task stopped");
-    });
+    })
 }
 
 /// 发送保活报文

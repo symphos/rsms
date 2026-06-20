@@ -5,6 +5,8 @@
 //! 仅在连接配置了 TM（即用户设置了 `MessageCallback`）时调用；未启用时这两个函数不会被触及，
 //! 因此对“不关心交付结果”的高吞吐路径零成本。
 
+use std::time::{Duration, Instant};
+
 use rsms_codec_cmpp::CommandId as CmppCommandId;
 use rsms_codec_sgip::CommandId as SgipCommandId;
 use rsms_codec_smgp::CommandId as SmgpCommandId;
@@ -96,6 +98,22 @@ pub(crate) async fn register_outbound(tm: &TransactionManager, protocol: Protoco
     ))
     .await;
     true
+}
+
+/// 优雅停机 drain 原语：轮询等待 TM 在途 Submit（Pending，即已发未收 Resp）降为 0。
+/// 返回 `true` 表示已全部收到 Resp；`false` 表示在 `timeout` 内未追平（超时）。
+/// 客户端停机时先停发、再调用本函数等在途 Resp 追平，最后才断连，实现零丢。
+pub(crate) async fn drain_pending(tm: &TransactionManager, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if tm.pending_count().await == 0 {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[cfg(test)]
@@ -217,6 +235,30 @@ mod tests {
         drive_inbound(&tm, Protocol::Cmpp, &frame_of(report)).await;
         assert_eq!(spy.reports.load(Ordering::Relaxed), 1, "Report 应按 msg_id 关联到原 Submit");
         assert_eq!(tm.transaction_count().await, 0, "报告匹配后应清理事务条目");
+    }
+
+    /// drain：有未收 Resp 的在途 Submit 时超时返回 false；收到 Resp 追平后快速返回 true。
+    #[tokio::test]
+    async fn drain_pending_times_out_then_drains() {
+        let tm = TransactionManager::new(10);
+        register_outbound(&tm, Protocol::Cmpp, &cmpp_submit(7)).await; // pending=1
+        assert!(
+            !drain_pending(&tm, Duration::from_millis(80)).await,
+            "未收 Resp 时应超时返回 false"
+        );
+
+        let resp = cmpp_encode(
+            &UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                msg_id: MessageId::Binary(MID.to_vec()),
+                status: 0,
+            }),
+            7,
+        );
+        drive_inbound(&tm, Protocol::Cmpp, &frame_of(resp)).await; // pending=0
+        assert!(
+            drain_pending(&tm, Duration::from_millis(200)).await,
+            "Resp 追平后应返回 true"
+        );
     }
 
     /// 收侧：status!=0 的 SubmitResp 应走 error 回调。
