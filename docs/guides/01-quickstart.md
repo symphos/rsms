@@ -94,6 +94,33 @@ account_pool.update_config("900001", AccountConfig::new()
 ).await?;
 ```
 
+### IdGenerator —— 账号维度的 ID 生成
+
+框架按**账号**生成 `msg_id` 与 `sequence_id`：`AccountConnections` 各持一个独立的
+`IdGenerator`（默认 `SimpleIdGenerator`，原子单调自增），账号之间物理隔离、互不串号；
+同账号的多条连接**共用同一实例**（保证账号内不重复）。
+
+```rust
+pub trait IdGenerator: Send + Sync {
+    fn next_msg_id(&self) -> u64;       // 8B MsgId（服务端出站 MO/回执用）
+    fn next_sequence_id(&self) -> u32;  // 4B 协议请求序号
+}
+```
+
+- **服务端**业务侧经 `InboundContext.id_generator`（`Option<Arc<dyn IdGenerator>>`，鉴权后才有值）获取；
+- 也可由 `account_connections.id_generator()` 取该账号的实例。
+
+**sequence_id 契约（重要）**：`send_request` 的 sequence_id 直接取自你构造的 PDU 头（框架不代生成）。
+请求/响应匹配的滑动窗口按连接隔离，但**交付回调链路的 `TransactionManager` 按账号共享、以 sequence_id
+为键**——因此**同账号多连接时 sequence_id 必须账号内唯一**，否则会互相覆盖事务、导致回执/回调错配。
+最简做法：所有连接都用该账号共享的生成器取值：
+
+```rust
+let seq = account_connections.id_generator().next_sequence_id();
+```
+
+> 长短信的 reference 唯一性与入站合包的发送方分桶，另见 [长短信处理 · 拼接正确性与串号防护](03-longmessage.md#拼接正确性与串号防护)。
+
 ### BusinessHandler
 
 服务端业务处理器。框架在协议层解析完成后调用 `on_inbound`。
