@@ -436,6 +436,13 @@ impl ClientConnection {
     /// Returns error if window is full or rate limited
     /// Timeout is configured globally via `EndpointConfig.timeout`
     /// Returns a ResponseFuture that resolves to the response PDU
+    ///
+    /// **sequence_id 契约**：sequence_id 直接从你构造的 PDU 头读取（框架不代生成）。
+    /// 滑动窗口按连接隔离，故同步响应匹配天然不串；但**交付回调链路的 `TransactionManager`
+    /// 是按账号共享、以 sequence_id 为键**。因此**同账号多连接场景下，sequence_id 必须在账号内唯一**，
+    /// 否则两条连接用相同 sequence 会在 TM 里互相覆盖、导致回执/回调错配。
+    /// 推荐用账号共享的生成器取值：`account_connections.id_generator().next_sequence_id()`
+    /// （同账号多连接共用同一实例，原子单调，天然账号内唯一）。
     pub async fn send_request<P: Into<RawPdu>>(&self, pdu: P) -> Result<ResponseFuture> {
         let pdu = pdu.into();
         let pdu_slice = pdu.as_bytes_ref();

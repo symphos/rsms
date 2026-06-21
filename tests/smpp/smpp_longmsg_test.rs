@@ -312,7 +312,7 @@ fn merge_segments(segments: &[Vec<u8>]) -> Vec<u8> {
             (0, 1, 1)
         };
         let frame = LongMessageFrame::new(ref_id, total, number, seg.clone(), has_udhi, None);
-        if let Ok(Some(merged)) = merger.add_frame(frame) {
+        if let Ok(Some(merged)) = merger.add_frame("s", frame) {
             result = Some(merged);
         }
     }
@@ -401,7 +401,7 @@ async fn test_longmsg_mt_split_and_merge() {
 
     let mut merger = LongMessageMerger::new();
     for frame in &frames {
-        let result = merger.add_frame(frame.clone()).expect("add_frame 失败");
+        let result = merger.add_frame("s", frame.clone()).expect("add_frame 失败");
         if frame.segment_number == frame.total_segments {
             assert!(result.is_some(), "最后一个分段后应该得到完整消息");
             assert_eq!(result.unwrap(), original, "合包后的消息应与原始消息一致");
@@ -440,15 +440,15 @@ async fn test_longmsg_ascii_split() {
 
     let mut merger = LongMessageMerger::new();
     for frame in &frames {
-        merger.add_frame(frame.clone()).expect("add_frame 失败");
+        merger.add_frame("s", frame.clone()).expect("add_frame 失败");
     }
-    let result = merger.add_frame(frames.last().unwrap().clone()).expect("重复 add_frame");
+    let result = merger.add_frame("s", frames.last().unwrap().clone()).expect("重复 add_frame");
     assert!(result.is_none(), "重复分段应返回None");
 
     let mut merger2 = LongMessageMerger::new();
     let mut final_result = None;
     for frame in &frames {
-        if let Ok(Some(merged)) = merger2.add_frame(frame.clone()) {
+        if let Ok(Some(merged)) = merger2.add_frame("s", frame.clone()) {
             final_result = Some(merged);
         }
     }

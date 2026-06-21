@@ -13,7 +13,7 @@ Rust 多协议短信消息中间件框架，支持 **CMPP 2.0/3.0**、**SMGP 3.0
 - **结构化日志** — 所有连接日志自动携带 `remote_ip`/`remote_port`，支持按端点配置日志级别
 - **动态调整** — 运行时动态调整连接数上限和 QPS，自动剔除多余连接（发送协议层 Close Packet）
 - **长短信** — 内置长短信拆分/合包（`rsms-longmsg`），支持 8-bit 和 16-bit UDH
-- **账号隔离** — `AccountPool` 按账号独立管理连接、限流、配置
+- **账号隔离** — `AccountPool` 按账号独立管理连接、限流、配置；`msg_id`/`sequence_id` 经**每账号独立的 `IdGenerator`** 生成，账号间不串号
 - **消息队列** — `MessageSource` trait 按账号隔离，业务方自己管理内存队列
 
 ## 快速开始

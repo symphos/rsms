@@ -78,7 +78,8 @@ impl LongMessageMerger {
         self.last_cleanup = Instant::now();
     }
 
-    /// 向合并器提交一个长短信分段帧。
+    /// 向合并器提交一个长短信分段帧。`sender` 为发送方标识（入站 MO 即原始终端号），
+    /// 用于按发送方分桶，避免不同发送方 reference 撞号时串合/丢段。
     ///
     /// - 若该帧是单段消息（`total_segments == 1` 且无 UDH），直接返回 `Ok(Some(content))`。
     /// - 若该帧是重复帧（已收到过相同分段编号），返回 `Ok(None)`。
@@ -86,14 +87,21 @@ impl LongMessageMerger {
     /// - 否则缓存该帧，返回 `Ok(None)`，等待后续分段到达。
     ///
     /// 每次调用会检查并惰性触发超时分组的清理（间隔 >= TTL 时触发）。
-    pub fn add_frame(&mut self, frame: LongMessageFrame) -> Result<Option<Vec<u8>>, RsmsError> {
+    pub fn add_frame(
+        &mut self,
+        sender: &str,
+        frame: LongMessageFrame,
+    ) -> Result<Option<Vec<u8>>, RsmsError> {
         // 惰性清理：距上次清理超过 ttl 即回收过期未完成分片，避免永不收齐的分片无界堆积导致 OOM。
         // 与框架「不缓存 MsgId 避免 OOM」的设计哲学一致——merger 同样必须有界。
         if self.last_cleanup.elapsed() >= self.ttl {
             self.cleanup_expired();
         }
 
-        let key = frame.unique_id();
+        // 分组键带上发送方：reference 仅 16-bit、且各发送方各自从小值起，撞号现实存在。
+        // 仅按 (reference, total) 分组会把不同发送方的同号分段串入同一组（拼接错乱/丢段）。
+        // 用 \u{1f}(单元分隔符) 分隔，避免发送方串与 unique_id 拼接产生歧义。
+        let key = format!("{sender}\u{1f}{}", frame.unique_id());
 
         if frame.total_segments == 1 && !frame.has_udhi {
             return Ok(Some(frame.content));
@@ -168,7 +176,7 @@ mod tests {
     fn cleanup_expired_removes_stale_incomplete_entries() {
         let frames = multi_segment_frames(300, b'X');
         let mut merger = LongMessageMerger::with_ttl(Duration::from_millis(30));
-        assert!(merger.add_frame(frames[0].clone()).unwrap().is_none());
+        assert!(merger.add_frame("s", frames[0].clone()).unwrap().is_none());
         assert_eq!(merger.pending_count(), 1);
         sleep(Duration::from_millis(60));
         merger.cleanup_expired();
@@ -181,10 +189,10 @@ mod tests {
         let a = multi_segment_frames(300, b'X');
         let b = multi_segment_frames(900, b'Y');
         let mut merger = LongMessageMerger::with_ttl(Duration::from_millis(30));
-        merger.add_frame(a[0].clone()).unwrap(); // 不完整，留在 pending
+        merger.add_frame("s", a[0].clone()).unwrap(); // 不完整，留在 pending
         assert_eq!(merger.pending_count(), 1);
         sleep(Duration::from_millis(60)); // 超过 ttl
-        merger.add_frame(b[0].clone()).unwrap(); // 应触发惰性清理 + 加入新 entry
+        merger.add_frame("s", b[0].clone()).unwrap(); // 应触发惰性清理 + 加入新 entry
         assert_eq!(
             merger.pending_count(),
             1,
