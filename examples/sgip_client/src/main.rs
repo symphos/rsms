@@ -21,10 +21,10 @@
 // ============================================================================
 
 use async_trait::async_trait;
+use rsms_business::{MessageContext, MessageHandler};
 use rsms_codec_sgip::adapter::SgipAdapter;
-use rsms_connector::client::{ClientContext, ClientHandler};
-use rsms_connector::{ClientBuilder, MessageItem, MessageSource, SgipDecoder};
-use rsms_core::{EncodedPdu, EndpointConfig, Frame, Protocol, RawPdu, Result};
+use rsms_connector::{ClientBuilder, MessageItem, MessageSource, NoopClientHandler, SgipDecoder};
+use rsms_core::{EncodedPdu, EndpointConfig, Protocol, RawPdu, Result};
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
 use rsms_model::{
@@ -321,21 +321,14 @@ impl SgipClientHandler {
 }
 
 #[async_trait]
-impl ClientHandler for SgipClientHandler {
+impl MessageHandler for SgipClientHandler {
     fn name(&self) -> &'static str {
         "sgip-client"
     }
 
-    async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        let unified = match SgipAdapter.decode(frame) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("解码失败 cmd_id=0x{:08x}: {}", frame.command_id, e);
-                return Ok(());
-            }
-        };
-
-        match unified {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 框架已按协议解码为统一消息，业务直接按枚举分支处理，无需手调 SgipAdapter.decode。
+        match msg {
             UnifiedMessage::BindResp(resp) => {
                 if resp.status == 0 {
                     tracing::info!("SGIP 认证成功");
@@ -356,31 +349,25 @@ impl ClientHandler for SgipClientHandler {
                     report.dest.number,
                     report.status
                 );
-                reply_report_resp(ctx, frame).await?;
+                // delta-1：独立 Report 命令回 ReportResp；ctx.reply 内部回显 12B 复合序列（delta-2）。
+                ctx.reply(UnifiedMessage::ReportResp).await?;
             }
             UnifiedMessage::Deliver(deliver) => {
-                reply_deliver_resp(ctx, frame).await?;
+                // MO-Deliver 回 DeliverResp；ctx.reply 内部回显 12B 复合序列（delta-2）。
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
                 // 传入 deliver.encoding，handle_mo 按编码正确解码显示内容
-                self.handle_mo(&deliver.dest.number, deliver.concat.as_ref(), deliver.content, deliver.encoding);
+                self.handle_mo(
+                    &deliver.dest.number,
+                    deliver.concat.as_ref(),
+                    deliver.content.clone(),
+                    deliver.encoding,
+                );
             }
             UnifiedMessage::UnbindResp => tracing::debug!("收到 UnbindResp"),
             other => tracing::warn!("收到未处理统一消息: {:?}", other),
         }
         Ok(())
     }
-}
-
-/// 回 ReportResp（SGIP 独立 Report 命令的应答）。
-/// sequence_of(frame) 自动解 12B 复合序列，回显请求序列（不手剥 data[8..20]）。
-async fn reply_report_resp(ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-    let bytes = SgipAdapter.encode(&UnifiedMessage::ReportResp, SgipAdapter.sequence_of(frame))?;
-    ctx.conn.write_frame(&bytes).await
-}
-
-/// 回 DeliverResp（MO-Deliver 的应答，经 adapter 编码，sequence_of 自动回显请求序列）。
-async fn reply_deliver_resp(ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-    let bytes = SgipAdapter.encode(&UnifiedMessage::DeliverResp, SgipAdapter.sequence_of(frame))?;
-    ctx.conn.write_frame(&bytes).await
 }
 
 /// 生成 SGIP 时间戳（MMDDHHMMSS 压缩格式，复合序列的 timestamp 分量）。
@@ -441,7 +428,8 @@ async fn main() -> Result<()> {
 
     tracing::info!("正在连接 SGIP 服务端 {}...", SERVER_ADDR);
 
-    let conn = ClientBuilder::new(endpoint, handler, SgipDecoder)
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SgipDecoder)
+        .with_message_handler(handler)
         .message_source(msg_source as Arc<dyn MessageSource>)
         .connect()
         .await?;

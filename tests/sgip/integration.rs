@@ -1,10 +1,8 @@
-use rsms_connector::{ServerBuilder, SgipDecoder};
-use rsms_connector::client::ClientHandler;
+use rsms_connector::{ServerBuilder, SgipDecoder, NoopClientHandler};
 use rsms_connector::{AuthHandler, AuthCredentials, AuthResult, ServerEventHandler, AccountConfigProvider};
 use rsms_test_common::{TestEventHandler, TestClientEventHandler, MockAccountConfigProvider};
-use rsms_business::BusinessHandler;
-use rsms_business::InboundContext;
-use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Frame, Result};
+use rsms_business::{MessageContext, MessageHandler};
+use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Result};
 // 窄腰统一模型：业务/客户端不再直接接触 SGIP 裸 codec，统一走 SgipAdapter + UnifiedMessage。
 use rsms_codec_sgip::adapter::SgipAdapter;
 use rsms_model::{
@@ -123,41 +121,39 @@ impl TestBusinessHandler {
 }
 
 #[async_trait]
-impl BusinessHandler for TestBusinessHandler {
+impl MessageHandler for TestBusinessHandler {
     fn name(&self) -> &'static str {
         "sgip-test-biz"
     }
 
-    async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        // 统一模型解码：裸 decode_message + 手剥字节全部由 SgipAdapter 吸收。
-        if let Ok(unified) = SgipAdapter.decode(frame) {
-            match unified {
-                UnifiedMessage::Submit(s) => {
-                    self.submit_count.fetch_add(1, Ordering::Relaxed);
-                    let content = String::from_utf8_lossy(&s.content).to_string();
-                    self.messages.lock().unwrap().push(content);
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 框架已按协议解码为统一消息，直接 match，无需手调 SgipAdapter.decode。
+        match msg {
+            UnifiedMessage::Submit(s) => {
+                self.submit_count.fetch_add(1, Ordering::Relaxed);
+                let content = String::from_utf8_lossy(&s.content).to_string();
+                self.messages.lock().unwrap().push(content);
 
-                    // 回 SubmitResp：SGIP 无 msg_id，msg_id 给空 Text；序列用 sequence_of 回显请求复合序列。
-                    let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
-                        msg_id: MessageId::Text(String::new()),
-                        status: 0,
-                    });
-                    let resp_bytes = SgipAdapter.encode(&resp, SgipAdapter.sequence_of(frame))?;
-                    ctx.conn.write_frame(resp_bytes.as_slice()).await?;
-                }
-                UnifiedMessage::Deliver(d) => {
-                    // 状态报告（旧版以 "id:" 文本承载在 Deliver 里）与普通 MO 区分语义保持不变。
-                    if d.content.len() > 20 && String::from_utf8_lossy(&d.content).contains("id:") {
-                        self.reports.lock().unwrap().push(String::from_utf8_lossy(&d.content).to_string());
-                    } else {
-                        self.mo_messages.lock().unwrap().push((
-                            d.dest.number.clone(),
-                            String::from_utf8_lossy(&d.content).to_string(),
-                        ));
-                    }
-                }
-                _ => {}
+                // 回 SubmitResp（delta-4）：SGIP 无 msg_id，msg_id 给空 Text；
+                // ctx.reply 内部回显 12B 复合序列（delta-2 已验证）。
+                ctx.reply(UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                    msg_id: MessageId::Text(String::new()),
+                    status: 0,
+                })).await?;
             }
+            UnifiedMessage::Deliver(d) => {
+                // delta-5：集成测试里状态报告以 "id:" 文本承载在 Deliver 里（历史约定），
+                // 保持现有 match 语义——不改成 Report/ReportResp。
+                if d.content.len() > 20 && String::from_utf8_lossy(&d.content).contains("id:") {
+                    self.reports.lock().unwrap().push(String::from_utf8_lossy(&d.content).to_string());
+                } else {
+                    self.mo_messages.lock().unwrap().push((
+                        d.dest.number.clone(),
+                        String::from_utf8_lossy(&d.content).to_string(),
+                    ));
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -267,18 +263,14 @@ impl TestClientHandler {
 }
 
 #[async_trait]
-impl ClientHandler for TestClientHandler {
+impl MessageHandler for TestClientHandler {
     fn name(&self) -> &'static str {
         "sgip-test-client"
     }
 
-    async fn on_inbound(&self, ctx: &rsms_connector::client::ClientContext<'_>, frame: &Frame) -> Result<()> {
-        let unified = match SgipAdapter.decode(frame) {
-            Ok(m) => m,
-            Err(_) => return Ok(()),
-        };
-
-        match unified {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 框架已按协议解码为统一消息，直接 match，无需手调 SgipAdapter.decode。
+        match msg {
             UnifiedMessage::BindResp(resp) => {
                 *self.bind_resp_status.lock().unwrap() = Some(resp.status);
                 if resp.status == 0 {
@@ -290,15 +282,13 @@ impl ClientHandler for TestClientHandler {
             }
             UnifiedMessage::Deliver(d) => {
                 self.deliver_count.fetch_add(1, Ordering::Relaxed);
-                // 旧版状态报告以 "id:" 文本承载在 Deliver 内容里，语义保持不变。
+                // delta-5：旧版状态报告以 "id:" 文本承载在 Deliver 内容里，语义保持不变。
                 let content = String::from_utf8_lossy(&d.content);
                 if content.contains("id:") {
                     self.report_count.fetch_add(1, Ordering::Relaxed);
                 }
-                // 回 DeliverResp：序列用 sequence_of 回显请求复合序列。
-                let bytes =
-                    SgipAdapter.encode(&UnifiedMessage::DeliverResp, SgipAdapter.sequence_of(frame))?;
-                ctx.conn.write_frame(bytes.as_slice()).await?;
+                // 回 DeliverResp：ctx.reply 内部回显 12B 复合序列（delta-2 已验证）。
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
             UnifiedMessage::UnbindResp => {
                 self.unbind_resp_received.store(true, Ordering::Relaxed);
@@ -312,7 +302,7 @@ impl ClientHandler for TestClientHandler {
 
 pub async fn start_test_server(
     auth_handler: Arc<dyn AuthHandler>,
-    biz_handler: Arc<dyn BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
     event_handler: Arc<dyn ServerEventHandler>,
     idle_timeout_secs: u32,
 ) -> Result<(u16, tokio::task::JoinHandle<()>)> {
@@ -324,7 +314,7 @@ pub async fn start_test_server(
         idle_timeout_secs as u16,
     ).with_protocol(Protocol::Sgip));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(auth_handler)
         .account_config_provider(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>)
         .event_handler(event_handler)
@@ -341,7 +331,7 @@ pub async fn start_test_server(
 
 pub async fn start_test_server_with_pool(
     auth_handler: Arc<dyn AuthHandler>,
-    biz_handler: Arc<dyn BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
     event_handler: Arc<dyn ServerEventHandler>,
     idle_timeout_secs: u32,
 ) -> Result<(u16, Arc<rsms_connector::ConnectionPool>, tokio::task::JoinHandle<()>)> {
@@ -353,7 +343,7 @@ pub async fn start_test_server_with_pool(
         idle_timeout_secs as u16,
     ).with_protocol(Protocol::Sgip));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(auth_handler)
         .account_config_provider(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>)
         .event_handler(event_handler)
@@ -433,9 +423,13 @@ mod tests {
         let evt = Arc::new(TestEventHandler::new());
         let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30).await.unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(
+            EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30)
+                .with_protocol(Protocol::Sgip),
+        );
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
+        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SgipDecoder)
+            .with_message_handler(client_handler.clone())
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -472,9 +466,13 @@ mod tests {
         let evt = Arc::new(TestEventHandler::new());
         let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30).await.unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(
+            EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30)
+                .with_protocol(Protocol::Sgip),
+        );
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
+        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SgipDecoder)
+            .with_message_handler(client_handler.clone())
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -509,9 +507,13 @@ mod tests {
         let evt = Arc::new(TestEventHandler::new());
         let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30).await.unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(
+            EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30)
+                .with_protocol(Protocol::Sgip),
+        );
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
+        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SgipDecoder)
+            .with_message_handler(client_handler.clone())
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -547,9 +549,13 @@ mod tests {
         let evt = Arc::new(TestEventHandler::new());
         let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30).await.unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(
+            EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30)
+                .with_protocol(Protocol::Sgip),
+        );
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
+        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SgipDecoder)
+            .with_message_handler(client_handler.clone())
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -586,9 +592,13 @@ mod tests {
         let evt = Arc::new(TestEventHandler::new());
         let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30).await.unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(
+            EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30)
+                .with_protocol(Protocol::Sgip),
+        );
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
+        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SgipDecoder)
+            .with_message_handler(client_handler.clone())
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -624,9 +634,13 @@ mod tests {
         let client_evt = Arc::new(TestClientEventHandler::new());
         let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 2).await.unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(
+            EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30)
+                .with_protocol(Protocol::Sgip),
+        );
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
+        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SgipDecoder)
+            .with_message_handler(client_handler.clone())
             .client_config(ClientConfig::new())
             .event_handler(client_evt.clone())
             .connect()
@@ -661,9 +675,13 @@ mod tests {
             .await
             .unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(
+            EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30)
+                .with_protocol(Protocol::Sgip),
+        );
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
+        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SgipDecoder)
+            .with_message_handler(client_handler.clone())
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -705,9 +723,13 @@ mod tests {
             .await
             .unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(
+            EndpointConfig::new("sgip-client", "127.0.0.1", port, 8, 30)
+                .with_protocol(Protocol::Sgip),
+        );
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
+        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SgipDecoder)
+            .with_message_handler(client_handler.clone())
             .client_config(ClientConfig::new())
             .connect()
             .await

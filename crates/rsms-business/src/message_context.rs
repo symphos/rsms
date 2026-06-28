@@ -22,7 +22,8 @@ pub struct MessageContext {
     adapter: &'static dyn ProtocolAdapter,
     /// 当前请求帧的「回显序列」，由框架以 `adapter.sequence_of(frame)` 解出后注入；
     /// `reply` 据此回显请求序列（SGIP 复合序列亦由 [`Sequence`] 承载）。
-    frame_sequence: Sequence,
+    /// SGIP 服务端需在 `handle_submit` 中读取此字段以构造 Report 的 submit_sequence。
+    pub frame_sequence: Sequence,
 }
 
 impl MessageContext {
