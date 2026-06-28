@@ -10,6 +10,10 @@ use rsms_codec_cmpp::CommandId as CmppCommandId;
 use rsms_codec_sgip::CommandId as SgipCommandId;
 use rsms_codec_smgp::CommandId as SmgpCommandId;
 use rsms_codec_smpp::CommandId as SmppCommandId;
+use rsms_business::{
+    MessageContext, MessageHandler, ProtocolConnection as BusinessProtocolConnection,
+    RateLimiter as BusinessRateLimiter,
+};
 use rsms_core::{ConnectionInfo, Metrics, NoopMetrics, Protocol, RawPdu, EndpointConfig, Frame, Result, RsmsError, SessionState};
 use rsms_session::ConnectionContext;
 use rsms_window::{Window, WindowConfig};
@@ -225,6 +229,8 @@ pub struct ClientConnection {
     sending: AtomicBool,
     /// 本连接派生的后台 task 句柄（读循环 / keepalive / 出站 fetcher），供 `shutdown` 收尾 await。
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// 该连接的 ID/序列号生成器。窄腰 `MessageContext` 要求非 Option；客户端无连接池语义，自持一个。
+    pub(crate) id_generator: Arc<dyn rsms_core::IdGenerator>,
 }
 
 impl ClientConnection {
@@ -255,6 +261,7 @@ impl ClientConnection {
             tm,
             sending: AtomicBool::new(true),
             tasks: Mutex::new(Vec::new()),
+            id_generator: Arc::new(crate::SimpleIdGenerator::new()),
         })
     }
 
@@ -564,6 +571,31 @@ impl ProtocolConnection for ClientConnection {
     }
 }
 
+/// 窄腰 `MessageContext` 要求 `rsms_business::ProtocolConnection`；客户端连接据此参与统一处理链。
+/// 与上方 `crate::protocol::ProtocolConnection` 委托同一份连接状态（客户端无限流，故 `rate_limiter` 恒 `None`）。
+#[async_trait]
+impl BusinessProtocolConnection for ClientConnection {
+    fn id(&self) -> u64 {
+        self.id
+    }
+
+    async fn write_frame(&self, data: &[u8]) -> Result<()> {
+        ClientConnection::write_frame(self, data).await
+    }
+
+    async fn authenticated_account(&self) -> Option<String> {
+        Some(self.endpoint.id.clone())
+    }
+
+    async fn rate_limiter(&self) -> Option<Arc<dyn BusinessRateLimiter>> {
+        None
+    }
+
+    async fn protocol_version(&self) -> Option<u8> {
+        self.ctx.lock().await.protocol_version()
+    }
+}
+
 /// 客户端连接上下文（用于业务处理器）。
 pub struct ClientContext<'a> {
     pub endpoint: &'a EndpointConfig,
@@ -574,6 +606,20 @@ pub struct ClientContext<'a> {
 pub trait ClientHandler: Send + Sync {
     fn name(&self) -> &'static str;
     async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()>;
+}
+
+/// 空客户端处理器：迁到 [`ClientBuilder::with_message_handler`] 后，`ClientBuilder::new` 仍强制
+/// 传入一个 `ClientHandler`（其他协议 example 共用该签名），用它占位。WP4-3 删 `client_handler` 时移除。
+pub struct NoopClientHandler;
+
+#[async_trait]
+impl ClientHandler for NoopClientHandler {
+    fn name(&self) -> &'static str {
+        "noop-client"
+    }
+    async fn on_inbound(&self, _ctx: &ClientContext<'_>, _frame: &Frame) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// 客户端构建器：链式配置后调用 [`ClientBuilder::connect`] 建连并启动读循环。
@@ -593,6 +639,7 @@ pub struct ClientBuilder<D: FrameDecoder + Send + Sync + 'static> {
     event_handler: Option<Arc<dyn ClientEventHandler>>,
     metrics: Option<Arc<dyn Metrics>>,
     message_callback: Option<Arc<dyn MessageCallback>>,
+    message_handler: Option<Arc<dyn MessageHandler>>,
 }
 
 impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
@@ -610,6 +657,7 @@ impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
             event_handler: None,
             metrics: None,
             message_callback: None,
+            message_handler: None,
         }
     }
 
@@ -642,6 +690,13 @@ impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
         self
     }
 
+    /// 注入窄腰统一消息处理器（重塑后主路径）。设置后读循环把入站帧解码为 `UnifiedMessage`
+    /// 并调 `on_message`；与构造时的 `client_handler`（裸帧旧路径）二选一，设置它即覆盖旧路径。
+    pub fn with_message_handler(mut self, handler: Arc<dyn MessageHandler>) -> Self {
+        self.message_handler = Some(handler);
+        self
+    }
+
     /// 连接到服务器并启动读循环。
     pub async fn connect(self) -> Result<Arc<ClientConnection>> {
         let ClientBuilder {
@@ -653,6 +708,7 @@ impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
             event_handler,
             metrics,
             message_callback,
+            message_handler,
         } = self;
         let metrics: Arc<dyn Metrics> = metrics.unwrap_or_else(|| Arc::new(NoopMetrics));
         let config = client_config.unwrap_or_default();
@@ -688,8 +744,9 @@ impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
 
     metrics.connection_opened();
     let metrics_for_read = Arc::clone(&metrics);
+    let message_handler_clone = message_handler.clone();
     let read_handle = tokio::spawn(async move {
-        run_client_read_loop(conn_clone, client_handler_clone, Arc::clone(&decoder), event_handler, metrics_for_read).await;
+        run_client_read_loop(conn_clone, client_handler_clone, message_handler_clone, Arc::clone(&decoder), event_handler, metrics_for_read).await;
     });
     conn.register_task(read_handle).await;
 
@@ -756,7 +813,7 @@ pub(crate) async fn connect_with_pool(
     let metrics: Arc<dyn Metrics> = Arc::new(NoopMetrics);
     let metrics_for_read = Arc::clone(&metrics);
     let read_handle = tokio::spawn(async move {
-        run_client_read_loop(conn_clone, client_handler_clone, decoder, event_handler, metrics_for_read).await;
+        run_client_read_loop(conn_clone, client_handler_clone, None, decoder, event_handler, metrics_for_read).await;
     });
     conn.register_task(read_handle).await;
 
@@ -783,6 +840,7 @@ pub(crate) async fn connect_with_pool(
 async fn run_client_read_loop(
     conn: Arc<ClientConnection>,
     client_handler: Arc<dyn ClientHandler>,
+    message_handler: Option<Arc<dyn MessageHandler>>,
     decoder: Arc<tokio::sync::Mutex<Box<dyn FrameDecoder>>>,
     event_handler: Option<Arc<dyn ClientEventHandler>>,
     metrics: Arc<dyn Metrics>,
@@ -880,11 +938,6 @@ async fn run_client_read_loop(
                 drive_inbound(tm, conn.endpoint.protocol, &frame).await;
             }
 
-            let ctx = ClientContext {
-                endpoint: &conn.endpoint,
-                conn: &conn,
-            };
-
             if conn.endpoint.log_level.is_none_or(|max| tracing::Level::INFO <= max) {
                 tracing::info!(
                     conn_id = conn.id,
@@ -895,9 +948,8 @@ async fn run_client_read_loop(
                     "received frame"
                 );
             }
-            
-            // 影子比对（客户端收包方向）：unified-shadow feature 开启时，对每帧经 registry
-            // 做统一模型解码并打日志。只观测、不接管，错误隔离不影响旧路径。
+
+            // 影子比对（客户端收包方向）：unified-shadow 开启时对每帧统一解码并打日志，只观测不接管。
             #[cfg(feature = "unified-shadow")]
             {
                 use rsms_model::ProtocolAdapter as _;
@@ -908,8 +960,33 @@ async fn run_client_read_loop(
                 }
             }
 
-            if let Err(e) = client_handler.on_inbound(&ctx, &frame).await {
-                error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "client handler error: {}", e);
+            if let Some(mh) = &message_handler {
+                // 窄腰主路径：解码为统一消息，构造 MessageContext，调 on_message。
+                use rsms_model::ProtocolAdapter as _;
+                let adapter = crate::adapter_registry::adapter_for(conn.endpoint.protocol);
+                match adapter.decode(&frame) {
+                    Ok(unified) => {
+                        let ctx = MessageContext::new(
+                            conn.endpoint.clone(),
+                            conn.clone() as Arc<dyn BusinessProtocolConnection>,
+                            conn.id_generator.clone(),
+                            adapter,
+                            adapter.sequence_of(&frame),
+                        );
+                        if let Err(e) = mh.on_message(&ctx, &unified).await {
+                            error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "message handler error: {}", e);
+                        }
+                    }
+                    Err(e) => tracing::warn!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "统一模型解码失败（跳过该帧）: {e}"),
+                }
+            } else {
+                let ctx = ClientContext {
+                    endpoint: &conn.endpoint,
+                    conn: &conn,
+                };
+                if let Err(e) = client_handler.on_inbound(&ctx, &frame).await {
+                    error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "client handler error: {}", e);
+                }
             }
         }
         
@@ -943,7 +1020,7 @@ async fn run_outbound_fetcher(
             continue;
         }
 
-        let account = conn.authenticated_account().await.unwrap_or_default();
+        let account = ProtocolConnection::authenticated_account(&*conn).await.unwrap_or_default();
 
         let items = match source.fetch(&account, 16).await {
             Ok(items) if !items.is_empty() => items,
@@ -1109,6 +1186,29 @@ fn build_sgip_keepalive_pdu() -> Vec<u8> {
     pdu.extend_from_slice(&command_id);
     pdu.extend_from_slice(&[0u8; 12]);
     pdu
+}
+
+#[cfg(test)]
+mod wp4_client_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use rsms_business::{MessageContext, MessageHandler};
+    use rsms_model::UnifiedMessage;
+
+    struct DummyMh;
+    #[async_trait]
+    impl MessageHandler for DummyMh {
+        fn name(&self) -> &'static str { "dummy" }
+        async fn on_message(&self, _ctx: &MessageContext, _msg: &UnifiedMessage) -> rsms_core::Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn with_message_handler_stores_handler() {
+        let ep = Arc::new(rsms_core::EndpointConfig::new("ep", "127.0.0.1", 7890, 16, 60));
+        let b = ClientBuilder::new(ep, Arc::new(NoopClientHandler), crate::CmppDecoder)
+            .with_message_handler(Arc::new(DummyMh));
+        assert!(b.message_handler.is_some(), "with_message_handler 应存入处理器");
+    }
 }
 
 #[cfg(test)]
