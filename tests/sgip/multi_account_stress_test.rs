@@ -9,7 +9,6 @@ use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler};
 use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Frame, Result};
 // 窄腰统一模型：收发一律走 SgipAdapter + UnifiedMessage，不再手构裸 codec / 手剥头部字节。
 use rsms_codec_sgip::adapter::SgipAdapter;
-use rsms_codec_sgip::CommandId;
 use rsms_model::{
     Address, DeliveryStatus, MessageId, ProtocolAdapter, ProtocolExtra, Sequence, SgipExtra,
     UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmit, UnifiedSubmitResp,
@@ -221,13 +220,9 @@ fn seq_to_msg_id(node_id: u32, timestamp: u32, number: u32) -> MessageId {
     MessageId::Binary(b)
 }
 
-// 回 ReportResp：用 Unknown{command_id=ReportResp} 经 adapter 还原；序列用 sequence_of 回显请求复合序列。
+// 回 ReportResp：使用统一模型 UnifiedMessage::ReportResp 变体；序列用 sequence_of 回显请求复合序列。
 async fn build_report_resp(ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-    let resp = UnifiedMessage::Unknown {
-        command_id: CommandId::ReportResp as u32,
-        raw: vec![],
-    };
-    let bytes = SgipAdapter.encode(&resp, SgipAdapter.sequence_of(frame))?;
+    let bytes = SgipAdapter.encode(&UnifiedMessage::ReportResp, SgipAdapter.sequence_of(frame))?;
     ctx.conn.write_frame(bytes.as_slice()).await
 }
 
@@ -285,9 +280,8 @@ impl rsms_business::BusinessHandler for ServerHandler {
                         dest_number,
                     }.to_bytes()).await;
                 }
-                // ReportResp 退化为 Unknown{command_id=ReportResp}；DeliverResp 为独立变体。
-                UnifiedMessage::Unknown { command_id, .. }
-                    if command_id == CommandId::ReportResp as u32 => {}
+                // ReportResp 统一模型独立变体；DeliverResp 同。
+                UnifiedMessage::ReportResp => {}
                 UnifiedMessage::DeliverResp => {}
                 _ => {}
             }
