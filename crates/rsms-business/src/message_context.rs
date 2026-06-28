@@ -22,8 +22,7 @@ pub struct MessageContext {
     adapter: &'static dyn ProtocolAdapter,
     /// 当前请求帧的「回显序列」，由框架以 `adapter.sequence_of(frame)` 解出后注入；
     /// `reply` 据此回显请求序列（SGIP 复合序列亦由 [`Sequence`] 承载）。
-    /// SGIP 服务端需在 `handle_submit` 中读取此字段以构造 Report 的 submit_sequence。
-    pub frame_sequence: Sequence,
+    frame_sequence: Sequence,
 }
 
 impl MessageContext {
@@ -36,6 +35,14 @@ impl MessageContext {
         frame_sequence: Sequence,
     ) -> Self {
         Self { endpoint, conn, id_generator, adapter, frame_sequence }
+    }
+
+    /// 当前请求帧的「回显序列」（框架以 `adapter.sequence_of(frame)` 解出注入）。
+    ///
+    /// 业务据此把异步响应（如 SGIP 状态报告的 submit_sequence）关联回原请求——
+    /// SGIP 的 Submit 无 msg_id、以帧头复合序列为关联键，迁移后是取该序列的唯一途径。
+    pub fn frame_sequence(&self) -> Sequence {
+        self.frame_sequence
     }
 
     /// 一步式回执：把统一消息编码为当前协议字节（回显请求帧序列）并写回对端。

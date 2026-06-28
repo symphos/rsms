@@ -449,7 +449,7 @@ impl SgipBusinessHandler {
         // 作为 Report.submit_sequence（delta-2：SgipAdapter.encode 从 msg_id 12B Binary 反解还原）。
         if submit.want_report {
             if let Some(account) = ctx.conn.authenticated_account().await {
-                let submit_seq = ctx.frame_sequence;
+                let submit_seq = ctx.frame_sequence();
                 let report_number = ctx.id_generator.next_sequence_id();
                 let report = build_report(&submit_seq, &phone, report_number);
                 self.msg_source.push(&account, report).await;
