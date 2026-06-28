@@ -363,13 +363,7 @@ impl BusinessHandler for SgipBusinessHandler {
                     dest = %report.dest.number,
                     "收到 Report"
                 );
-                // SGIP 独立 Report 须回 ReportResp；统一模型无 ReportResp 变体，
-                // 用 Unknown{command_id=ReportResp} 让 adapter 还原回 ReportResp 编码。
-                let resp = UnifiedMessage::Unknown {
-                    command_id: rsms_codec_sgip::CommandId::ReportResp as u32,
-                    raw: vec![],
-                };
-                let bytes = SgipAdapter.encode(&resp, SgipAdapter.sequence_of(frame))?;
+                let bytes = SgipAdapter.encode(&UnifiedMessage::ReportResp, SgipAdapter.sequence_of(frame))?;
                 ctx.conn.write_frame(&bytes).await?;
             }
             UnifiedMessage::Deliver(deliver) => {

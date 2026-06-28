@@ -22,7 +22,6 @@
 
 use async_trait::async_trait;
 use rsms_codec_sgip::adapter::SgipAdapter;
-use rsms_codec_sgip::CommandId;
 use rsms_connector::client::{ClientContext, ClientHandler};
 use rsms_connector::{ClientBuilder, MessageItem, MessageSource, SgipDecoder};
 use rsms_core::{EncodedPdu, EndpointConfig, Frame, Protocol, RawPdu, Result};
@@ -372,15 +371,9 @@ impl ClientHandler for SgipClientHandler {
 }
 
 /// 回 ReportResp（SGIP 独立 Report 命令的应答）。
-/// 统一模型无 ReportResp 变体，这是窄腰对 SGIP「独立 Report-ack」的已知边界：
-/// 用 Unknown{command_id: ReportResp} 携带真实命令字，adapter.encode 据此还原回 ReportResp。
 /// sequence_of(frame) 自动解 12B 复合序列，回显请求序列（不手剥 data[8..20]）。
 async fn reply_report_resp(ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-    let resp = UnifiedMessage::Unknown {
-        command_id: CommandId::ReportResp as u32,
-        raw: vec![],
-    };
-    let bytes = SgipAdapter.encode(&resp, SgipAdapter.sequence_of(frame))?;
+    let bytes = SgipAdapter.encode(&UnifiedMessage::ReportResp, SgipAdapter.sequence_of(frame))?;
     ctx.conn.write_frame(&bytes).await
 }
 
