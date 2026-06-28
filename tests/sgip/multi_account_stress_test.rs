@@ -1,12 +1,13 @@
 use async_trait::async_trait;
 use rsms_connector::{
-    ServerBuilder, ClientBuilder, SgipDecoder,
+    ServerBuilder, ClientBuilder, SgipDecoder, NoopClientHandler,
     AuthCredentials, AuthHandler, AuthResult,
     AccountConfigProvider,
     protocol::MessageSource,
 };
-use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler};
-use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Frame, Result};
+use rsms_connector::client::ClientConfig;
+use rsms_business::{MessageContext, MessageHandler};
+use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Result};
 // 窄腰统一模型：收发一律走 SgipAdapter + UnifiedMessage，不再手构裸 codec / 手剥头部字节。
 use rsms_codec_sgip::adapter::SgipAdapter;
 use rsms_model::{
@@ -145,18 +146,13 @@ impl ClientState {
 }
 
 #[async_trait]
-impl ClientHandler for ClientState {
+impl MessageHandler for ClientState {
     fn name(&self) -> &'static str {
         "multi-account-stress-client"
     }
 
-    async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        let unified = match SgipAdapter.decode(frame) {
-            Ok(m) => m,
-            Err(_) => return Ok(()),
-        };
-
-        match unified {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        match msg {
             UnifiedMessage::BindResp(resp) => {
                 *self.login_status.lock().unwrap() = Some(resp.status);
                 if resp.status == 0 {
@@ -190,11 +186,11 @@ impl ClientHandler for ClientState {
                     }
                 }
 
-                return build_report_resp(ctx, frame).await;
+                return ctx.reply(UnifiedMessage::ReportResp).await;
             }
             UnifiedMessage::Deliver(_) => {
                 self.stats.mo_received.fetch_add(1, Ordering::Relaxed);
-                return build_deliver_resp(ctx, frame).await;
+                return ctx.reply(UnifiedMessage::DeliverResp).await;
             }
             _ => {}
         }
@@ -220,18 +216,6 @@ fn seq_to_msg_id(node_id: u32, timestamp: u32, number: u32) -> MessageId {
     MessageId::Binary(b)
 }
 
-// 回 ReportResp：使用统一模型 UnifiedMessage::ReportResp 变体；序列用 sequence_of 回显请求复合序列。
-async fn build_report_resp(ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-    let bytes = SgipAdapter.encode(&UnifiedMessage::ReportResp, SgipAdapter.sequence_of(frame))?;
-    ctx.conn.write_frame(bytes.as_slice()).await
-}
-
-// 回 DeliverResp：序列用 sequence_of 回显请求复合序列。
-async fn build_deliver_resp(ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-    let bytes = SgipAdapter.encode(&UnifiedMessage::DeliverResp, SgipAdapter.sequence_of(frame))?;
-    ctx.conn.write_frame(bytes.as_slice()).await
-}
-
 struct ServerHandler {
     submit_count: AtomicU64,
     msg_source: Arc<StressMockMessageSource>,
@@ -247,44 +231,41 @@ impl ServerHandler {
 }
 
 #[async_trait]
-impl rsms_business::BusinessHandler for ServerHandler {
+impl MessageHandler for ServerHandler {
     fn name(&self) -> &'static str {
         "multi-account-stress-server"
     }
 
-    async fn on_inbound(&self, ctx: &rsms_business::InboundContext, frame: &Frame) -> Result<()> {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
         let account = ctx.conn.authenticated_account().await.unwrap_or_else(|| "unknown".to_string());
-        if let Ok(unified) = SgipAdapter.decode(frame) {
-            match unified {
-                UnifiedMessage::Submit(s) => {
-                    let _count = self.submit_count.fetch_add(1, Ordering::Relaxed);
+        match msg {
+            UnifiedMessage::Submit(s) => {
+                let _count = self.submit_count.fetch_add(1, Ordering::Relaxed);
 
-                    // 回 SubmitResp：序列用 sequence_of 回显请求复合序列。
-                    let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
-                        msg_id: MessageId::Text(String::new()),
-                        status: 0,
-                    });
-                    let resp_bytes = SgipAdapter.encode(&resp, SgipAdapter.sequence_of(frame))?;
-                    ctx.conn.write_frame(resp_bytes.as_slice()).await?;
+                // 回 SubmitResp：ctx.reply 自动回显请求帧序列（含 SGIP 复合序列）。
+                let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                    msg_id: MessageId::Text(String::new()),
+                    status: 0,
+                });
+                ctx.reply(resp).await?;
 
-                    // 被报告 Submit 的复合序列 number 分量：直接取自 sequence_of。
-                    let submit_seq_number = match SgipAdapter.sequence_of(frame) {
-                        Sequence::Sgip { number, .. } => number,
-                        Sequence::Plain(n) => n,
-                    };
+                // 被报告 Submit 的复合序列 number 分量：由框架注入的 frame_sequence 取出。
+                let submit_seq_number = match ctx.frame_sequence() {
+                    Sequence::Sgip { number, .. } => number,
+                    Sequence::Plain(n) => n,
+                };
 
-                    let dest_number = s.dests.first().map(|a| a.number.clone()).unwrap_or_default();
-                    self.msg_source.push_item(&account, ReportItem {
-                        submit_seq_number,
-                        conn_id: ctx.conn.id(),
-                        dest_number,
-                    }.to_bytes()).await;
-                }
-                // ReportResp 统一模型独立变体；DeliverResp 同。
-                UnifiedMessage::ReportResp => {}
-                UnifiedMessage::DeliverResp => {}
-                _ => {}
+                let dest_number = s.dests.first().map(|a| a.number.clone()).unwrap_or_default();
+                self.msg_source.push_item(&account, ReportItem {
+                    submit_seq_number,
+                    conn_id: ctx.conn.id(),
+                    dest_number,
+                }.to_bytes()).await;
             }
+            // ReportResp 统一模型独立变体；DeliverResp 同。
+            UnifiedMessage::ReportResp => {}
+            UnifiedMessage::DeliverResp => {}
+            _ => {}
         }
         Ok(())
     }
@@ -324,7 +305,7 @@ impl AuthHandler for PasswordAuthHandler {
 }
 
 async fn start_test_server(
-    biz_handler: Arc<dyn rsms_business::BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
 ) -> Result<(u16, Arc<rsms_connector::AccountPool>, tokio::task::JoinHandle<()>)> {
     let cfg = Arc::new(EndpointConfig::new(
         "sgip-multi-account-stress-server",
@@ -338,7 +319,7 @@ async fn start_test_server(
         auth = auth.add_account(account, password);
     }
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(Arc::new(auth))
         .account_config_provider(Arc::new(MockAccountConfigProvider::with_limits(10000, 4096)) as Arc<dyn AccountConfigProvider>)
         .serve()
@@ -564,7 +545,8 @@ async fn stress_test_sgip_5accounts_5connections() {
 
             let mut conn = None;
             for retry in 0..50 {
-                match ClientBuilder::new(endpoint.clone(), client_state.clone(), SgipDecoder)
+                match ClientBuilder::new(endpoint.clone(), Arc::new(NoopClientHandler), SgipDecoder)
+                    .with_message_handler(client_state.clone())
                     .client_config(ClientConfig::new())
                     .message_source(msg_source.clone() as Arc<dyn MessageSource>)
                     .connect()
