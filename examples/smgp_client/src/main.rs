@@ -22,11 +22,11 @@
 // ============================================================================
 
 use async_trait::async_trait;
+use rsms_business::{MessageContext, MessageHandler};
 use rsms_codec_smgp::adapter::SmgpAdapter;
 use rsms_codec_smgp::compute_login_auth;
-use rsms_connector::client::{ClientContext, ClientHandler};
-use rsms_connector::{ClientBuilder, MessageItem, MessageSource, SmgpDecoder};
-use rsms_core::{EncodedPdu, EndpointConfig, Frame, Protocol, RawPdu, Result};
+use rsms_connector::{ClientBuilder, MessageItem, MessageSource, NoopClientHandler, SmgpDecoder};
+use rsms_core::{EncodedPdu, EndpointConfig, Protocol, RawPdu, Result};
 use rsms_longmsg::{
     split::SmsAlphabet, LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser,
 };
@@ -295,21 +295,14 @@ impl SmgpClientHandler {
 }
 
 #[async_trait]
-impl ClientHandler for SmgpClientHandler {
+impl MessageHandler for SmgpClientHandler {
     fn name(&self) -> &'static str {
         "smgp-client"
     }
 
-    async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        let unified = match SmgpAdapter.decode(frame) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("解码失败 cmd_id=0x{:08x}: {}", frame.command_id, e);
-                return Ok(());
-            }
-        };
-
-        match unified {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 框架已按协议解码为统一消息，业务直接按枚举分支处理。
+        match msg {
             UnifiedMessage::BindResp(resp) => {
                 if resp.status == 0 {
                     tracing::info!("✓ SMGP 认证成功");
@@ -320,8 +313,9 @@ impl ClientHandler for SmgpClientHandler {
             }
             UnifiedMessage::SubmitResp(resp) => {
                 let count = self.submit_count.fetch_add(1, Ordering::Relaxed) + 1;
-                let id = match resp.msg_id {
-                    MessageId::Text(t) => t,
+                // msg: &UnifiedMessage，resp 为借用，msg_id 须 borrow 匹配。
+                let id = match &resp.msg_id {
+                    MessageId::Text(t) => t.clone(),
                     MessageId::Binary(b) => b.iter().map(|x| format!("{x:02x}")).collect(),
                 };
                 tracing::info!("[{}] SubmitResp: msg_id={}, status={}", count, id, resp.status);
@@ -340,14 +334,15 @@ impl ClientHandler for SmgpClientHandler {
                     report.src.number,
                     String::from_utf8_lossy(&report.raw)
                 );
-                reply_deliver_resp(ctx, frame).await?;
+                // 一步回执（窄腰）：框架按请求帧序列编码 DeliverResp 并写回。
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
             UnifiedMessage::Deliver(deliver) => {
                 let enc = deliver.encoding;
                 // 窄腰：adapter 已剥 UDH → deliver.concat + 纯载荷，据 concat 重建含 UDH 段供合包逻辑复用。
                 let seg = seg_with_udh(&deliver.concat, &deliver.content);
                 self.handle_mo(&deliver.src.number, &deliver.dest.number, seg, enc);
-                reply_deliver_resp(ctx, frame).await?;
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
             UnifiedMessage::UnbindResp => tracing::info!("收到 ExitResp，连接将关闭"),
             UnifiedMessage::PingResp => tracing::debug!("收到心跳响应"),
@@ -355,12 +350,6 @@ impl ClientHandler for SmgpClientHandler {
         }
         Ok(())
     }
-}
-
-/// 回 DeliverResp（经 adapter 编码，sequence_of 自动回显请求序列——跨协议统一写法）。
-async fn reply_deliver_resp(ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-    let bytes = SmgpAdapter.encode(&UnifiedMessage::DeliverResp, SmgpAdapter.sequence_of(frame))?;
-    ctx.conn.write_frame(&bytes).await
 }
 
 #[tokio::main]
@@ -391,7 +380,9 @@ async fn main() -> Result<()> {
     );
 
     tracing::info!("正在连接 SMGP 服务端 {}...", SERVER_ADDR);
-    let conn = ClientBuilder::new(endpoint, handler, SmgpDecoder)
+    // 窄腰主路径：业务处理器经 with_message_handler 注入；new 第二参用 NoopClientHandler 占位。
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmgpDecoder)
+        .with_message_handler(handler)
         .message_source(msg_source as Arc<dyn MessageSource>)
         .connect()
         .await?;

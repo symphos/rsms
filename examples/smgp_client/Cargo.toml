@@ -15,6 +15,7 @@ async-trait.workspace = true
 bytes.workspace = true
 rsms-core = { path = "../../crates/rsms-core" }
 rsms-connector = { path = "../../crates/rsms-connector" }
+rsms-business = { path = "../../crates/rsms-business" }
 rsms-model = { path = "../../crates/rsms-model" }
 rsms-codec-smgp = { path = "../../crates/rsms-codec-smgp" }
 rsms-longmsg = { path = "../../crates/rsms-longmsg" }

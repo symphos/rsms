@@ -21,15 +21,14 @@
 // ============================================================================
 
 use async_trait::async_trait;
-use rsms_business::BusinessHandler;
-use rsms_business::InboundContext;
+use rsms_business::{MessageContext, MessageHandler};
 use rsms_codec_smgp::adapter::SmgpAdapter;
 use rsms_codec_smgp::datatypes::{SmgpMsgId, SmgpReport};
 use rsms_connector::{
     AccountConfig, AccountConfigProvider, AccountPoolConfig, AuthCredentials, AuthHandler,
     AuthResult, MessageItem, MessageSource, ProtocolConnection, ServerBuilder, ServerEventHandler,
 };
-use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Frame, Protocol, RawPdu, Result};
+use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Protocol, RawPdu, Result};
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
 use rsms_model::{
@@ -285,23 +284,16 @@ struct SmgpBusinessHandler {
 }
 
 #[async_trait]
-impl BusinessHandler for SmgpBusinessHandler {
+impl MessageHandler for SmgpBusinessHandler {
     fn name(&self) -> &'static str {
         "smgp-business"
     }
 
-    async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        let unified = match SmgpAdapter.decode(frame) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(conn_id = ctx.conn.id(), "消息解码失败: {}", e);
-                return Ok(());
-            }
-        };
-
-        match unified {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 框架已按协议解码为统一消息，业务直接按枚举分支处理。
+        match msg {
             UnifiedMessage::Submit(submit) => {
-                self.handle_submit(ctx, frame, &submit).await?;
+                self.handle_submit(ctx, submit).await?;
             }
             UnifiedMessage::Ping => {
                 tracing::debug!(conn_id = ctx.conn.id(), "收到 ActiveTest");
@@ -315,8 +307,7 @@ impl BusinessHandler for SmgpBusinessHandler {
 impl SmgpBusinessHandler {
     async fn handle_submit(
         &self,
-        ctx: &InboundContext,
-        frame: &Frame,
+        ctx: &MessageContext,
         submit: &rsms_model::UnifiedSubmit,
     ) -> Result<()> {
         let phone = submit
@@ -325,26 +316,16 @@ impl SmgpBusinessHandler {
             .map(|a| a.number.as_str())
             .unwrap_or("unknown");
 
-        // 生成 10 字节二进制 MsgId（SMGP 报告/回执 id 字段为二进制，非文本）
-        let msg_id = SmgpMsgId::from_u64(
-            ctx.id_generator
-                .as_ref()
-                .map(|g| g.next_msg_id())
-                .unwrap_or_else(|| {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos() as u64
-                }),
-        );
+        // 生成 10 字节二进制 MsgId（SMGP 报告/回执 id 字段为二进制，非文本）。
+        // MessageContext.id_generator 保证非空，直接调用。
+        let msg_id = SmgpMsgId::from_u64(ctx.id_generator.next_msg_id());
 
-        // 立即回 SubmitResp：msg_id 用 MessageId::Binary(10B)，sequence_of 回显请求序列
-        let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+        // 一步回执（窄腰）：框架按请求帧序列编码 SubmitResp 并写回，业务不再手剥序列/手拼字节。
+        ctx.reply(UnifiedMessage::SubmitResp(UnifiedSubmitResp {
             msg_id: MessageId::Binary(msg_id.bytes.to_vec()),
             status: 0,
-        });
-        let resp_bytes = SmgpAdapter.encode(&resp, SmgpAdapter.sequence_of(frame))?;
-        ctx.conn.write_frame(&resp_bytes).await?;
+        }))
+        .await?;
 
         // 长短信合包：窄腰 concat 表达分段信息（adapter 已剥 UDH、submit.content 为纯载荷）。
         // 据 concat 重建含 UDH 段字节交 merger（merger 内部按 UDH 解析合并）。
@@ -573,7 +554,7 @@ async fn main() -> Result<()> {
     tracing::info!("SMGP 网关启动于 {}:{}", config.host, config.port);
 
     let server = ServerBuilder::new(config)
-        .handlers(vec![Arc::new(SmgpBusinessHandler {
+        .message_handlers(vec![Arc::new(SmgpBusinessHandler {
             msg_source: msg_source.clone(),
             merger: merger.clone(),
         })])
