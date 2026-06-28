@@ -747,7 +747,7 @@ async fn run_stress_test_with_connections(version: u8, num_connections: usize) {
             "stress-client", "127.0.0.1", port, 2048, 30,
         ).with_window_size(2048).with_log_level(tracing::Level::WARN));
 
-        // run_stress_test_with_connections は常に V3.0 で呼ばれるため、新路径のみ使用。
+        // run_stress_test_with_connections 仅被 V3.0 场景调用，故全程使用新 MessageHandler 路径。
         let mut conn = None;
         for retry in 0..50 {
             match ClientBuilder::new(endpoint.clone(), Arc::new(NoopClientHandler), CmppDecoder)
