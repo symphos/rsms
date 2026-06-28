@@ -129,7 +129,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_message_chain_invokes_each_handler_in_order() {
+    async fn run_message_chain_invokes_each_handler() {
         let ctx = make_ctx();
         let h1 = Arc::new(RecordingMessageHandler::default());
         let h2 = Arc::new(RecordingMessageHandler::default());
@@ -144,6 +144,62 @@ mod tests {
             h1.seen.lock().unwrap()[0].contains("Ping"),
             "handler 应收到传入的那条消息"
         );
+    }
+
+    struct OrderHandler {
+        log: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        id: u8,
+    }
+    #[async_trait]
+    impl MessageHandler for OrderHandler {
+        fn name(&self) -> &'static str {
+            "order"
+        }
+        async fn on_message(&self, _ctx: &MessageContext, _msg: &UnifiedMessage) -> Result<()> {
+            self.log.lock().unwrap().push(self.id);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn run_message_chain_invokes_handlers_in_order() {
+        let ctx = make_ctx();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handlers: Vec<Arc<dyn MessageHandler>> = vec![
+            Arc::new(OrderHandler { log: log.clone(), id: 1 }),
+            Arc::new(OrderHandler { log: log.clone(), id: 2 }),
+        ];
+        run_message_chain(&ctx, &UnifiedMessage::Ping, &handlers).await.unwrap();
+        assert_eq!(*log.lock().unwrap(), vec![1, 2], "应按注册顺序依次调用各 handler");
+    }
+
+    struct ErringHandler {
+        calls: std::sync::Arc<std::sync::Mutex<u32>>,
+    }
+    #[async_trait]
+    impl MessageHandler for ErringHandler {
+        fn name(&self) -> &'static str {
+            "err"
+        }
+        async fn on_message(&self, _ctx: &MessageContext, _msg: &UnifiedMessage) -> Result<()> {
+            *self.calls.lock().unwrap() += 1;
+            Err(rsms_core::RsmsError::Other("boom".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_message_chain_stops_at_first_err() {
+        let ctx = make_ctx();
+        let err_calls = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let after = Arc::new(RecordingMessageHandler::default());
+        let handlers: Vec<Arc<dyn MessageHandler>> = vec![
+            Arc::new(ErringHandler { calls: err_calls.clone() }),
+            after.clone(),
+        ];
+        let result = run_message_chain(&ctx, &UnifiedMessage::Ping, &handlers).await;
+        assert!(result.is_err(), "首个 handler 返回 Err 应上抛");
+        assert_eq!(*err_calls.lock().unwrap(), 1, "出错 handler 被调一次");
+        assert_eq!(after.seen.lock().unwrap().len(), 0, "Err 后续 handler 不应被调用");
     }
 
     #[tokio::test]
