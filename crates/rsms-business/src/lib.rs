@@ -6,6 +6,9 @@ use std::sync::Arc;
 mod message_context;
 pub use message_context::MessageContext;
 
+mod message_handler;
+pub use message_handler::{run_message_chain, MessageHandler, RawFrameHandler};
+
 /// 入站消息的上下文，由框架在每次 `BusinessHandler::on_inbound` 调用前构造并传入。
 pub struct InboundContext {
     /// 当前连接所属的端点配置（含协议、鉴权、日志级别等元数据）。
