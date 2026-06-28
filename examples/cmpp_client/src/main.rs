@@ -17,11 +17,11 @@
 // ============================================================================
 
 use async_trait::async_trait;
+use rsms_business::{MessageContext, MessageHandler};
 use rsms_codec_cmpp::adapter::CmppAdapter;
 use rsms_codec_cmpp::compute_connect_auth;
-use rsms_connector::client::{ClientContext, ClientHandler};
-use rsms_connector::{ClientBuilder, CmppDecoder, MessageItem, MessageSource};
-use rsms_core::{EncodedPdu, EndpointConfig, Frame, Protocol, RawPdu, Result};
+use rsms_connector::{ClientBuilder, CmppDecoder, MessageItem, MessageSource, NoopClientHandler};
+use rsms_core::{EncodedPdu, EndpointConfig, Protocol, RawPdu, Result};
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
 use rsms_model::{
@@ -318,21 +318,13 @@ impl CmppClientHandler {
 }
 
 #[async_trait]
-impl ClientHandler for CmppClientHandler {
+impl MessageHandler for CmppClientHandler {
     fn name(&self) -> &'static str {
         "cmpp-client"
     }
 
-    async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        let unified = match CmppAdapter.decode(frame) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("解码失败 cmd_id=0x{:08x}: {}", frame.command_id, e);
-                return Ok(());
-            }
-        };
-
-        match unified {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        match msg {
             UnifiedMessage::BindResp(resp) => {
                 if resp.status == 0 {
                     tracing::info!("✓ CMPP 认证成功");
@@ -343,8 +335,8 @@ impl ClientHandler for CmppClientHandler {
             }
             UnifiedMessage::SubmitResp(resp) => {
                 let count = self.submit_count.fetch_add(1, Ordering::Relaxed) + 1;
-                let id = match resp.msg_id {
-                    MessageId::Text(t) => t,
+                let id = match &resp.msg_id {
+                    MessageId::Text(t) => t.clone(),
                     MessageId::Binary(b) => b.iter().map(|x| format!("{:02x}", x)).collect(),
                 };
                 tracing::info!("[{}] SubmitResp: msg_id={}, result={}", count, id, resp.status);
@@ -363,11 +355,17 @@ impl ClientHandler for CmppClientHandler {
                     report.dest.number,
                     String::from_utf8_lossy(&report.raw)
                 );
-                reply_deliver_resp(ctx, frame).await?;
+                // 一步回执（窄腰）：框架按请求帧序列编码 DeliverResp 并写回。
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
             UnifiedMessage::Deliver(deliver) => {
-                self.handle_mo(&deliver.src.number, deliver.content, deliver.encoding, deliver.concat);
-                reply_deliver_resp(ctx, frame).await?;
+                self.handle_mo(
+                    &deliver.src.number,
+                    deliver.content.clone(),
+                    deliver.encoding,
+                    deliver.concat.clone(),
+                );
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
             UnifiedMessage::PingResp => tracing::info!("✓ 收到心跳响应 (ActiveTestResp)"),
             UnifiedMessage::UnbindResp => tracing::info!("收到 Terminate 响应，连接将关闭"),
@@ -378,11 +376,6 @@ impl ClientHandler for CmppClientHandler {
     }
 }
 
-/// 回 DeliverResp（经 adapter 编码，sequence_of 自动回显请求序列——跨协议统一写法）。
-async fn reply_deliver_resp(ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-    let bytes = CmppAdapter.encode(&UnifiedMessage::DeliverResp, CmppAdapter.sequence_of(frame))?;
-    ctx.conn.write_frame(&bytes).await
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -424,7 +417,10 @@ async fn main() -> Result<()> {
 
     tracing::info!("正在连接 CMPP 服务端 {}...", SERVER_ADDR);
 
-    let conn = ClientBuilder::new(endpoint, handler, CmppDecoder)
+    // 窄腰主路径：业务处理器经 with_message_handler 注入；new 第二参用 NoopClientHandler 占位
+    // （new 签名暂仍强制 ClientHandler，WP4-3 删旧路径时清理）。
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+        .with_message_handler(handler)
         .message_source(msg_source as Arc<dyn MessageSource>)
         .connect()
         .await?;

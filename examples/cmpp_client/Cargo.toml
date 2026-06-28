@@ -14,6 +14,7 @@ tracing-subscriber.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 rsms-core = { path = "../../crates/rsms-core" }
+rsms-business = { path = "../../crates/rsms-business" }
 rsms-connector = { path = "../../crates/rsms-connector" }
 rsms-codec-cmpp = { path = "../../crates/rsms-codec-cmpp" }
 rsms-longmsg = { path = "../../crates/rsms-longmsg" }
