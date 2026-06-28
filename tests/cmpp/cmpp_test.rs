@@ -1,15 +1,14 @@
 use async_trait::async_trait;
 use rsms_connector::{
     ClientBuilder, AuthCredentials, AuthHandler, AuthResult,
-    ClientEventHandler, ClientHandler, MessageSource, MessageItem, ProtocolConnection,
+    ClientEventHandler, MessageSource, MessageItem, ProtocolConnection,
     ServerEventHandler, AccountConfig, AccountConfigProvider,
-    CmppDecoder,
+    CmppDecoder, NoopClientHandler,
     MessageCallback, SubmitInfo, ReportInfo, MoInfo,
     ServerShutdown,
 };
-use rsms_connector::client::{ClientContext, ClientConfig};
-use rsms_business::BusinessHandler;
-use rsms_business::InboundContext;
+use rsms_connector::client::ClientConfig;
+use rsms_business::{MessageContext, MessageHandler};
 use rsms_core::{ConnectionInfo, EncodedPdu, Metrics, Protocol, RawPdu, EndpointConfig, Frame, Result};
 // 窄腰统一模型：编解码全程经 CmppAdapter（decode→UnifiedMessage / encode UnifiedMessage→字节）。
 // compute_connect_auth 是 MD5 鉴权工具（非裸消息构造），保留。
@@ -142,15 +141,15 @@ impl TestBusinessHandler {
 }
 
 #[async_trait]
-impl BusinessHandler for TestBusinessHandler {
+impl MessageHandler for TestBusinessHandler {
     fn name(&self) -> &'static str {
         "test-biz-handler"
     }
 
-    async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        // 统一模型分支：Submit（含限流判定回 SubmitResp）；Report/Deliver 分别记 report/mo。
-        match CmppAdapter.decode(frame) {
-            Ok(UnifiedMessage::Submit(s)) => {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 窄腰路径：框架已 decode，直接 match 统一消息枚举。
+        match msg {
+            UnifiedMessage::Submit(s) => {
                 let result = if ctx.conn.authenticated_account().await.is_some() {
                     if let Some(limiter) = ctx.conn.rate_limiter().await {
                         if !limiter.try_acquire().await {
@@ -170,20 +169,18 @@ impl BusinessHandler for TestBusinessHandler {
                 } else {
                     3
                 };
-                let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                ctx.reply(UnifiedMessage::SubmitResp(UnifiedSubmitResp {
                     msg_id: MessageId::Binary(vec![0u8; 8]),
                     status: result,
-                });
-                let resp_bytes = CmppAdapter.encode(&resp, CmppAdapter.sequence_of(frame))?;
-                ctx.conn.write_frame(&resp_bytes).await?;
+                })).await?;
             }
             // 状态报告（CMPP Deliver registered_delivery=1）→ Report，记原始正文。
-            Ok(UnifiedMessage::Report(r)) => {
+            UnifiedMessage::Report(r) => {
                 let report = String::from_utf8_lossy(&r.raw).to_string();
                 self.reports.lock().unwrap().push(report);
             }
             // MO 上行（registered_delivery=0）→ Deliver，记 (src, content)。
-            Ok(UnifiedMessage::Deliver(d)) => {
+            UnifiedMessage::Deliver(d) => {
                 self.mo_messages.lock().unwrap().push((
                     d.src.number.clone(),
                     String::from_utf8_lossy(&d.content).to_string(),
@@ -306,19 +303,14 @@ impl TestClientHandler {
 }
 
 #[async_trait]
-impl ClientHandler for TestClientHandler {
+impl MessageHandler for TestClientHandler {
     fn name(&self) -> &'static str {
         "test-client-handler"
     }
 
-    async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        // 统一模型分支替代手剥字节：BindResp/SubmitResp/Deliver/Report/PingResp/UnbindResp。
-        let unified = match CmppAdapter.decode(frame) {
-            Ok(m) => m,
-            Err(_) => return Ok(()),
-        };
-
-        match unified {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 窄腰路径：框架已 decode，直接 match 统一消息枚举。
+        match msg {
             UnifiedMessage::BindResp(resp) => {
                 *self.connect_resp_status.lock().unwrap() = Some(resp.status);
                 if resp.status == 0 {
@@ -332,14 +324,12 @@ impl ClientHandler for TestClientHandler {
             UnifiedMessage::Report(_) => {
                 self.deliver_count.fetch_add(1, Ordering::Relaxed);
                 self.report_count.fetch_add(1, Ordering::Relaxed);
-                let resp_bytes = CmppAdapter.encode(&UnifiedMessage::DeliverResp, CmppAdapter.sequence_of(frame))?;
-                ctx.conn.write_frame(&resp_bytes).await?;
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
             // MO 上行（registered_delivery=0）：仅计 deliver，并回 DeliverResp。
             UnifiedMessage::Deliver(_) => {
                 self.deliver_count.fetch_add(1, Ordering::Relaxed);
-                let resp_bytes = CmppAdapter.encode(&UnifiedMessage::DeliverResp, CmppAdapter.sequence_of(frame))?;
-                ctx.conn.write_frame(&resp_bytes).await?;
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
             UnifiedMessage::PingResp => {
                 self.active_test_resp_count.fetch_add(1, Ordering::Relaxed);
@@ -359,7 +349,7 @@ use rsms_connector::ServerBuilder;
 /// 启动测试服务器
 async fn start_test_server(
     auth_handler: Arc<dyn AuthHandler>,
-    biz_handler: Arc<dyn BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
     event_handler: Arc<dyn ServerEventHandler>,
     idle_timeout_secs: u32,
 ) -> Result<(u16, tokio::task::JoinHandle<()>)> {
@@ -371,7 +361,7 @@ async fn start_test_server(
         idle_timeout_secs as u16,
     ));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(auth_handler)
         .account_config_provider(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>)
         .event_handler(event_handler)
@@ -389,7 +379,7 @@ async fn start_test_server(
 /// 启动测试服务器，返回server引用以便访问连接池
 async fn start_test_server_with_pool(
     auth_handler: Arc<dyn AuthHandler>,
-    biz_handler: Arc<dyn BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
     event_handler: Arc<dyn ServerEventHandler>,
     idle_timeout_secs: u32,
 ) -> Result<(u16, Arc<rsms_connector::ConnectionPool>, tokio::task::JoinHandle<()>)> {
@@ -401,7 +391,7 @@ async fn start_test_server_with_pool(
         idle_timeout_secs as u16,
     ));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(auth_handler)
         .account_config_provider(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>)
         .event_handler(event_handler)
@@ -431,7 +421,8 @@ async fn test_connect_with_valid_password() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new());
-    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+        .with_message_handler(client_handler.clone())
         .client_config(ClientConfig::new())
         .connect()
         .await
@@ -498,12 +489,12 @@ impl MessageSource for OneShotSource {
 
 async fn start_test_server_with_metrics(
     auth_handler: Arc<dyn AuthHandler>,
-    biz_handler: Arc<dyn BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
     metrics: Arc<dyn Metrics>,
 ) -> Result<(u16, tokio::task::JoinHandle<()>)> {
     let cfg = Arc::new(EndpointConfig::new("metrics-server", "127.0.0.1", 0, 8, 30));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(auth_handler)
         .account_config_provider(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>)
         .metrics(metrics)
@@ -534,7 +525,8 @@ async fn test_metrics_hooks_fired() {
 
     let endpoint = Arc::new(EndpointConfig::new("metrics-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new());
-    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+        .with_message_handler(client_handler.clone())
         .client_config(ClientConfig::new())
         .connect()
         .await
@@ -573,7 +565,8 @@ async fn test_client_metrics_and_outbound() {
     let client_metrics = Arc::new(CountingMetrics::default());
     let endpoint = Arc::new(EndpointConfig::new("metrics-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new());
-    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+        .with_message_handler(client_handler.clone())
         .client_config(ClientConfig::new())
         .metrics(client_metrics.clone() as Arc<dyn Metrics>)
         .message_source(Arc::new(OneShotSource { sent: AtomicBool::new(false) }) as Arc<dyn MessageSource>)
@@ -606,7 +599,8 @@ async fn test_connect_with_invalid_password() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new());
-    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+        .with_message_handler(client_handler.clone())
         .client_config(ClientConfig::new())
         .connect()
         .await
@@ -638,7 +632,8 @@ async fn test_submit_and_response() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new());
-    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+        .with_message_handler(client_handler.clone())
         .client_config(ClientConfig::new())
         .connect()
         .await
@@ -675,7 +670,8 @@ async fn test_terminate() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new());
-    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+        .with_message_handler(client_handler.clone())
         .client_config(ClientConfig::new())
         .connect()
         .await
@@ -710,7 +706,8 @@ async fn test_no_heartbeat_disconnect() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new());
-    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+        .with_message_handler(client_handler.clone())
         .client_config(ClientConfig::new())
         .event_handler(client_evt.clone())
         .connect()
@@ -742,7 +739,8 @@ async fn test_submit_without_auth_returns_error() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new());
-    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+        .with_message_handler(client_handler.clone())
         .client_config(ClientConfig::new())
         .connect()
         .await
@@ -822,7 +820,8 @@ async fn test_deliver_mo() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new());
-    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+        .with_message_handler(client_handler.clone())
         .client_config(ClientConfig::new())
         .connect()
         .await
@@ -864,7 +863,8 @@ async fn test_deliver_report() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new());
-    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+        .with_message_handler(client_handler.clone())
         .client_config(ClientConfig::new())
         .connect()
         .await
@@ -895,13 +895,13 @@ async fn test_deliver_report() {
 /// 启动测试服务器并返回优雅停机句柄 + 连接池（用于 B2 服务端停机测试）。
 async fn start_test_server_with_shutdown(
     auth_handler: Arc<dyn AuthHandler>,
-    biz_handler: Arc<dyn BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
     event_handler: Arc<dyn ServerEventHandler>,
     idle_timeout_secs: u32,
 ) -> Result<(u16, ServerShutdown, Arc<rsms_connector::ConnectionPool>, tokio::task::JoinHandle<()>)> {
     let cfg = Arc::new(EndpointConfig::new("test-server", "127.0.0.1", 0, 8, idle_timeout_secs as u16));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(auth_handler)
         .account_config_provider(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>)
         .event_handler(event_handler)
@@ -936,7 +936,8 @@ async fn test_server_graceful_shutdown() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new());
-    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+        .with_message_handler(client_handler.clone())
         .client_config(ClientConfig::new())
         .connect()
         .await
@@ -985,7 +986,8 @@ async fn test_client_graceful_shutdown() {
     let spy = Arc::new(DeliverySpy::default());
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new());
-    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+        .with_message_handler(client_handler.clone())
         .client_config(ClientConfig::new())
         .message_callback(spy.clone() as Arc<dyn MessageCallback>)
         .connect()
@@ -1036,7 +1038,7 @@ impl AccountConfigProvider for RateLimitConfigProvider {
 
 async fn start_test_server_with_rate_limit(
     auth_handler: Arc<dyn AuthHandler>,
-    biz_handler: Arc<dyn BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
     event_handler: Arc<dyn ServerEventHandler>,
     max_qps: u64,
     window_size_ms: u64,
@@ -1050,7 +1052,7 @@ async fn start_test_server_with_rate_limit(
     ));
     let config_provider = Arc::new(RateLimitConfigProvider::new(max_qps, window_size_ms));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(auth_handler)
         .account_config_provider(config_provider)
         .event_handler(event_handler)
@@ -1080,7 +1082,8 @@ async fn test_submit_rate_limit_exceeded() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new());
-    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+        .with_message_handler(client_handler.clone())
         .client_config(ClientConfig::new())
         .connect()
         .await
@@ -1248,7 +1251,8 @@ async fn test_auth_correct_password() {
     let ts = Arc::new(TestClientEventHandler::new());
     let ms = Arc::new(TestMessageSource);
 
-    let conn = ClientBuilder::new(endpoint, handler.clone(), CmppDecoder)
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+        .with_message_handler(handler.clone())
         .client_config(ClientConfig::new())
         .message_source(ms)
         .event_handler(ts)
@@ -1282,7 +1286,8 @@ async fn test_auth_wrong_password() {
     let ts = Arc::new(TestClientEventHandler::new());
     let ms = Arc::new(TestMessageSource);
 
-    let conn = ClientBuilder::new(endpoint, handler.clone(), CmppDecoder)
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+        .with_message_handler(handler.clone())
         .client_config(ClientConfig::new())
         .message_source(ms)
         .event_handler(ts)
@@ -1318,7 +1323,8 @@ async fn test_auth_unknown_account() {
     let ts = Arc::new(TestClientEventHandler::new());
     let ms = Arc::new(TestMessageSource);
 
-    let conn = ClientBuilder::new(endpoint, handler.clone(), CmppDecoder)
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+        .with_message_handler(handler.clone())
         .client_config(ClientConfig::new())
         .message_source(ms)
         .event_handler(ts)
@@ -1353,7 +1359,8 @@ async fn test_submit_message() {
     let ts = Arc::new(TestClientEventHandler::new());
     let ms = Arc::new(TestMessageSource);
 
-    let conn = ClientBuilder::new(endpoint, handler.clone(), CmppDecoder)
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+        .with_message_handler(handler.clone())
         .client_config(ClientConfig::new())
         .message_source(ms)
         .event_handler(ts)
@@ -1435,7 +1442,8 @@ async fn test_delivery_callback_autowire() {
     let spy = Arc::new(DeliverySpy::default());
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new());
-    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+        .with_message_handler(client_handler.clone())
         .client_config(ClientConfig::new())
         .message_callback(spy.clone() as Arc<dyn MessageCallback>)
         .connect()
