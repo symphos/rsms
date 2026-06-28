@@ -374,6 +374,7 @@ dependencies = [
  "rsms-codec-cmpp",
  "rsms-core",
  "rsms-model",
+ "tokio",
  "tracing",
 ]
 

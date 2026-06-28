@@ -1,5 +1,8 @@
 //! 业务处理器扩展（对齐 `BusinessHandlerInterface`）。
 use async_trait::async_trait;
+
+mod message_context;
+pub use message_context::MessageContext;
 use rsms_core::{EndpointConfig, Frame, IdGenerator, Result};
 use std::sync::Arc;
 

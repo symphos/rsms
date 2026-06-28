@@ -11,3 +11,6 @@ rsms-codec-cmpp = { path = "../rsms-codec-cmpp" }
 rsms-core = { path = "../rsms-core" }
 rsms-model = { path = "../rsms-model" }
 tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
