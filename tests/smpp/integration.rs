@@ -1,9 +1,7 @@
-use rsms_connector::{ServerBuilder, SmppDecoder};
-use rsms_connector::client::ClientHandler;
+use rsms_connector::{ServerBuilder, SmppDecoder, NoopClientHandler};
 use rsms_connector::{AuthHandler, AuthCredentials, AuthResult, ServerEventHandler, AccountConfigProvider};
-use rsms_business::BusinessHandler;
-use rsms_business::InboundContext;
-use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Protocol, Frame, Result};
+use rsms_business::{MessageContext, MessageHandler};
+use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Protocol, Result};
 // 窄腰统一模型：构造/解码 PDU 全程走 SmppAdapter（实现 ProtocolAdapter），不再裸 codec。
 use rsms_codec_smpp::adapter::SmppAdapter;
 use rsms_model::{
@@ -107,30 +105,27 @@ impl TestBusinessHandler {
 }
 
 #[async_trait]
-impl BusinessHandler for TestBusinessHandler {
+impl MessageHandler for TestBusinessHandler {
     fn name(&self) -> &'static str {
         "smpp-test-biz"
     }
 
-    async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        // 收包经 SmppAdapter 解为统一消息，按 UnifiedMessage 分支处理。
-        if let Ok(msg) = SmppAdapter.decode(frame) {
-            match msg {
-                UnifiedMessage::Submit(s) => {
-                    self.submit_count.fetch_add(1, Ordering::Relaxed);
-                    let content = String::from_utf8_lossy(&s.content).to_string();
-                    self.messages.lock().unwrap().push(content);
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 框架已按协议解码为统一消息，直接 match 统一枚举。
+        match msg {
+            UnifiedMessage::Submit(s) => {
+                self.submit_count.fetch_add(1, Ordering::Relaxed);
+                let content = String::from_utf8_lossy(&s.content).to_string();
+                self.messages.lock().unwrap().push(content);
 
-                    // 回 SubmitResp：msg_id 用 SMPP 的 MessageId::Text，sequence_of 回显请求序列。
-                    let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
-                        msg_id: MessageId::Text("000".to_string()),
-                        status: 0,
-                    });
-                    let resp_bytes = SmppAdapter.encode(&resp, SmppAdapter.sequence_of(frame))?;
-                    ctx.conn.write_frame(&resp_bytes).await?;
-                }
-                _ => {}
+                // 一步回执（窄腰）：框架按请求帧序列编码 SubmitResp 并写回。
+                ctx.reply(UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                    msg_id: MessageId::Text("000".to_string()),
+                    status: 0,
+                }))
+                .await?;
             }
+            _ => {}
         }
         Ok(())
     }
@@ -243,25 +238,14 @@ impl TestClientHandler {
 }
 
 #[async_trait]
-impl ClientHandler for TestClientHandler {
+impl MessageHandler for TestClientHandler {
     fn name(&self) -> &'static str {
         "smpp-test-client"
     }
 
-    async fn on_inbound(&self, ctx: &rsms_connector::client::ClientContext<'_>, frame: &Frame) -> Result<()> {
-        let pdu = frame.data_as_slice();
-        if pdu.len() < 16 {
-            return Ok(());
-        }
-
-        // 消息类型与结果码（command_status）均经 SmppAdapter 透出到统一模型，
-        // BindResp/SubmitResp 的 status 直接取自 UnifiedMessage（不再裸读 PDU 头部）。
-        let unified = match SmppAdapter.decode(frame) {
-            Ok(m) => m,
-            Err(_) => return Ok(()),
-        };
-
-        match unified {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 框架已按协议解码为统一消息，直接 match 统一枚举。
+        match msg {
             // adapter 把 BindTransmitter/Transceiver Resp 统一归为 BindResp，status=command_status。
             UnifiedMessage::BindResp(r) => {
                 *self.bind_resp_status.lock().unwrap() = Some(r.status);
@@ -272,12 +256,10 @@ impl ClientHandler for TestClientHandler {
             UnifiedMessage::SubmitResp(r) => {
                 *self.submit_resp_status.lock().unwrap() = Some(r.status);
             }
-            // DeliverSm（MO 或回执）→ 统一模型 Deliver/Report，均回 DeliverResp（sequence_of 回显请求序列）。
+            // DeliverSm（MO 或回执）→ 统一模型 Deliver/Report，均回 DeliverResp（ctx.reply 自动回显请求序列）。
             UnifiedMessage::Deliver(_) | UnifiedMessage::Report(_) => {
                 self.deliver_count.fetch_add(1, Ordering::Relaxed);
-                let resp_bytes =
-                    SmppAdapter.encode(&UnifiedMessage::DeliverResp, SmppAdapter.sequence_of(frame))?;
-                ctx.conn.write_frame(&resp_bytes).await?;
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
             UnifiedMessage::PingResp => {
                 self.enquire_link_resp_count.fetch_add(1, Ordering::Relaxed);
@@ -294,7 +276,7 @@ impl ClientHandler for TestClientHandler {
 
 pub async fn start_test_server(
     auth_handler: Arc<dyn AuthHandler>,
-    biz_handler: Arc<dyn BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
     event_handler: Arc<dyn ServerEventHandler>,
     idle_timeout_secs: u32,
 ) -> Result<(u16, tokio::task::JoinHandle<()>)> {
@@ -306,7 +288,7 @@ pub async fn start_test_server(
         idle_timeout_secs as u16,
     ).with_protocol(Protocol::Smpp));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(auth_handler)
         .account_config_provider(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>)
         .event_handler(event_handler)
@@ -323,7 +305,7 @@ pub async fn start_test_server(
 
 pub async fn start_test_server_with_pool(
     auth_handler: Arc<dyn AuthHandler>,
-    biz_handler: Arc<dyn BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
     event_handler: Arc<dyn ServerEventHandler>,
     idle_timeout_secs: u32,
 ) -> Result<(u16, Arc<rsms_connector::ConnectionPool>, tokio::task::JoinHandle<()>)> {
@@ -335,7 +317,7 @@ pub async fn start_test_server_with_pool(
         idle_timeout_secs as u16,
     ).with_protocol(Protocol::Smpp));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(auth_handler)
         .account_config_provider(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>)
         .event_handler(event_handler)
@@ -391,9 +373,10 @@ mod tests {
         let evt = Arc::new(TestEventHandler::new());
         let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30).await.unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smpp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
+        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmppDecoder)
+            .with_message_handler(client_handler.clone())
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -430,9 +413,10 @@ mod tests {
         let evt = Arc::new(TestEventHandler::new());
         let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30).await.unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smpp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
+        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmppDecoder)
+            .with_message_handler(client_handler.clone())
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -469,9 +453,10 @@ mod tests {
         let evt = Arc::new(TestEventHandler::new());
         let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30).await.unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smpp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
+        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmppDecoder)
+            .with_message_handler(client_handler.clone())
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -506,9 +491,10 @@ mod tests {
         let evt = Arc::new(TestEventHandler::new());
         let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30).await.unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smpp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
+        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmppDecoder)
+            .with_message_handler(client_handler.clone())
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -544,9 +530,10 @@ mod tests {
         let evt = Arc::new(TestEventHandler::new());
         let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30).await.unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smpp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
+        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmppDecoder)
+            .with_message_handler(client_handler.clone())
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -585,9 +572,10 @@ mod tests {
             .await
             .unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smpp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
+        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmppDecoder)
+            .with_message_handler(client_handler.clone())
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -626,9 +614,10 @@ mod tests {
         let evt = Arc::new(TestEventHandler::new());
         let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30).await.unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smpp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
+        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmppDecoder)
+            .with_message_handler(client_handler.clone())
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -663,9 +652,10 @@ mod tests {
         let evt = Arc::new(TestEventHandler::new());
         let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30).await.unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smpp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
+        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmppDecoder)
+            .with_message_handler(client_handler.clone())
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -701,9 +691,10 @@ mod tests {
         let client_evt = Arc::new(TestClientEventHandler::new());
         let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 2).await.unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smpp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
+        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmppDecoder)
+            .with_message_handler(client_handler.clone())
             .client_config(ClientConfig::new())
             .event_handler(client_evt.clone())
             .connect()

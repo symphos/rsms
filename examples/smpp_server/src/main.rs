@@ -29,21 +29,20 @@
 // ============================================================================
 
 use async_trait::async_trait;
-use rsms_business::BusinessHandler;
-use rsms_business::InboundContext;
+use rsms_business::{MessageContext, MessageHandler};
 use rsms_codec_smpp::adapter::SmppAdapter;
 use rsms_connector::{
     ServerBuilder, AccountConfig, AccountConfigProvider, AccountPoolConfig, AuthCredentials,
     AuthHandler, AuthResult, MessageItem, MessageSource, ProtocolConnection, ServerEventHandler,
 };
-use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Protocol, Frame, RawPdu, Result};
+use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Protocol, RawPdu, Result};
 use rsms_longmsg::{
     LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser,
     split::SmsAlphabet,
 };
 use rsms_model::{
     Address, Concat, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra, Sequence,
-    SmppExtra, UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmitResp,
+    UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmitResp,
 };
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -335,29 +334,20 @@ struct SmppBusinessHandler {
 }
 
 #[async_trait]
-impl BusinessHandler for SmppBusinessHandler {
+impl MessageHandler for SmppBusinessHandler {
     fn name(&self) -> &'static str {
         "smpp-business"
     }
 
-    async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        let unified = match SmppAdapter.decode(frame) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(conn_id = ctx.conn.id(), "消息解码失败: {}", e);
-                return Ok(());
-            }
-        };
-
-        match unified {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 框架已按协议解码为统一消息，业务直接按枚举分支处理。
+        match msg {
             UnifiedMessage::Submit(submit) => {
-                self.handle_submit(ctx, frame, submit).await?;
+                self.handle_submit(ctx, submit).await?;
             }
             UnifiedMessage::Deliver(_) | UnifiedMessage::Report(_) => {
-                // 客户端上行 DeliverSm（极少见），回 DeliverResp（sequence_of 自动回显请求序列）
-                let bytes =
-                    SmppAdapter.encode(&UnifiedMessage::DeliverResp, SmppAdapter.sequence_of(frame))?;
-                ctx.conn.write_frame(&bytes).await?;
+                // 客户端上行 DeliverSm（极少见），回 DeliverResp（ctx.reply 自动回显请求序列）
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
             UnifiedMessage::Ping => {
                 tracing::debug!(conn_id = ctx.conn.id(), "收到 EnquireLink");
@@ -371,9 +361,8 @@ impl BusinessHandler for SmppBusinessHandler {
 impl SmppBusinessHandler {
     async fn handle_submit(
         &self,
-        ctx: &InboundContext,
-        frame: &Frame,
-        submit: rsms_model::UnifiedSubmit,
+        ctx: &MessageContext,
+        submit: &rsms_model::UnifiedSubmit,
     ) -> Result<()> {
         let phone = submit
             .dests
@@ -382,20 +371,15 @@ impl SmppBusinessHandler {
             .unwrap_or_else(|| "unknown".to_string());
         let source = submit.src.number.clone();
 
-        // 生成 msg_id：经 IdGenerator（无则回退用序列号），文本化承载到 SubmitResp
-        let msg_id = ctx
-            .id_generator
-            .as_ref()
-            .map(|g| g.next_msg_id().to_string())
-            .unwrap_or_else(|| format!("{:010}", frame.sequence_id));
+        // 生成 msg_id：经 IdGenerator 分配，文本化承载到 SubmitResp。
+        let msg_id = ctx.id_generator.next_msg_id().to_string();
 
-        // 回 SubmitResp（框架不自动回，业务方自己回）。sequence_of 自动回显请求序列。
-        let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+        // 一步回执（窄腰）：框架按请求帧序列编码 SubmitResp 并写回，业务不再手剥序列/手拼字节。
+        ctx.reply(UnifiedMessage::SubmitResp(UnifiedSubmitResp {
             msg_id: MessageId::Text(msg_id.clone()),
             status: 0,
-        });
-        let resp_bytes = SmppAdapter.encode(&resp, SmppAdapter.sequence_of(frame))?;
-        ctx.conn.write_frame(&resp_bytes).await?;
+        }))
+        .await?;
 
         // 长短信合包：adapter 已把 UDH 剥成 submit.concat、content 为纯载荷；
         // 据 concat 重建含 UDH 段交给 merger（其内部再 strip_udh 取 payload 合并）。
@@ -580,7 +564,7 @@ async fn main() -> Result<()> {
     let merger = Arc::new(std::sync::Mutex::new(LongMessageMerger::new()));
 
     let server = ServerBuilder::new(config)
-        .handlers(vec![Arc::new(SmppBusinessHandler {
+        .message_handlers(vec![Arc::new(SmppBusinessHandler {
             msg_source: msg_source.clone(),
             merger: merger.clone(),
         })])
