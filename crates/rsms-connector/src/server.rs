@@ -85,7 +85,7 @@ impl ServerBuilder {
         self
     }
 
-    /// 一次性设置窄腰处理器列表（覆盖已有）。
+    /// 一次性设置窄腰处理器列表（覆盖已有）。设置后本连接走窄腰路径，旧 `BusinessHandler` 列表被忽略。
     pub fn message_handlers(mut self, handlers: Vec<Arc<dyn MessageHandler>>) -> Self {
         self.message_handlers = handlers;
         self

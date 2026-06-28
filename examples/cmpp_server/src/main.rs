@@ -19,8 +19,8 @@
 // 核心流程：
 //   1. 从 accounts.conf 读取账号配置
 //   2. 客户端连接 → 框架自动完成 CMPP 协议握手（Connect/ConnectResp）
-//   3. 客户端发送 Submit → BusinessHandler.on_inbound() 收到
-//   4. 业务方解码为 UnifiedMessage::Submit、回 SubmitResp、处理业务（含长短信合包）
+//   3. 客户端发送 Submit → MessageHandler.on_message() 收到（框架已解码为 UnifiedMessage::Submit）
+//   4. 业务方按 UnifiedMessage::Submit 分支处理、用 ctx.reply 回 SubmitResp（含长短信合包）
 //   5. 通过 MessageSource 异步发送 Deliver(MO) / Report（状态报告）
 // ============================================================================
 
