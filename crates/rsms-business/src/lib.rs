@@ -1,10 +1,10 @@
 //! 业务处理器扩展（对齐 `BusinessHandlerInterface`）。
 use async_trait::async_trait;
+use rsms_core::{EndpointConfig, Frame, IdGenerator, Result};
+use std::sync::Arc;
 
 mod message_context;
 pub use message_context::MessageContext;
-use rsms_core::{EndpointConfig, Frame, IdGenerator, Result};
-use std::sync::Arc;
 
 /// 入站消息的上下文，由框架在每次 `BusinessHandler::on_inbound` 调用前构造并传入。
 pub struct InboundContext {
