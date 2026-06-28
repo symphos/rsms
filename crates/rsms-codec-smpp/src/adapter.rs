@@ -761,6 +761,7 @@ mod tests {
 
     #[test]
     fn report_resp_equals_deliver_resp() {
+        // SMPP 报告经 DeliverSm(esm_class=0x04) 承载，对报告的响应即 DeliverSmResp。
         let seq = Sequence::Plain(42);
         let a = SmppAdapter.encode(&UnifiedMessage::ReportResp, seq).unwrap();
         let b = SmppAdapter.encode(&UnifiedMessage::DeliverResp, seq).unwrap();

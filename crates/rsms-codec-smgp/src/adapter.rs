@@ -733,6 +733,7 @@ mod tests {
 
     #[test]
     fn report_resp_equals_deliver_resp() {
+        // SMGP 报告经 Deliver(is_report=1) 承载，对报告的响应即 DeliverResp。
         let seq = Sequence::Plain(42);
         let a = SmgpAdapter.encode(&UnifiedMessage::ReportResp, seq).unwrap();
         let b = SmgpAdapter.encode(&UnifiedMessage::DeliverResp, seq).unwrap();

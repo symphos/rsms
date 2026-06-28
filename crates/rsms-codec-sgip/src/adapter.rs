@@ -485,7 +485,11 @@ mod tests {
         let seq = Sequence::Sgip { node_id: 1, timestamp: 2, number: 3 };
         let bytes = SgipAdapter.encode(&UnifiedMessage::ReportResp, seq).unwrap();
         let frame = frame_of(bytes);
-        assert_eq!(SgipAdapter.decode(&frame).unwrap(), UnifiedMessage::ReportResp);
+        assert_eq!(
+            SgipAdapter.decode(&frame).unwrap(),
+            UnifiedMessage::ReportResp,
+            "encode→decode 往返后应无损回到 ReportResp"
+        );
     }
 
     #[test]
