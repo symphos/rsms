@@ -1,10 +1,11 @@
 use async_trait::async_trait;
 use rsms_connector::{
     AuthCredentials, AuthHandler, AuthResult,
-    AccountConfigProvider, CmppDecoder, ClientBuilder,
+    AccountConfigProvider, CmppDecoder, ClientBuilder, NoopClientHandler,
     protocol::MessageSource,
 };
 use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler};
+use rsms_business::{MessageContext, MessageHandler};
 use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Frame, Result};
 // 窄腰统一模型：编解码经 CmppAdapter；V2.0 Submit 构造（SubmitV20）adapter 无法表达，保留裸 codec。
 // compute_connect_auth 为鉴权工具，保留。
@@ -223,6 +224,66 @@ impl ClientState {
             }
         }
         None
+    }
+}
+
+/// V3.0 窄腰路径：框架已 decode，直接 match 统一消息枚举。
+/// V2.0 连接（`stress_test_cmpp20_mt_mo`）继续走旧 `ClientHandler` 路径，
+/// 因 V2.0 ConnectResp/SubmitResp 字段宽度与 V3.0 不同，默认 adapter.decode() 无法正确解码。
+#[async_trait]
+impl MessageHandler for ClientState {
+    fn name(&self) -> &'static str {
+        "stress_client_mh"
+    }
+
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        match msg {
+            UnifiedMessage::BindResp(resp) => {
+                *self.connect_status.lock().unwrap() = Some(resp.status);
+                if resp.status == 0 {
+                    self.connected.store(true, Ordering::Relaxed);
+                }
+            }
+            UnifiedMessage::SubmitResp(resp) => {
+                self.stats.submit_resp_received.fetch_add(1, Ordering::Relaxed);
+                if resp.status == 0 {
+                    if let MessageId::Binary(b) = &resp.msg_id {
+                        let mut msg_id = [0u8; 8];
+                        let n = b.len().min(8);
+                        msg_id[..n].copy_from_slice(&b[..n]);
+                        self.msg_ids.write().unwrap().push_back(msg_id);
+                    }
+                } else {
+                    self.stats.submit_errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            // 状态报告（Deliver registered_delivery=1）→ Report。按结构化 msg_id 匹配并回 DeliverResp。
+            UnifiedMessage::Report(r) => {
+                self.stats.report_received.fetch_add(1, Ordering::Relaxed);
+                if let MessageId::Binary(b) = &r.msg_id {
+                    let mut report_msg_id = [0u8; 8];
+                    let n = b.len().min(8);
+                    report_msg_id[..n].copy_from_slice(&b[..n]);
+                    if !self.matched_msg_ids.lock().unwrap().contains(&report_msg_id) {
+                        let mut pending = self.msg_ids.write().unwrap();
+                        if let Some(pos) = pending.iter().position(|&id| id == report_msg_id) {
+                            pending.remove(pos);
+                            self.matched_msg_ids.lock().unwrap().insert(report_msg_id);
+                            self.stats.report_matched.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
+            }
+            // MO 上行（registered_delivery=0）→ Deliver。
+            UnifiedMessage::Deliver(d) => {
+                self.stats.mo_received.fetch_add(1, Ordering::Relaxed);
+                tracing::trace!("[Client] Received MO from {}: {:02x?}", d.src.number, d.content);
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -551,12 +612,24 @@ async fn run_stress_test(version: u8) {
             "stress-client", "127.0.0.1", port, 1024, 30,
         ).with_window_size(2048).with_log_level(tracing::Level::WARN));
 
-        let conn = ClientBuilder::new(endpoint, client_state.clone(), CmppDecoder)
-            .client_config(ClientConfig::new())
-            .message_source(msg_source.clone() as Arc<dyn MessageSource>)
-            .connect()
-            .await
-            .expect("connect");
+        // V3.0：窄腰新路径（NoopClientHandler 占位 + with_message_handler）。
+        // V2.0：旧路径（client_state 作 ClientHandler）——默认 adapter.decode() 无法正确解码 V2.0 应答。
+        let conn = if version == CMPP_VERSION_3_0 {
+            ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+                .with_message_handler(client_state.clone())
+                .client_config(ClientConfig::new())
+                .message_source(msg_source.clone() as Arc<dyn MessageSource>)
+                .connect()
+                .await
+                .expect("connect")
+        } else {
+            ClientBuilder::new(endpoint, client_state.clone(), CmppDecoder)
+                .client_config(ClientConfig::new())
+                .message_source(msg_source.clone() as Arc<dyn MessageSource>)
+                .connect()
+                .await
+                .expect("connect")
+        };
 
         let connect_pdu = client_state.build_connect_pdu();
         conn.send_request(connect_pdu).await.expect("send connect");
@@ -674,9 +747,11 @@ async fn run_stress_test_with_connections(version: u8, num_connections: usize) {
             "stress-client", "127.0.0.1", port, 2048, 30,
         ).with_window_size(2048).with_log_level(tracing::Level::WARN));
 
+        // run_stress_test_with_connections は常に V3.0 で呼ばれるため、新路径のみ使用。
         let mut conn = None;
         for retry in 0..50 {
-            match ClientBuilder::new(endpoint.clone(), client_state.clone(), CmppDecoder)
+            match ClientBuilder::new(endpoint.clone(), Arc::new(NoopClientHandler), CmppDecoder)
+                .with_message_handler(client_state.clone())
                 .client_config(ClientConfig::new())
                 .message_source(msg_source.clone() as Arc<dyn MessageSource>)
                 .connect()

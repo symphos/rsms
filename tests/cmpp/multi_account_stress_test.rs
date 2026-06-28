@@ -1,11 +1,12 @@
 use async_trait::async_trait;
 use rsms_connector::{
     AuthCredentials, AuthHandler, AuthResult,
-    AccountConfigProvider, CmppDecoder, ClientBuilder,
+    AccountConfigProvider, CmppDecoder, ClientBuilder, NoopClientHandler,
     protocol::MessageSource,
 };
-use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler};
-use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Frame, Result};
+use rsms_connector::client::ClientConfig;
+use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Result};
+use rsms_business::{MessageContext, MessageHandler};
 // 窄腰统一模型：本测试仅 CMPP 3.0，全程编解码经 CmppAdapter。compute_connect_auth 为鉴权工具，保留。
 use rsms_codec_cmpp::adapter::CmppAdapter;
 use rsms_codec_cmpp::auth::compute_connect_auth;
@@ -126,19 +127,14 @@ impl ClientState {
 }
 
 #[async_trait]
-impl ClientHandler for ClientState {
+impl MessageHandler for ClientState {
     fn name(&self) -> &'static str {
         "multi-account-stress-client"
     }
 
-    async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        // 统一模型分支：BindResp/SubmitResp（取 8B 二进制 MsgId）/Report|Deliver（回 DeliverResp）。
-        let unified = match CmppAdapter.decode(frame) {
-            Ok(m) => m,
-            Err(_) => return Ok(()),
-        };
-
-        match unified {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 窄腰主路径：框架已 decode，直接 match 统一消息枚举。
+        match msg {
             UnifiedMessage::BindResp(resp) => {
                 *self.connect_status.lock().unwrap() = Some(resp.status);
                 if resp.status == 0 {
@@ -158,8 +154,8 @@ impl ClientHandler for ClientState {
                     self.stats.submit_errors.fetch_add(1, Ordering::Relaxed);
                 }
             }
+            // 状态报告（Deliver registered_delivery=1）→ Report。按解码后的结构化 msg_id 匹配。
             UnifiedMessage::Report(r) => {
-                // 按解码后的结构化 msg_id 匹配（回执经 adapter 编码为定长二进制，正文文本被丢弃）。
                 self.stats.report_received.fetch_add(1, Ordering::Relaxed);
                 if let MessageId::Binary(b) = &r.msg_id {
                     let mut report_msg_id = [0u8; 8];
@@ -174,61 +170,16 @@ impl ClientHandler for ClientState {
                         }
                     }
                 }
-                let resp_bytes = CmppAdapter.encode(&UnifiedMessage::DeliverResp, CmppAdapter.sequence_of(frame))?;
-                ctx.conn.write_frame(&resp_bytes).await?;
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
-            UnifiedMessage::Deliver(d) => {
-                self.handle_deliver_common(0, &d.content);
-                let resp_bytes = CmppAdapter.encode(&UnifiedMessage::DeliverResp, CmppAdapter.sequence_of(frame))?;
-                ctx.conn.write_frame(&resp_bytes).await?;
+            // MO 上行（registered_delivery=0）→ Deliver。
+            UnifiedMessage::Deliver(_d) => {
+                self.stats.mo_received.fetch_add(1, Ordering::Relaxed);
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
             _ => {}
         }
-
         Ok(())
-    }
-}
-
-impl ClientState {
-    fn handle_deliver_common(&self, registered_delivery: u8, msg_content: &[u8]) {
-        if registered_delivery == 1 {
-            let content = String::from_utf8_lossy(msg_content).to_string();
-            if let Some(report_msg_id) = Self::parse_msg_id_from_report(&content) {
-                self.stats.report_received.fetch_add(1, Ordering::Relaxed);
-                let matched = self.matched_msg_ids.lock().unwrap();
-                if matched.contains(&report_msg_id) {
-                    return;
-                }
-                drop(matched);
-                let mut pending = self.msg_ids.write().unwrap();
-                if let Some(pos) = pending.iter().position(|&id| id == report_msg_id) {
-                    pending.remove(pos);
-                    self.matched_msg_ids.lock().unwrap().insert(report_msg_id);
-                    self.stats.report_matched.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        } else {
-            self.stats.mo_received.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    fn parse_msg_id_from_report(content: &str) -> Option<[u8; 8]> {
-        let parts: Vec<&str> = content.split_whitespace().collect();
-        if parts.len() >= 2 && parts[0].starts_with("id:") {
-            let hex_str = parts[0].trim_start_matches("id:");
-            if hex_str.len() == 16 {
-                let mut msg_id = [0u8; 8];
-                for i in 0..8 {
-                    if let Ok(byte) = u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16) {
-                        msg_id[i] = byte;
-                    } else {
-                        return None;
-                    }
-                }
-                return Some(msg_id);
-            }
-        }
-        None
     }
 }
 
@@ -247,15 +198,15 @@ impl ServerHandler {
 }
 
 #[async_trait]
-impl rsms_business::BusinessHandler for ServerHandler {
+impl MessageHandler for ServerHandler {
     fn name(&self) -> &'static str {
         "multi-account-stress-server"
     }
 
-    async fn on_inbound(&self, ctx: &rsms_business::InboundContext, frame: &Frame) -> Result<()> {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
         let account = ctx.conn.authenticated_account().await.unwrap_or_else(|| "unknown".to_string());
-        // 统一模型：收到 Submit → 回 SubmitResp（8B 二进制 MsgId 编入 count）+ push report item。
-        if let Ok(UnifiedMessage::Submit(submit)) = CmppAdapter.decode(frame) {
+        // 窄腰主路径：框架已 decode，直接 match Submit → 回 SubmitResp + push report item。
+        if let UnifiedMessage::Submit(submit) = msg {
             let count = self.submit_count.fetch_add(1, Ordering::Relaxed);
             let mut msg_id = [0u8; 8];
             msg_id[4] = ((count >> 24) & 0xFF) as u8;
@@ -263,12 +214,10 @@ impl rsms_business::BusinessHandler for ServerHandler {
             msg_id[6] = ((count >> 8) & 0xFF) as u8;
             msg_id[7] = (count & 0xFF) as u8;
 
-            let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+            ctx.reply(UnifiedMessage::SubmitResp(UnifiedSubmitResp {
                 msg_id: MessageId::Binary(msg_id.to_vec()),
                 status: 0,
-            });
-            let resp_bytes = CmppAdapter.encode(&resp, CmppAdapter.sequence_of(frame))?;
-            ctx.conn.write_frame(&resp_bytes).await?;
+            })).await?;
 
             let dest_id = submit.dests.first().map(|a| a.number.clone()).unwrap_or_default();
             let item = ReportItem {
@@ -319,7 +268,7 @@ impl AuthHandler for PasswordAuthHandler {
 use rsms_connector::ServerBuilder;
 
 async fn start_test_server(
-    biz_handler: Arc<dyn rsms_business::BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
 ) -> Result<(u16, Arc<rsms_connector::AccountPool>, tokio::task::JoinHandle<()>)> {
     let cfg = Arc::new(EndpointConfig::new(
         "multi-account-stress-server",
@@ -333,7 +282,7 @@ async fn start_test_server(
         auth = auth.add_account(account, password);
     }
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(Arc::new(auth))
         .account_config_provider(Arc::new(MockAccountConfigProvider::with_limits(10000, 4096)) as Arc<dyn AccountConfigProvider>)
         .serve()
@@ -553,7 +502,8 @@ async fn stress_test_cmpp30_5accounts_5connections() {
                 30,
             ).with_window_size(WINDOW_SIZE).with_log_level(tracing::Level::WARN));
 
-            let conn = ClientBuilder::new(endpoint, client_state.clone(), CmppDecoder)
+            let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+                .with_message_handler(client_state.clone())
                 .client_config(ClientConfig::new())
                 .message_source(msg_source.clone() as Arc<dyn MessageSource>)
                 .connect()
