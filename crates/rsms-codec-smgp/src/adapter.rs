@@ -303,9 +303,10 @@ fn unified_to_smgp(msg: &UnifiedMessage, seq: Sequence) -> Result<SmgpMessage> {
                 },
             }
         }
-        UnifiedMessage::DeliverResp => SmgpMessage::DeliverResp {
+        UnifiedMessage::DeliverResp | UnifiedMessage::ReportResp => SmgpMessage::DeliverResp {
             sequence_id: seq,
             // adapter 的 DeliverResp 不携带回执 MsgId（统一模型无此字段），置默认；仅用于 shadow/收敛。
+            // ReportResp 同理：SMGP 报告经 Deliver(is_report=1) 承载，对报告的响应即 DeliverResp。
             resp: DeliverResp { msg_id: SmgpMsgId::default(), status: 0 },
         },
         UnifiedMessage::Bind(b) => {
@@ -728,5 +729,13 @@ mod tests {
             }
             _ => panic!("expected Report"),
         }
+    }
+
+    #[test]
+    fn report_resp_equals_deliver_resp() {
+        let seq = Sequence::Plain(42);
+        let a = SmgpAdapter.encode(&UnifiedMessage::ReportResp, seq).unwrap();
+        let b = SmgpAdapter.encode(&UnifiedMessage::DeliverResp, seq).unwrap();
+        assert_eq!(a, b);
     }
 }

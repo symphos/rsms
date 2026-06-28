@@ -352,10 +352,11 @@ fn unified_to_cmpp_with_version(
                 resp: SubmitResp { msg_id, result: r.status },
             }
         }
-        UnifiedMessage::DeliverResp => CmppMessage::DeliverResp {
+        UnifiedMessage::DeliverResp | UnifiedMessage::ReportResp => CmppMessage::DeliverResp {
             version,
             sequence_id: seq,
             // 统一模型 DeliverResp 不携带回执 MsgId，置默认；result=0 表示成功。
+            // ReportResp 同理：CMPP 报告经 Deliver 承载，对报告的响应即 DeliverResp。
             resp: DeliverResp { msg_id: [0u8; 8], result: 0 },
         },
         UnifiedMessage::Ping => CmppMessage::ActiveTest { version: CmppVersion::V30, sequence_id: seq },
@@ -909,5 +910,14 @@ mod tests {
             }
             other => panic!("encode_with_version(V20) 应产 DeliverV20，得到 {other:?}"),
         }
+    }
+
+    #[test]
+    fn report_resp_equals_deliver_resp() {
+        // CMPP 无独立 Report_Resp：报告经 Deliver 承载，故对报告的响应即 DeliverResp。
+        let seq = Sequence::Plain(42);
+        let a = CmppAdapter.encode(&UnifiedMessage::ReportResp, seq).unwrap();
+        let b = CmppAdapter.encode(&UnifiedMessage::DeliverResp, seq).unwrap();
+        assert_eq!(a, b);
     }
 }
