@@ -1,25 +1,24 @@
 use async_trait::async_trait;
-use rsms_business::{BusinessHandler, InboundContext};
-// 窄腰统一模型：V3.0-only 的构造（Bind/Submit/Deliver-MO）经 CmppAdapter。
-// 但本测试同时覆盖 CMPP 2.0 长短信（SubmitV20/DeliverV20 + decode_message_with_version），
-// 而 adapter 仅 V3.0，无法表达 V2.0；故版本化 decode（biz/client handler）与全部 V2.0 构造保留裸
-// codec（规则 3：纯 V2.0 wire 路径不可经统一模型表达）。compute_connect_auth 是鉴权工具，保留。
+use rsms_business::{MessageContext, MessageHandler};
+// 窄腰统一模型：V3.0 构造（Bind/Submit/Deliver-MO）经 CmppAdapter；V2.0 构造保留裸 codec
+// （SubmitV20/DeliverV20，规则 3：纯 V2.0 wire 路径）。服务端/客户端 handler 走新路径
+// （MessageHandler + ctx.reply），框架版本感知 decode/encode（D1a/D1b）自动处理两版本差异。
+// compute_connect_auth 是 MD5 鉴权工具，保留。
 use rsms_codec_cmpp::adapter::CmppAdapter;
 use rsms_codec_cmpp::{
-    decode_message, decode_message_with_version, auth::compute_connect_auth,
-    CmppMessage, CommandId, DeliverV20, DeliverResp, Pdu,
-    SubmitResp, SubmitV20,
+    auth::compute_connect_auth,
+    DeliverV20, Pdu, SubmitV20,
 };
 use rsms_model::{
-    Address, CmppExtra, Concat, Encoding, ProtocolAdapter, ProtocolExtra, Sequence, UnifiedBind,
-    UnifiedDeliver, UnifiedMessage, UnifiedSubmit,
+    Address, CmppExtra, Concat, Encoding, MessageId, ProtocolAdapter, ProtocolExtra, Sequence,
+    UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedSubmit, UnifiedSubmitResp,
 };
 use rsms_connector::{
     ClientBuilder, ServerBuilder, AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler,
-    AuthResult, ClientHandler, CmppDecoder,
+    AuthResult, NoopClientHandler, CmppDecoder, ProtocolConnection,
 };
-use rsms_connector::client::{ClientConfig, ClientContext, ClientConnection};
-use rsms_core::{ConnectionInfo, Frame, RawPdu, EndpointConfig, Result};
+use rsms_connector::client::{ClientConfig, ClientConnection};
+use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Result};
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
 use rsms_longmsg::split::SmsAlphabet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -40,6 +39,18 @@ fn frame_to_concat(f: &LongMessageFrame) -> (Option<Concat>, Vec<u8>) {
         )
     } else {
         (None, f.content.clone())
+    }
+}
+
+/// 消费侧：把窄腰 (concat, 纯载荷) 重建为含 UDH 的分段字节，供既有 merge_*/has_udhi 断言复用。
+fn seg_with_udh(concat: &Option<Concat>, content: &[u8]) -> Vec<u8> {
+    match concat {
+        Some(c) => {
+            let mut v = c.to_udh_prefix();
+            v.extend_from_slice(content);
+            v
+        }
+        None => content.to_vec(),
     }
 }
 
@@ -86,57 +97,43 @@ struct LongMsgSegment {
 }
 
 struct LongMsgBizHandler {
-    version: u8,
     received_segments: Arc<Mutex<Vec<LongMsgSegment>>>,
 }
 
 impl LongMsgBizHandler {
-    fn new(version: u8) -> Self {
+    fn new() -> Self {
         Self {
-            version,
             received_segments: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
 
 #[async_trait]
-impl BusinessHandler for LongMsgBizHandler {
+impl MessageHandler for LongMsgBizHandler {
     fn name(&self) -> &'static str {
         "longmsg-biz"
     }
 
-    async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        let msg = if self.version == 0x20 {
-            decode_message_with_version(frame.data_as_slice(), Some(0x20))
-        } else {
-            decode_message(frame.data_as_slice())
-        };
-        if let Ok(msg) = msg {
-            match msg {
-                CmppMessage::SubmitV20 { submit: s, .. } => {
-                    self.received_segments.lock().unwrap().push(LongMsgSegment {
-                        pk_total: s.pk_total,
-                        pk_number: s.pk_number,
-                        tpudhi: s.tpudhi,
-                        msg_content: s.msg_content.clone(),
-                    });
-                    let resp = SubmitResp { msg_id: [0u8; 8], result: 0 };
-                    let resp_pdu: Pdu = resp.into();
-                    ctx.conn.write_frame(resp_pdu.to_pdu_bytes(frame.sequence_id).as_slice()).await?;
-                }
-                CmppMessage::SubmitV30 { submit: s, .. } => {
-                    self.received_segments.lock().unwrap().push(LongMsgSegment {
-                        pk_total: s.pk_total,
-                        pk_number: s.pk_number,
-                        tpudhi: s.tpudhi,
-                        msg_content: s.msg_content.clone(),
-                    });
-                    let resp = SubmitResp { msg_id: [0u8; 8], result: 0 };
-                    let resp_pdu: Pdu = resp.into();
-                    ctx.conn.write_frame(resp_pdu.to_pdu_bytes(frame.sequence_id).as_slice()).await?;
-                }
-                _ => {}
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 窄腰新路径：框架已按 conn.protocol_version() 版本感知解码（D1a），
+        // V2.0/V3.0 Submit 均产 UnifiedMessage::Submit；concat 承载分段信息，content 为纯载荷。
+        // 据 concat 重建含 UDH 的分段字节，供 merge_submit_segments 合包断言复用。
+        // ctx.reply 版本感知回 V2.0/V3.0 SubmitResp（D1b），无需手动 encode/write_frame。
+        match msg {
+            UnifiedMessage::Submit(s) => {
+                let udh_content = seg_with_udh(&s.concat, &s.content);
+                self.received_segments.lock().unwrap().push(LongMsgSegment {
+                    pk_total: s.concat.as_ref().map(|c| c.total).unwrap_or(1),
+                    pk_number: s.concat.as_ref().map(|c| c.sequence).unwrap_or(1),
+                    tpudhi: if s.concat.is_some() { 1 } else { 0 },
+                    msg_content: udh_content,
+                });
+                ctx.reply(UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                    msg_id: MessageId::Binary(vec![0u8; 8]),
+                    status: 0,
+                })).await?;
             }
+            _ => {}
         }
         Ok(())
     }
@@ -236,64 +233,45 @@ impl LongMsgClientHandler {
 }
 
 #[async_trait]
-impl ClientHandler for LongMsgClientHandler {
+impl MessageHandler for LongMsgClientHandler {
     fn name(&self) -> &'static str {
         "longmsg-client"
     }
 
-    async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        let pdu = frame.data_as_slice();
-        if pdu.len() < 12 {
-            return Ok(());
-        }
-        let cmd_id = u32::from_be_bytes([pdu[4], pdu[5], pdu[6], pdu[7]]);
-
-        if cmd_id == CommandId::ConnectResp as u32 && pdu.len() >= 25 {
-            let status = u32::from_be_bytes([pdu[12], pdu[13], pdu[14], pdu[15]]);
-            if status == 0 {
-                self.connected.store(true, Ordering::Relaxed);
-            }
-        } else if cmd_id == CommandId::SubmitResp as u32 {
-            self.submit_resp_count.fetch_add(1, Ordering::Relaxed);
-        } else if cmd_id == CommandId::Deliver as u32 {
-            let decode_ver = if self.version == 0x20 { Some(0x20) } else { None };
-            let msg = if let Some(v) = decode_ver {
-                decode_message_with_version(pdu, Some(v))
-            } else {
-                decode_message(pdu)
-            };
-            if let Ok(msg) = msg {
-                match msg {
-                    CmppMessage::DeliverV20 { deliver: d, .. } => {
-                        if d.registered_delivery == 0 {
-                            self.deliver_segments.lock().unwrap().push(d.msg_content.clone());
-                        }
-                        let resp = DeliverResp { msg_id: [0u8; 8], result: 0 };
-                        let resp_pdu: Pdu = resp.into();
-                        ctx.conn.write_frame(resp_pdu.to_pdu_bytes(frame.sequence_id).as_slice()).await?;
-                    }
-                    CmppMessage::DeliverV30 { deliver: d, .. } => {
-                        if d.registered_delivery == 0 {
-                            self.deliver_segments.lock().unwrap().push(d.msg_content.clone());
-                        }
-                        let resp = DeliverResp { msg_id: [0u8; 8], result: 0 };
-                        let resp_pdu: Pdu = resp.into();
-                        ctx.conn.write_frame(resp_pdu.to_pdu_bytes(frame.sequence_id).as_slice()).await?;
-                    }
-                    _ => {}
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 窄腰新路径：框架已按 conn.protocol_version() 版本感知解码（D1a），
+        // V2.0/V3.0 BindResp/SubmitResp/Deliver 均产统一消息枚举。
+        // ctx.reply 版本感知回 V2.0/V3.0 DeliverResp（D1b），无需手动 encode/write_frame。
+        match msg {
+            UnifiedMessage::BindResp(resp) => {
+                if resp.status == 0 {
+                    self.connected.store(true, Ordering::Relaxed);
                 }
             }
+            UnifiedMessage::SubmitResp(_) => {
+                self.submit_resp_count.fetch_add(1, Ordering::Relaxed);
+            }
+            // MO 长短信分段（registered_delivery=0）：据 concat 重建含 UDH 段供合包断言复用，
+            // 并回 DeliverResp（框架按版本感知 encode）。
+            UnifiedMessage::Deliver(d) => {
+                self.deliver_segments
+                    .lock()
+                    .unwrap()
+                    .push(seg_with_udh(&d.concat, &d.content));
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
+            }
+            _ => {}
         }
         Ok(())
     }
 }
 
 async fn start_server(
-    biz_handler: Arc<dyn BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
 ) -> Result<(u16, Arc<rsms_connector::ConnectionPool>, tokio::task::JoinHandle<()>)> {
     let cfg = Arc::new(EndpointConfig::new("test-server", "127.0.0.1", 0, 8, 30));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(Arc::new(PasswordAuthHandler))
         .account_config_provider(Arc::new(MockAccountConfigProvider) as Arc<dyn AccountConfigProvider>)
         .serve()
@@ -309,10 +287,16 @@ async fn start_server(
 async fn connect_client(port: u16, version: u8) -> Result<(Arc<LongMsgClientHandler>, Arc<ClientConnection>)> {
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let handler = Arc::new(LongMsgClientHandler::new(version));
-    let conn = ClientBuilder::new(endpoint, handler.clone(), CmppDecoder)
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+        .with_message_handler(handler.clone())
         .client_config(ClientConfig::new())
         .connect()
         .await?;
+    // V2.0 握手：预先设置 protocol_version，使框架版本感知 decode（decode_with_version）
+    // 在收到 V2.0 ConnectResp（30B）时走 V2.0 路径而非默认 V3.0（33B 期望）。
+    // 框架当前在客户端侧不自动从 Connect PDU 提取版本，须测试侧预设。
+    // V3.0 设 Some(0x30) 等价默认行为，可统一调用。
+    conn.set_protocol_version(version).await;
     let connect_pdu = handler.build_connect_pdu();
     conn.send_request(connect_pdu).await?;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -490,7 +474,7 @@ async fn test_longmsg_v20_mt_submit() {
         .with_max_level(tracing::Level::WARN)
         .try_init();
 
-    let biz = Arc::new(LongMsgBizHandler::new(0x20));
+    let biz = Arc::new(LongMsgBizHandler::new());
     let (port, _pool, handle) = start_server(biz.clone()).await.unwrap();
 
     let (client, conn) = connect_client(port, 0x20).await.unwrap();
@@ -528,7 +512,7 @@ async fn test_longmsg_v20_mo_deliver() {
         .with_max_level(tracing::Level::WARN)
         .try_init();
 
-    let biz = Arc::new(LongMsgBizHandler::new(0x20));
+    let biz = Arc::new(LongMsgBizHandler::new());
     let (port, pool, handle) = start_server(biz.clone()).await.unwrap();
 
     let (client, _conn) = connect_client(port, 0x20).await.unwrap();
@@ -573,7 +557,7 @@ async fn test_longmsg_v20_mt_and_mo_roundtrip() {
         .with_max_level(tracing::Level::WARN)
         .try_init();
 
-    let biz = Arc::new(LongMsgBizHandler::new(0x20));
+    let biz = Arc::new(LongMsgBizHandler::new());
     let (port, pool, handle) = start_server(biz.clone()).await.unwrap();
 
     let (client, conn) = connect_client(port, 0x20).await.unwrap();
@@ -633,7 +617,7 @@ async fn test_longmsg_v20_submit_resp_all_success() {
         .with_max_level(tracing::Level::WARN)
         .try_init();
 
-    let biz = Arc::new(LongMsgBizHandler::new(0x20));
+    let biz = Arc::new(LongMsgBizHandler::new());
     let (port, _pool, handle) = start_server(biz.clone()).await.unwrap();
 
     let (client, conn) = connect_client(port, 0x20).await.unwrap();
@@ -669,7 +653,7 @@ async fn test_longmsg_v30_mt_submit() {
         .with_max_level(tracing::Level::WARN)
         .try_init();
 
-    let biz = Arc::new(LongMsgBizHandler::new(0x30));
+    let biz = Arc::new(LongMsgBizHandler::new());
     let (port, _pool, handle) = start_server(biz.clone()).await.unwrap();
 
     let (client, conn) = connect_client(port, 0x30).await.unwrap();
@@ -707,7 +691,7 @@ async fn test_longmsg_v30_mo_deliver() {
         .with_max_level(tracing::Level::WARN)
         .try_init();
 
-    let biz = Arc::new(LongMsgBizHandler::new(0x30));
+    let biz = Arc::new(LongMsgBizHandler::new());
     let (port, pool, handle) = start_server(biz.clone()).await.unwrap();
 
     let (client, _conn) = connect_client(port, 0x30).await.unwrap();
@@ -753,7 +737,7 @@ async fn test_longmsg_v30_mt_and_mo_roundtrip() {
         .with_max_level(tracing::Level::WARN)
         .try_init();
 
-    let biz = Arc::new(LongMsgBizHandler::new(0x30));
+    let biz = Arc::new(LongMsgBizHandler::new());
     let (port, pool, handle) = start_server(biz.clone()).await.unwrap();
 
     let (client, conn) = connect_client(port, 0x30).await.unwrap();
@@ -814,7 +798,7 @@ async fn test_longmsg_v30_submit_resp_all_success() {
         .with_max_level(tracing::Level::WARN)
         .try_init();
 
-    let biz = Arc::new(LongMsgBizHandler::new(0x30));
+    let biz = Arc::new(LongMsgBizHandler::new());
     let (port, _pool, handle) = start_server(biz.clone()).await.unwrap();
 
     let (client, conn) = connect_client(port, 0x30).await.unwrap();
