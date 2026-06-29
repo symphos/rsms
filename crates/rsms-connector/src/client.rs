@@ -863,16 +863,6 @@ async fn run_client_read_loop(
                 );
             }
 
-            // 影子比对（客户端收包方向）：unified-shadow 开启时对每帧统一解码并打日志，只观测不接管。
-            #[cfg(feature = "unified-shadow")]
-            {
-                use rsms_model::ProtocolAdapter as _;
-                let protocol = conn.endpoint.protocol;
-                match crate::adapter_registry::adapter_for(protocol).decode(&frame) {
-                    Ok(unified) => tracing::debug!(conn_id = conn.id, proto = protocol.as_str(), cmd_id = frame.command_id, ?unified, "shadow decode ok"),
-                    Err(e) => tracing::warn!(conn_id = conn.id, proto = protocol.as_str(), cmd_id = frame.command_id, "shadow decode err: {e}"),
-                }
-            }
 
             // 窄腰主路径：解码为统一消息，构造 MessageContext，调 on_message。
             {

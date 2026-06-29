@@ -5,8 +5,6 @@ edition.workspace = true
 license.workspace = true
 description = "TCP endpoint connector, connection pool, fetch"
 
-[features]
-unified-shadow = []
 
 [dependencies]
 async-trait.workspace = true

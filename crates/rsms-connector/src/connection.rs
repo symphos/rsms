@@ -417,16 +417,6 @@ pub async fn run_connection(
                 Protocol::Smpp => smpp_handler.handle_frame(&frame, conn_arc.clone()).await,
             };
 
-            // 影子比对：unified-shadow feature 开启时，对任意协议帧经 registry 做统一模型解码。
-            // 只打日志，不接管实际处理，错误隔离不影响旧路径。
-            #[cfg(feature = "unified-shadow")]
-            {
-                use rsms_model::ProtocolAdapter as _;
-                match crate::adapter_registry::adapter_for(protocol).decode(&frame) {
-                    Ok(unified) => tracing::debug!(conn_id = conn.id, proto = protocol.as_str(), ?unified, "shadow decode ok"),
-                    Err(e) => tracing::warn!(conn_id = conn.id, proto = protocol.as_str(), "shadow decode err: {e}"),
-                }
-            }
 
             // handler 错误即跳过该帧；仅 Continue 才进入业务链，其余（如 Stop）不处理。
             let action = match handle_result {
