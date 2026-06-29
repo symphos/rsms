@@ -1,12 +1,12 @@
 use async_trait::async_trait;
 use rsms_connector::{
     AuthCredentials, AuthHandler, AuthResult,
-    AccountConfigProvider, CmppDecoder, ClientBuilder, NoopClientHandler,
+    AccountConfigProvider, CmppDecoder, ClientBuilder, NoopClientHandler, ProtocolConnection,
     protocol::MessageSource,
 };
-use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler};
+use rsms_connector::client::ClientConfig;
 use rsms_business::{MessageContext, MessageHandler};
-use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Frame, Result};
+use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Result};
 // 窄腰统一模型：编解码经 CmppAdapter；V2.0 Submit 构造（SubmitV20）adapter 无法表达，保留裸 codec。
 // compute_connect_auth 为鉴权工具，保留。
 use rsms_codec_cmpp::adapter::CmppAdapter;
@@ -64,7 +64,6 @@ impl ReportItem {
     }
 }
 
-#[allow(dead_code)]
 struct ClientState {
     connected: AtomicBool,
     connect_status: Mutex<Option<u32>>,
@@ -114,122 +113,8 @@ impl ClientState {
     }
 }
 
-#[async_trait]
-impl ClientHandler for ClientState {
-    fn name(&self) -> &'static str {
-        "stress_client"
-    }
-
-    async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        // 统一模型分支：BindResp/SubmitResp（取 8B 二进制 MsgId 入待匹配队列）/Report|Deliver（回 DeliverResp）。
-        // 按本连接协商版本解码：CMPP 2.0 的 ConnectResp/SubmitResp/回执字段宽度与 3.0 不同，
-        // 用版本无关默认（V3.0）解码会令 V2.0 应答解码失败 → 永不置 connected/收不到回执。
-        let version = CmppVersion::from_wire(self.version).unwrap_or(CmppVersion::V30);
-        let unified = match CmppAdapter.decode_with_version(frame, version) {
-            Ok(m) => m,
-            Err(_) => return Ok(()),
-        };
-
-        match unified {
-            UnifiedMessage::BindResp(resp) => {
-                *self.connect_status.lock().unwrap() = Some(resp.status);
-                if resp.status == 0 {
-                    self.connected.store(true, Ordering::Relaxed);
-                }
-            }
-            UnifiedMessage::SubmitResp(resp) => {
-                self.stats.submit_resp_received.fetch_add(1, Ordering::Relaxed);
-                if resp.status == 0 {
-                    if let MessageId::Binary(b) = &resp.msg_id {
-                        let mut msg_id = [0u8; 8];
-                        let n = b.len().min(8);
-                        msg_id[..n].copy_from_slice(&b[..n]);
-                        self.msg_ids.write().unwrap().push_back(msg_id);
-                    }
-                } else {
-                    self.stats.submit_errors.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            // 状态报告（Deliver registered_delivery=1）→ Report。按解码后的结构化 msg_id 匹配：
-            // 回执经 adapter 编码为定长二进制，正文文本被丢弃，故不能再从正文解析 msgId。
-            UnifiedMessage::Report(r) => {
-                self.stats.report_received.fetch_add(1, Ordering::Relaxed);
-                if let MessageId::Binary(b) = &r.msg_id {
-                    let mut report_msg_id = [0u8; 8];
-                    let n = b.len().min(8);
-                    report_msg_id[..n].copy_from_slice(&b[..n]);
-                    if !self.matched_msg_ids.lock().unwrap().contains(&report_msg_id) {
-                        let mut pending = self.msg_ids.write().unwrap();
-                        if let Some(pos) = pending.iter().position(|&id| id == report_msg_id) {
-                            pending.remove(pos);
-                            self.matched_msg_ids.lock().unwrap().insert(report_msg_id);
-                            self.stats.report_matched.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-                let resp_bytes = CmppAdapter.encode(&UnifiedMessage::DeliverResp, CmppAdapter.sequence_of(frame))?;
-                ctx.conn.write_frame(&resp_bytes).await?;
-            }
-            // MO 上行（registered_delivery=0）→ Deliver。
-            UnifiedMessage::Deliver(d) => {
-                self.handle_deliver(&0, &d.content, &d.src.number);
-                let resp_bytes = CmppAdapter.encode(&UnifiedMessage::DeliverResp, CmppAdapter.sequence_of(frame))?;
-                ctx.conn.write_frame(&resp_bytes).await?;
-            }
-            _ => {}
-        }
-
-        Ok(())
-    }
-}
-
-impl ClientState {
-    fn handle_deliver(&self, registered_delivery: &u8, msg_content: &[u8], src_terminal_id: &str) {
-        if *registered_delivery == 1 {
-            let content = String::from_utf8_lossy(msg_content).to_string();
-            if let Some(report_msg_id) = Self::parse_msg_id_from_report(&content) {
-                self.stats.report_received.fetch_add(1, Ordering::Relaxed);
-                let matched = self.matched_msg_ids.lock().unwrap();
-                if matched.contains(&report_msg_id) {
-                    return;
-                }
-                drop(matched);
-                let mut pending = self.msg_ids.write().unwrap();
-                if let Some(pos) = pending.iter().position(|&id| id == report_msg_id) {
-                    pending.remove(pos);
-                    self.matched_msg_ids.lock().unwrap().insert(report_msg_id);
-                    self.stats.report_matched.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        } else {
-            self.stats.mo_received.fetch_add(1, Ordering::Relaxed);
-            tracing::trace!("[Client] Received MO from {}: {:02x?}", src_terminal_id, msg_content);
-        }
-    }
-
-    fn parse_msg_id_from_report(content: &str) -> Option<[u8; 8]> {
-        let parts: Vec<&str> = content.split_whitespace().collect();
-        if parts.len() >= 2 && parts[0].starts_with("id:") {
-            let hex_str = parts[0].trim_start_matches("id:");
-            if hex_str.len() == 16 {
-                let mut msg_id = [0u8; 8];
-                for i in 0..8 {
-                    if let Ok(byte) = u8::from_str_radix(&hex_str[i*2..i*2+2], 16) {
-                        msg_id[i] = byte;
-                    } else {
-                        return None;
-                    }
-                }
-                return Some(msg_id);
-            }
-        }
-        None
-    }
-}
-
-/// V3.0 窄腰路径：框架已 decode，直接 match 统一消息枚举。
-/// V2.0 连接（`stress_test_cmpp20_mt_mo`）继续走旧 `ClientHandler` 路径，
-/// 因 V2.0 ConnectResp/SubmitResp 字段宽度与 V3.0 不同，默认 adapter.decode() 无法正确解码。
+/// 窄腰主路径：框架已按协商版本（V2.0/V3.0）decode，直接 match 统一消息枚举。
+/// V2.0/V3.0 均走此路径——客户端预设 protocol_version 后框架自动按版本解码（D1a/D1b）。
 #[async_trait]
 impl MessageHandler for ClientState {
     fn name(&self) -> &'static str {
@@ -287,60 +172,42 @@ impl MessageHandler for ClientState {
     }
 }
 
-#[allow(dead_code)]
 struct ServerHandler {
     submit_count: AtomicU64,
-    report_sent: AtomicU64,
-    mo_sent: AtomicU64,
     msg_source: Arc<StressMockMessageSource>,
 }
 
 impl ServerHandler {
-    #[allow(dead_code)]
     fn new(msg_source: Arc<StressMockMessageSource>) -> Self {
         Self {
             submit_count: AtomicU64::new(0),
-            report_sent: AtomicU64::new(0),
-            mo_sent: AtomicU64::new(0),
             msg_source,
         }
-    }
-
-    async fn handle_submit(
-        &self,
-        dest_id: String,
-        ctx: &rsms_business::InboundContext,
-        frame: &Frame,
-    ) -> Result<()> {
-        let count = self.submit_count.fetch_add(1, Ordering::Relaxed);
-        let mut msg_id = [0u8; 8];
-        msg_id[4..8].copy_from_slice(&(count as u32).to_be_bytes());
-
-        // 统一 SubmitResp：8B 二进制 MsgId，status=0。
-        let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
-            msg_id: MessageId::Binary(msg_id.to_vec()),
-            status: 0,
-        });
-        let resp_bytes = CmppAdapter.encode(&resp, CmppAdapter.sequence_of(frame))?;
-        ctx.conn.write_frame(&resp_bytes).await?;
-
-        let item = ReportItem { msg_id, conn_id: ctx.conn.id(), dest_id };
-        self.msg_source.push_item(STRESS_TEST_ACCOUNT, item.to_bytes()).await;
-        Ok(())
     }
 }
 
 #[async_trait]
-impl rsms_business::BusinessHandler for ServerHandler {
+impl MessageHandler for ServerHandler {
     fn name(&self) -> &'static str {
         "stress-server-handler"
     }
 
-    async fn on_inbound(&self, ctx: &rsms_business::InboundContext, frame: &Frame) -> Result<()> {
-        // 统一模型：收到 Submit → handle_submit（取首个目标号作 dest_id）。
-        if let Ok(UnifiedMessage::Submit(submit)) = CmppAdapter.decode(frame) {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 窄腰主路径：框架已 decode，Submit → 回 SubmitResp + push report item。
+        // ctx.reply 版本感知：V2.0 连接自动回 V2.0 SubmitResp（D1b），V3.0 回 V3.0 SubmitResp。
+        if let UnifiedMessage::Submit(submit) = msg {
+            let count = self.submit_count.fetch_add(1, Ordering::Relaxed);
+            let mut msg_id = [0u8; 8];
+            msg_id[4..8].copy_from_slice(&(count as u32).to_be_bytes());
+
+            ctx.reply(UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                msg_id: MessageId::Binary(msg_id.to_vec()),
+                status: 0,
+            })).await?;
+
             let dest_id = submit.dests.first().map(|a| a.number.clone()).unwrap_or_default();
-            self.handle_submit(dest_id, ctx, frame).await?;
+            let item = ReportItem { msg_id, conn_id: ctx.conn.id(), dest_id };
+            self.msg_source.push_item(STRESS_TEST_ACCOUNT, item.to_bytes()).await;
         }
         Ok(())
     }
@@ -383,14 +250,14 @@ impl AuthHandler for PasswordAuthHandler {
 use rsms_connector::ServerBuilder;
 
 async fn start_test_server(
-    biz_handler: Arc<dyn rsms_business::BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
 ) -> Result<(u16, Arc<rsms_connector::AccountPool>, tokio::task::JoinHandle<()>)> {
     let cfg = Arc::new(EndpointConfig::new(
         "stress-test-server", "127.0.0.1", 0, 500, 60,
     ).with_log_level(tracing::Level::WARN));
     let auth = Arc::new(PasswordAuthHandler::new().add_account(STRESS_TEST_ACCOUNT, STRESS_TEST_PASSWORD));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(auth)
         .account_config_provider(Arc::new(MockAccountConfigProvider::with_limits(5000, 2048)) as Arc<dyn AccountConfigProvider>)
         .serve()
@@ -442,7 +309,10 @@ async fn report_generator_task(
                         raw: report_content.into_bytes(),
                     });
                     let seq = rand_u32();
-                    if let Ok(bytes) = CmppAdapter.encode(&report, Sequence::Plain(seq)) {
+                    // 版本感知编码：V2.0 连接产 DeliverV20（60B 正文，registered_delivery=1），
+                    // V3.0 连接产 V3.0 Deliver（71B 正文）；客户端按协商版本正确解码为 Report。
+                    let cmpp_ver = if conn.protocol_version().await == Some(0x20) { CmppVersion::V20 } else { CmppVersion::V30 };
+                    if let Ok(bytes) = CmppAdapter.encode_with_version(&report, Sequence::Plain(seq), cmpp_ver) {
                         if conn.write_frame(&bytes).await.is_ok() {
                             report_sent.fetch_add(1, Ordering::Relaxed);
                         }
@@ -479,7 +349,9 @@ async fn mo_generator_task(
                     tlvs: vec![],
                 });
                 let seq = rand_u32();
-                if let Ok(bytes) = CmppAdapter.encode(&deliver, Sequence::Plain(seq)) {
+                // 版本感知编码：V2.0 连接产 DeliverV20（MO 上行），V3.0 产 V3.0 Deliver。
+                let cmpp_ver = if conn.protocol_version().await == Some(0x20) { CmppVersion::V20 } else { CmppVersion::V30 };
+                if let Ok(bytes) = CmppAdapter.encode_with_version(&deliver, Sequence::Plain(seq), cmpp_ver) {
                     if conn.write_frame(&bytes).await.is_ok() {
                         mo_sent.fetch_add(1, Ordering::Relaxed);
                     }
@@ -612,24 +484,20 @@ async fn run_stress_test(version: u8) {
             "stress-client", "127.0.0.1", port, 1024, 30,
         ).with_window_size(2048).with_log_level(tracing::Level::WARN));
 
-        // V3.0：窄腰新路径（NoopClientHandler 占位 + with_message_handler）。
-        // V2.0：旧路径（client_state 作 ClientHandler）——默认 adapter.decode() 无法正确解码 V2.0 应答。
-        let conn = if version == CMPP_VERSION_3_0 {
-            ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
-                .with_message_handler(client_state.clone())
-                .client_config(ClientConfig::new())
-                .message_source(msg_source.clone() as Arc<dyn MessageSource>)
-                .connect()
-                .await
-                .expect("connect")
-        } else {
-            ClientBuilder::new(endpoint, client_state.clone(), CmppDecoder)
-                .client_config(ClientConfig::new())
-                .message_source(msg_source.clone() as Arc<dyn MessageSource>)
-                .connect()
-                .await
-                .expect("connect")
-        };
+        // 统一新路径：V2.0/V3.0 均使用 NoopClientHandler 占位 + with_message_handler。
+        // V2.0 预设 protocol_version=0x20，框架版本感知 decode（D1a）自动处理 ConnectResp/SubmitResp 宽度差异。
+        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+            .with_message_handler(client_state.clone())
+            .client_config(ClientConfig::new())
+            .message_source(msg_source.clone() as Arc<dyn MessageSource>)
+            .connect()
+            .await
+            .expect("connect");
+
+        // V2.0 版本预设：在发 Connect 前设置 protocol_version，使框架以 V2.0 解码首个入站帧（ConnectResp）。
+        if version == CMPP_VERSION_2_0 {
+            conn.set_protocol_version(0x20).await;
+        }
 
         let connect_pdu = client_state.build_connect_pdu();
         conn.send_request(connect_pdu).await.expect("send connect");
