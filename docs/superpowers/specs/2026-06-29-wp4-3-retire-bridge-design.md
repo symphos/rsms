@@ -51,6 +51,8 @@ WP4-1（CMPP）/ WP4-2（SMGP/SMPP/SGIP）已把四协议主链路的 example / 
 - **D3b 心跳收归（handle_frame 统一，偏离原设计笔记的「统一 decode 层」倾向）**：心跳与握手/关闭同属协议层 resp，保持在各协议 `handle_frame` 里框架自动回。仅给 CMPP `handlers/cmpp.rs` 补 ActiveTest 自动回（对齐 SMGP/SMPP），**不动**已验证的 SMGP/SMPP，SGIP 无心跳不动。理由：与握手同层架构一致 + 不扰动已真机验证路径 + 改动面最小。
 - **D-遗留全迁**：3b **全迁**所有遗留 target，**不留任何旧路径样本**。逐 target 判断是否有触裸帧需求 → 用 `RawFrameHandler` 逃生舱口，否则 `MessageHandler`。
 - **D-客户端签名**：3c 删 `NoopClientHandler` 占位，`ClientBuilder::new(endpoint, handler, decoder)` 第二参直接收 `Arc<dyn MessageHandler>`（breaking）。
+- **D1c 客户端版本配置层声明（WP4-3c，2026-06-30 追加，框架缺口#2 修复）**：WP4-3b 暴露——服务端收 Connect 自动 `set_protocol_version`（cmpp.rs:131），但**客户端发 Connect 后框架不自动设**，每个 V2.0 客户端须手动 `conn.set_protocol_version(0x20)` 否则 ConnectResp 误按 V3.0 解、`connected` 永不置位。**拍板走 A 方案（配置层声明）**：`EndpointConfig` 加 `protocol_version: Option<u8>` + `.with_protocol_version(u8)`，`connect()`/`connect_with_pool` 建连后据此自动 `set_protocol_version`。否决 B 方案（框架嗅探出站 Connect PDU version 字节）——收益不抵写路径风险。测试手动 workaround 换配置层后 cmpp20 仍 8/0 端到端自证。
+- **D-ClientPool 删除（WP4-3c，2026-06-30）**：`ClientPool`/`connect_with_pool`/`ConnectionReadyCallback` 强依赖即将退役的 `ClientHandler`、整条路径不支持 `MessageHandler`、examples/tests 零使用——整体删除（不迁移死代码，与 3b 删孤儿同逻辑）。连带其专属下游断连事件管道（`set_event_tx`/`event_tx`/`ConnectionEvent`）一并清（最终评审揪出的删除尾巴）。
 
 ## 4. 子包拆分与门禁
 
