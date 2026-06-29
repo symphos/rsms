@@ -2,10 +2,11 @@ use async_trait::async_trait;
 use rsms_connector::{
     AuthCredentials, AuthHandler, AuthResult,
     AccountConfig, AccountConfigProvider, SmgpDecoder, ClientBuilder,
-    AccountPool,
+    AccountPool, NoopClientHandler,
 };
-use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler, ClientConnection};
-use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Frame, Result};
+use rsms_connector::client::{ClientConfig, ClientConnection};
+use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Result};
+use rsms_business::{MessageContext, MessageHandler};
 // 窄腰统一模型：编解码统一走 SmgpAdapter + UnifiedMessage。
 use rsms_codec_smgp::adapter::SmgpAdapter;
 use rsms_codec_smgp::compute_login_auth;
@@ -81,10 +82,10 @@ impl TestClientHandler {
 }
 
 #[async_trait]
-impl ClientHandler for TestClientHandler {
+impl MessageHandler for TestClientHandler {
     fn name(&self) -> &'static str { "test-client" }
-    async fn on_inbound(&self, _ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        if let Ok(UnifiedMessage::SubmitResp(_)) = SmgpAdapter.decode(frame) {
+    async fn on_message(&self, _ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        if let UnifiedMessage::SubmitResp(_) = msg {
             self.submit_resp_count.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
@@ -143,7 +144,7 @@ async fn start_server(
     ).with_protocol(Protocol::Smgp));
     let auth = Arc::new(PasswordAuthHandler::new().add_account(TEST_ACCOUNT, TEST_PASSWORD));
     let server = rsms_connector::ServerBuilder::new(cfg)
-        .handlers(vec![])
+        .message_handlers(vec![])
         .auth_handler(auth)
         .account_config_provider(config_provider as Arc<dyn AccountConfigProvider>)
         .serve()
@@ -167,7 +168,8 @@ async fn create_connections(port: u16, count: usize) -> Vec<Arc<ClientConnection
         ).with_protocol(Protocol::Smgp));
 
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, client_handler, SmgpDecoder)
+        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmgpDecoder)
+            .with_message_handler(client_handler)
             .client_config(ClientConfig::default())
             .connect()
             .await

@@ -2,10 +2,11 @@ use async_trait::async_trait;
 use rsms_connector::{
     AuthCredentials, AuthHandler, AuthResult,
     AccountConfig, AccountConfigProvider, CmppDecoder, ClientBuilder, ServerBuilder,
-    AccountPool,
+    AccountPool, NoopClientHandler,
 };
-use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler, ClientConnection};
-use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Frame, Result};
+use rsms_connector::client::{ClientConfig, ClientConnection};
+use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Result};
+use rsms_business::{MessageContext, MessageHandler};
 // 窄腰统一模型：Connect/Submit 构造与客户端收包分支经 CmppAdapter。compute_connect_auth 保留。
 use rsms_codec_cmpp::adapter::CmppAdapter;
 use rsms_codec_cmpp::auth::compute_connect_auth;
@@ -83,11 +84,11 @@ impl TestClientHandler {
 }
 
 #[async_trait]
-impl ClientHandler for TestClientHandler {
+impl MessageHandler for TestClientHandler {
     fn name(&self) -> &'static str { "test-client" }
-    async fn on_inbound(&self, _ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
+    async fn on_message(&self, _ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
         // 统一模型分支：仅统计 SubmitResp。
-        if let Ok(UnifiedMessage::SubmitResp(_)) = CmppAdapter.decode(frame) {
+        if let UnifiedMessage::SubmitResp(_) = msg {
             self.submit_resp_count.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
@@ -150,7 +151,7 @@ async fn start_server(
     ));
     let auth = Arc::new(PasswordAuthHandler::new().add_account(TEST_ACCOUNT, TEST_PASSWORD));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![])
+        .message_handlers(vec![])
         .auth_handler(auth)
         .account_config_provider(config_provider as Arc<dyn AccountConfigProvider>)
         .serve()
@@ -176,7 +177,8 @@ async fn create_connections(port: u16, count: usize) -> Vec<Arc<ClientConnection
         let client_handler = Arc::new(TestClientHandler::new());
         let client_config = ClientConfig::default();
 
-        let conn = ClientBuilder::new(endpoint, client_handler, CmppDecoder)
+        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+            .with_message_handler(client_handler)
             .client_config(client_config)
             .connect()
             .await
