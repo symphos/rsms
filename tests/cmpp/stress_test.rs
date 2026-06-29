@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use rsms_connector::{
     AuthCredentials, AuthHandler, AuthResult,
-    AccountConfigProvider, CmppDecoder, ClientBuilder, NoopClientHandler, ProtocolConnection,
+    AccountConfigProvider, CmppDecoder, ClientBuilder, ProtocolConnection,
     protocol::MessageSource,
 };
 use rsms_connector::client::ClientConfig;
@@ -484,10 +484,8 @@ async fn run_stress_test(version: u8) {
             "stress-client", "127.0.0.1", port, 1024, 30,
         ).with_window_size(2048).with_log_level(tracing::Level::WARN));
 
-        // 统一新路径：V2.0/V3.0 均使用 NoopClientHandler 占位 + with_message_handler。
         // V2.0 预设 protocol_version=0x20，框架版本感知 decode（D1a）自动处理 ConnectResp/SubmitResp 宽度差异。
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
-            .with_message_handler(client_state.clone())
+        let conn = ClientBuilder::new(endpoint, client_state.clone(), CmppDecoder)
             .client_config(ClientConfig::new())
             .message_source(msg_source.clone() as Arc<dyn MessageSource>)
             .connect()
@@ -618,8 +616,7 @@ async fn run_stress_test_with_connections(version: u8, num_connections: usize) {
         // run_stress_test_with_connections 仅被 V3.0 场景调用，故全程使用新 MessageHandler 路径。
         let mut conn = None;
         for retry in 0..50 {
-            match ClientBuilder::new(endpoint.clone(), Arc::new(NoopClientHandler), CmppDecoder)
-                .with_message_handler(client_state.clone())
+            match ClientBuilder::new(endpoint.clone(), client_state.clone(), CmppDecoder)
                 .client_config(ClientConfig::new())
                 .message_source(msg_source.clone() as Arc<dyn MessageSource>)
                 .connect()

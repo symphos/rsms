@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use rsms_connector::{
     AuthCredentials, AuthHandler, AuthResult,
     AccountConfig, AccountConfigProvider, CmppDecoder, ClientBuilder, ServerBuilder,
-    AccountPool, NoopClientHandler,
+    AccountPool,
 };
 use rsms_connector::client::{ClientConfig, ClientConnection};
 use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Result};
@@ -177,8 +177,7 @@ async fn create_connections(port: u16, count: usize) -> Vec<Arc<ClientConnection
         let client_handler = Arc::new(TestClientHandler::new());
         let client_config = ClientConfig::default();
 
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
-            .with_message_handler(client_handler)
+        let conn = ClientBuilder::new(endpoint, client_handler, CmppDecoder)
             .client_config(client_config)
             .connect()
             .await

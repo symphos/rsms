@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use rsms_connector::{
     ClientBuilder, AuthCredentials, AuthHandler, AuthResult,
-    ClientEventHandler, MessageSource, MessageItem, NoopClientHandler, ProtocolConnection,
+    ClientEventHandler, MessageSource, MessageItem, ProtocolConnection,
     AccountConfig, AccountConfigProvider,
     CmppDecoder,
 };
@@ -276,8 +276,7 @@ async fn test_connect_v20_version() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new_with_version(0x20));
-    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
-        .with_message_handler(client_handler.clone())
+    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
         .client_config(ClientConfig::new())
         .connect()
         .await
@@ -310,8 +309,7 @@ async fn test_connect_v30_version() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new_with_version(0x30));
-    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
-        .with_message_handler(client_handler.clone())
+    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
         .client_config(ClientConfig::new())
         .connect()
         .await
@@ -340,8 +338,7 @@ async fn test_connect_unsupported_version() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new_with_version(0x50));
-    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
-        .with_message_handler(client_handler.clone())
+    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
         .client_config(ClientConfig::new())
         .connect()
         .await
@@ -369,8 +366,7 @@ async fn test_submit_v20_after_connect() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new_with_version(0x20));
-    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
-        .with_message_handler(client_handler.clone())
+    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
         .client_config(ClientConfig::new())
         .connect()
         .await
@@ -399,8 +395,7 @@ async fn test_submit_v30_after_connect() {
 
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
     let client_handler = Arc::new(TestClientHandler::new_with_version(0x30));
-    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
-        .with_message_handler(client_handler.clone())
+    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
         .client_config(ClientConfig::new())
         .connect()
         .await

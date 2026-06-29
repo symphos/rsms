@@ -23,7 +23,7 @@
 use async_trait::async_trait;
 use rsms_business::{MessageContext, MessageHandler};
 use rsms_codec_sgip::adapter::SgipAdapter;
-use rsms_connector::{ClientBuilder, MessageItem, MessageSource, NoopClientHandler, SgipDecoder};
+use rsms_connector::{ClientBuilder, MessageItem, MessageSource, SgipDecoder};
 use rsms_core::{EncodedPdu, EndpointConfig, Protocol, RawPdu, Result};
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
@@ -428,8 +428,7 @@ async fn main() -> Result<()> {
 
     tracing::info!("正在连接 SGIP 服务端 {}...", SERVER_ADDR);
 
-    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SgipDecoder)
-        .with_message_handler(handler)
+    let conn = ClientBuilder::new(endpoint, handler, SgipDecoder)
         .message_source(msg_source as Arc<dyn MessageSource>)
         .connect()
         .await?;

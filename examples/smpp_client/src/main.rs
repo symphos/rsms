@@ -14,7 +14,7 @@
 use async_trait::async_trait;
 use rsms_business::{MessageContext, MessageHandler};
 use rsms_codec_smpp::adapter::SmppAdapter;
-use rsms_connector::{ClientBuilder, MessageItem, MessageSource, NoopClientHandler, SmppDecoder};
+use rsms_connector::{ClientBuilder, MessageItem, MessageSource, SmppDecoder};
 use rsms_core::{EncodedPdu, EndpointConfig, Protocol, RawPdu, Result};
 use rsms_longmsg::{
     split::SmsAlphabet, LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser,
@@ -319,9 +319,7 @@ async fn main() -> Result<()> {
     );
 
     tracing::info!("正在连接 SMPP 服务端 {}...", SERVER_ADDR);
-    // 窄腰主路径：业务处理器经 with_message_handler 注入；new 第二参用 NoopClientHandler 占位。
-    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmppDecoder)
-        .with_message_handler(handler)
+    let conn = ClientBuilder::new(endpoint, handler, SmppDecoder)
         .message_source(msg_source as Arc<dyn MessageSource>)
         .connect()
         .await?;

@@ -1,5 +1,5 @@
 use rsms_connector::{ServerBuilder, SmgpDecoder};
-use rsms_connector::{AuthHandler, AuthCredentials, AuthResult, ServerEventHandler, AccountConfigProvider, NoopClientHandler};
+use rsms_connector::{AuthHandler, AuthCredentials, AuthResult, ServerEventHandler, AccountConfigProvider};
 use rsms_business::{MessageContext, MessageHandler};
 use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Protocol, Result};
 // 窄腰统一模型：业务/对端代码不再直接用裸 codec PDU，统一走 SmgpAdapter + UnifiedMessage。
@@ -437,8 +437,7 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smgp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmgpDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmgpDecoder)
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -477,8 +476,7 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smgp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmgpDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmgpDecoder)
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -515,8 +513,7 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smgp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmgpDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmgpDecoder)
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -554,8 +551,7 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smgp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmgpDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmgpDecoder)
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -594,8 +590,7 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smgp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmgpDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmgpDecoder)
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -632,8 +627,7 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smgp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmgpDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmgpDecoder)
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -671,8 +665,7 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smgp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmgpDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmgpDecoder)
             .client_config(ClientConfig::new())
             .event_handler(client_evt.clone())
             .connect()
@@ -709,8 +702,7 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smgp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmgpDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmgpDecoder)
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -753,8 +745,7 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smgp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmgpDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmgpDecoder)
             .client_config(ClientConfig::new())
             .connect()
             .await

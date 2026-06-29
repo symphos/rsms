@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use rsms_business::{MessageContext, MessageHandler};
 use rsms_codec_smgp::adapter::SmgpAdapter;
 use rsms_codec_smgp::compute_login_auth;
-use rsms_connector::{ClientBuilder, MessageItem, MessageSource, NoopClientHandler, SmgpDecoder};
+use rsms_connector::{ClientBuilder, MessageItem, MessageSource, SmgpDecoder};
 use rsms_core::{EncodedPdu, EndpointConfig, Protocol, RawPdu, Result};
 use rsms_longmsg::{
     split::SmsAlphabet, LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser,
@@ -380,9 +380,7 @@ async fn main() -> Result<()> {
     );
 
     tracing::info!("正在连接 SMGP 服务端 {}...", SERVER_ADDR);
-    // 窄腰主路径：业务处理器经 with_message_handler 注入；new 第二参用 NoopClientHandler 占位。
-    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmgpDecoder)
-        .with_message_handler(handler)
+    let conn = ClientBuilder::new(endpoint, handler, SmgpDecoder)
         .message_source(msg_source as Arc<dyn MessageSource>)
         .connect()
         .await?;

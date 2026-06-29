@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use rsms_connector::{
-    ServerBuilder, ClientBuilder, SmppDecoder, NoopClientHandler,
+    ServerBuilder, ClientBuilder, SmppDecoder,
     AuthCredentials, AuthHandler, AuthResult,
     AccountConfigProvider,
     protocol::MessageSource,
@@ -533,8 +533,7 @@ async fn stress_test_smpp_5accounts_5connections() {
                 30,
             ).with_window_size(WINDOW_SIZE as u16).with_protocol(Protocol::Smpp).with_log_level(tracing::Level::WARN));
 
-            let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmppDecoder)
-                .with_message_handler(client_state.clone())
+            let conn = ClientBuilder::new(endpoint, client_state.clone(), SmppDecoder)
                 .client_config(ClientConfig::new())
                 .message_source(msg_source.clone() as Arc<dyn MessageSource>)
                 .connect()

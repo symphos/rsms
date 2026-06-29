@@ -625,39 +625,42 @@ impl ClientHandler for NoopClientHandler {
 /// 客户端构建器：链式配置后调用 [`ClientBuilder::connect`] 建连并启动读循环。
 ///
 /// ```ignore
-/// let conn = ClientBuilder::new(endpoint, Arc::new(MyClient), CmppDecoder)
+/// let conn = ClientBuilder::new(endpoint, handler, CmppDecoder)
 ///     .message_source(source)
 ///     .connect()
 ///     .await?;
 /// ```
 pub struct ClientBuilder<D: FrameDecoder + Send + Sync + 'static> {
     endpoint: Arc<EndpointConfig>,
-    client_handler: Arc<dyn ClientHandler>,
+    handler: Arc<dyn MessageHandler>,
     decoder: D,
     client_config: Option<ClientConfig>,
     message_source: Option<Arc<dyn MessageSource>>,
     event_handler: Option<Arc<dyn ClientEventHandler>>,
     metrics: Option<Arc<dyn Metrics>>,
     message_callback: Option<Arc<dyn MessageCallback>>,
-    message_handler: Option<Arc<dyn MessageHandler>>,
 }
 
 impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
+    /// 创建客户端构建器。
+    ///
+    /// - `endpoint`：连接配置（协议、地址、认证、窗口大小等）。
+    /// - `handler`：统一消息处理器，处理所有入站帧（Submit/Deliver/Report/Ping 等）。
+    /// - `decoder`：帧解码器（`CmppDecoder` / `SmgpDecoder` / `SmppDecoder` / `SgipDecoder`）。
     pub fn new(
         endpoint: Arc<EndpointConfig>,
-        client_handler: Arc<dyn ClientHandler>,
+        handler: Arc<dyn MessageHandler>,
         decoder: D,
     ) -> Self {
         Self {
             endpoint,
-            client_handler,
+            handler,
             decoder,
             client_config: None,
             message_source: None,
             event_handler: None,
             metrics: None,
             message_callback: None,
-            message_handler: None,
         }
     }
 
@@ -690,25 +693,17 @@ impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
         self
     }
 
-    /// 注入窄腰统一消息处理器（重塑后主路径）。设置后读循环把入站帧解码为 `UnifiedMessage`
-    /// 并调 `on_message`；与构造时的 `client_handler`（裸帧旧路径）二选一，设置它即覆盖旧路径。
-    pub fn with_message_handler(mut self, handler: Arc<dyn MessageHandler>) -> Self {
-        self.message_handler = Some(handler);
-        self
-    }
-
     /// 连接到服务器并启动读循环。
     pub async fn connect(self) -> Result<Arc<ClientConnection>> {
         let ClientBuilder {
             endpoint,
-            client_handler,
+            handler,
             decoder,
             client_config,
             message_source,
             event_handler,
             metrics,
             message_callback,
-            message_handler,
         } = self;
         let metrics: Arc<dyn Metrics> = metrics.unwrap_or_else(|| Arc::new(NoopMetrics));
         let config = client_config.unwrap_or_default();
@@ -740,18 +735,16 @@ impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
     }
 
     let conn_clone = Arc::clone(&conn);
-    let client_handler_clone = Arc::clone(&client_handler);
 
-    if let Some(handler) = &event_handler {
+    if let Some(ev) = &event_handler {
         let conn_for_handler = conn_clone.clone() as Arc<dyn ProtocolConnection>;
-        handler.on_connected(&conn_for_handler).await;
+        ev.on_connected(&conn_for_handler).await;
     }
 
     metrics.connection_opened();
     let metrics_for_read = Arc::clone(&metrics);
-    let message_handler_clone = message_handler.clone();
     let read_handle = tokio::spawn(async move {
-        run_client_read_loop(conn_clone, client_handler_clone, message_handler_clone, Arc::clone(&decoder), event_handler, metrics_for_read).await;
+        run_client_read_loop(conn_clone, handler, Arc::clone(&decoder), event_handler, metrics_for_read).await;
     });
     conn.register_task(read_handle).await;
 
@@ -787,8 +780,7 @@ fn create_decoder(protocol: Protocol) -> Box<dyn FrameDecoder + Send + Sync> {
 
 async fn run_client_read_loop(
     conn: Arc<ClientConnection>,
-    client_handler: Arc<dyn ClientHandler>,
-    message_handler: Option<Arc<dyn MessageHandler>>,
+    handler: Arc<dyn MessageHandler>,
     decoder: Arc<tokio::sync::Mutex<Box<dyn FrameDecoder>>>,
     event_handler: Option<Arc<dyn ClientEventHandler>>,
     metrics: Arc<dyn Metrics>,
@@ -908,8 +900,8 @@ async fn run_client_read_loop(
                 }
             }
 
-            if let Some(mh) = &message_handler {
-                // 窄腰主路径：解码为统一消息，构造 MessageContext，调 on_message。
+            // 窄腰主路径：解码为统一消息，构造 MessageContext，调 on_message。
+            {
                 use rsms_model::ProtocolAdapter as _;
                 let adapter = crate::adapter_registry::adapter_for(conn.endpoint.protocol);
                 match adapter.decode_with_version(&frame, BusinessProtocolConnection::protocol_version(&*conn).await) {
@@ -921,19 +913,11 @@ async fn run_client_read_loop(
                             adapter,
                             adapter.sequence_of(&frame),
                         );
-                        if let Err(e) = mh.on_message(&ctx, &unified).await {
+                        if let Err(e) = handler.on_message(&ctx, &unified).await {
                             error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "message handler error: {}", e);
                         }
                     }
                     Err(e) => tracing::warn!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "统一模型解码失败（跳过该帧）: {e}"),
-                }
-            } else {
-                let ctx = ClientContext {
-                    endpoint: &conn.endpoint,
-                    conn: &conn,
-                };
-                if let Err(e) = client_handler.on_inbound(&ctx, &frame).await {
-                    error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "client handler error: {}", e);
                 }
             }
         }
@@ -1151,11 +1135,12 @@ mod wp4_client_tests {
     }
 
     #[test]
-    fn with_message_handler_stores_handler() {
+    fn handler_stored_in_builder() {
         let ep = Arc::new(rsms_core::EndpointConfig::new("ep", "127.0.0.1", 7890, 16, 60));
-        let b = ClientBuilder::new(ep, Arc::new(NoopClientHandler), crate::CmppDecoder)
-            .with_message_handler(Arc::new(DummyMh));
-        assert!(b.message_handler.is_some(), "with_message_handler 应存入处理器");
+        let handler: Arc<dyn MessageHandler> = Arc::new(DummyMh);
+        let b = ClientBuilder::new(ep, Arc::clone(&handler), crate::CmppDecoder);
+        // 构造即持有，无需额外 with_message_handler
+        let _ = b;
     }
 }
 

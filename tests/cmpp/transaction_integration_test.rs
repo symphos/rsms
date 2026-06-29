@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use rsms_connector::transaction::{MessageCallback, SubmitInfo, ReportInfo, MoInfo, TransactionManager};
-use rsms_connector::{ClientBuilder, CmppDecoder, AccountConnections, AccountConfig, NoopClientHandler};
+use rsms_connector::{ClientBuilder, CmppDecoder, AccountConnections, AccountConfig};
 use rsms_core::{ConnectionInfo, EndpointConfig, Protocol, Result};
 use rsms_business::{MessageContext, MessageHandler};
 // 窄腰统一模型：编解码经 CmppAdapter；compute_connect_auth 是 MD5 鉴权工具，保留。
@@ -262,8 +262,7 @@ async fn test_pending_requests_fail_immediately_on_disconnect() {
     );
     // 此测试无需 TM 驱动，handler 不传 tm。
     let handler = Arc::new(TransactionTestHandler::new());
-    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
-        .with_message_handler(handler)
+    let conn = ClientBuilder::new(endpoint, handler, CmppDecoder)
         .client_config(Default::default())
         .connect()
         .await
@@ -319,8 +318,7 @@ async fn test_transaction_manager_integration() {
     // 把 TM 注入 handler，on_message 里直接用 self.tm 驱动事务匹配（与 acc_connections 同一实例）。
     let handler = Arc::new(TransactionTestHandler::new().with_tm(Arc::clone(&tm)));
 
-    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
-        .with_message_handler(handler.clone())
+    let conn = ClientBuilder::new(endpoint, handler.clone(), CmppDecoder)
         .client_config(Default::default())
         .connect()
         .await
@@ -403,8 +401,7 @@ async fn test_transaction_manager_multiple_submits() {
     // 把 TM 注入 handler，on_message 里直接用 self.tm 驱动事务匹配（与 acc_connections 同一实例）。
     let handler = Arc::new(TransactionTestHandler::new().with_tm(Arc::clone(&tm)));
 
-    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
-        .with_message_handler(handler.clone())
+    let conn = ClientBuilder::new(endpoint, handler.clone(), CmppDecoder)
         .client_config(Default::default())
         .connect()
         .await

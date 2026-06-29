@@ -1,4 +1,4 @@
-use rsms_connector::{ServerBuilder, SgipDecoder, NoopClientHandler};
+use rsms_connector::{ServerBuilder, SgipDecoder};
 use rsms_connector::{AuthHandler, AuthCredentials, AuthResult, ServerEventHandler, AccountConfigProvider};
 use rsms_test_common::{TestEventHandler, TestClientEventHandler, MockAccountConfigProvider};
 use rsms_business::{MessageContext, MessageHandler};
@@ -428,8 +428,7 @@ mod tests {
                 .with_protocol(Protocol::Sgip),
         );
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SgipDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -471,8 +470,7 @@ mod tests {
                 .with_protocol(Protocol::Sgip),
         );
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SgipDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -512,8 +510,7 @@ mod tests {
                 .with_protocol(Protocol::Sgip),
         );
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SgipDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -554,8 +551,7 @@ mod tests {
                 .with_protocol(Protocol::Sgip),
         );
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SgipDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -597,8 +593,7 @@ mod tests {
                 .with_protocol(Protocol::Sgip),
         );
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SgipDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -639,8 +634,7 @@ mod tests {
                 .with_protocol(Protocol::Sgip),
         );
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SgipDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
             .client_config(ClientConfig::new())
             .event_handler(client_evt.clone())
             .connect()
@@ -680,8 +674,7 @@ mod tests {
                 .with_protocol(Protocol::Sgip),
         );
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SgipDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -728,8 +721,7 @@ mod tests {
                 .with_protocol(Protocol::Sgip),
         );
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SgipDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SgipDecoder)
             .client_config(ClientConfig::new())
             .connect()
             .await

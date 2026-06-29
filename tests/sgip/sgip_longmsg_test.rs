@@ -8,8 +8,7 @@ use rsms_model::{
 };
 use rsms_connector::client::ClientConfig;
 use rsms_connector::{
-    ClientBuilder, ServerBuilder, AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler, AuthResult,
-    NoopClientHandler, SgipDecoder,
+    ClientBuilder, ServerBuilder, AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler, AuthResult, SgipDecoder,
 };
 use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Protocol, RawPdu, Result};
 use rsms_longmsg::split::SmsAlphabet;
@@ -338,8 +337,7 @@ async fn connect_client(
             .with_protocol(Protocol::Sgip),
     );
     let handler = Arc::new(LongMsgClientHandler::new());
-    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SgipDecoder)
-        .with_message_handler(handler.clone())
+    let conn = ClientBuilder::new(endpoint, handler.clone(), SgipDecoder)
         .client_config(ClientConfig::new())
         .connect()
         .await?;

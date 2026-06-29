@@ -1,4 +1,4 @@
-use rsms_connector::{ServerBuilder, SmppDecoder, NoopClientHandler};
+use rsms_connector::{ServerBuilder, SmppDecoder};
 use rsms_connector::{AuthHandler, AuthCredentials, AuthResult, ServerEventHandler, AccountConfigProvider};
 use rsms_business::{MessageContext, MessageHandler};
 use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Protocol, Result};
@@ -375,8 +375,7 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smpp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmppDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -415,8 +414,7 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smpp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmppDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -455,8 +453,7 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smpp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmppDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -493,8 +490,7 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smpp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmppDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -532,8 +528,7 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smpp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmppDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -574,8 +569,7 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smpp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmppDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -616,8 +610,7 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smpp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmppDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -654,8 +647,7 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smpp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmppDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
             .client_config(ClientConfig::new())
             .connect()
             .await
@@ -693,8 +685,7 @@ mod tests {
 
         let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smpp));
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmppDecoder)
-            .with_message_handler(client_handler.clone())
+        let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmppDecoder)
             .client_config(ClientConfig::new())
             .event_handler(client_evt.clone())
             .connect()

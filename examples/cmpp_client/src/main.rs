@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use rsms_business::{MessageContext, MessageHandler};
 use rsms_codec_cmpp::adapter::CmppAdapter;
 use rsms_codec_cmpp::compute_connect_auth;
-use rsms_connector::{ClientBuilder, CmppDecoder, MessageItem, MessageSource, NoopClientHandler};
+use rsms_connector::{ClientBuilder, CmppDecoder, MessageItem, MessageSource};
 use rsms_core::{EncodedPdu, EndpointConfig, Protocol, RawPdu, Result};
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
@@ -417,10 +417,7 @@ async fn main() -> Result<()> {
 
     tracing::info!("正在连接 CMPP 服务端 {}...", SERVER_ADDR);
 
-    // 窄腰主路径：业务处理器经 with_message_handler 注入；new 第二参用 NoopClientHandler 占位
-    // （new 签名暂仍强制 ClientHandler，WP4-3 删旧路径时清理）。
-    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
-        .with_message_handler(handler)
+    let conn = ClientBuilder::new(endpoint, handler, CmppDecoder)
         .message_source(msg_source as Arc<dyn MessageSource>)
         .connect()
         .await?;

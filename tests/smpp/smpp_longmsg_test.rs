@@ -4,8 +4,7 @@ use rsms_business::{MessageContext, MessageHandler};
 use rsms_codec_smpp::adapter::SmppAdapter;
 use rsms_connector::client::{ClientConfig, ClientConnection};
 use rsms_connector::{
-    ClientBuilder, ServerBuilder, AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler, AuthResult,
-    NoopClientHandler, SmppDecoder,
+    ClientBuilder, ServerBuilder, AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler, AuthResult, SmppDecoder,
 };
 use rsms_core::{ConnectionInfo, EndpointConfig, Protocol, RawPdu, Result};
 use rsms_model::{
@@ -338,8 +337,7 @@ async fn connect_client(
             .with_protocol(Protocol::Smpp),
     );
     let handler = Arc::new(LongMsgClientHandler::new(smpp_version));
-    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmppDecoder)
-        .with_message_handler(handler.clone())
+    let conn = ClientBuilder::new(endpoint, handler.clone(), SmppDecoder)
         .client_config(ClientConfig::new())
         .connect()
         .await?;

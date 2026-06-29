@@ -11,7 +11,7 @@ use rsms_model::{
 };
 use rsms_connector::{
     ClientBuilder, ServerBuilder, AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler,
-    AuthResult, NoopClientHandler, SmgpDecoder,
+    AuthResult, SmgpDecoder,
 };
 use rsms_connector::client::{ClientConfig, ClientConnection};
 use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Protocol, Result};
@@ -241,8 +241,7 @@ async fn start_server(
 async fn connect_client(port: u16) -> Result<(Arc<LongMsgClientHandler>, Arc<ClientConnection>)> {
     let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smgp));
     let handler = Arc::new(LongMsgClientHandler::new());
-    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmgpDecoder)
-        .with_message_handler(handler.clone())
+    let conn = ClientBuilder::new(endpoint, handler.clone(), SmgpDecoder)
         .client_config(ClientConfig::new())
         .connect()
         .await?;

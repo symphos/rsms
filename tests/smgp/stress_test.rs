@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use rsms_connector::{
-    ServerBuilder, ClientBuilder, SmgpDecoder, NoopClientHandler,
+    ServerBuilder, ClientBuilder, SmgpDecoder,
     AuthCredentials, AuthHandler, AuthResult,
     AccountConfigProvider,
 };
@@ -580,8 +580,7 @@ async fn run_stress_test(num_connections: usize) {
 
         let mut conn = None;
         for retry in 0..50 {
-            match ClientBuilder::new(endpoint.clone(), Arc::new(NoopClientHandler), SmgpDecoder)
-                .with_message_handler(client_state.clone())
+            match ClientBuilder::new(endpoint.clone(), client_state.clone(), SmgpDecoder)
                 .client_config(ClientConfig::new())
                 .connect()
                 .await

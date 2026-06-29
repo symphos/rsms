@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use rsms_connector::{
     AuthCredentials, AuthHandler, AuthResult,
     AccountConfig, AccountConfigProvider, SmgpDecoder, ClientBuilder,
-    AccountPool, NoopClientHandler,
+    AccountPool,
 };
 use rsms_connector::client::{ClientConfig, ClientConnection};
 use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Result};
@@ -168,8 +168,7 @@ async fn create_connections(port: u16, count: usize) -> Vec<Arc<ClientConnection
         ).with_protocol(Protocol::Smgp));
 
         let client_handler = Arc::new(TestClientHandler::new());
-        let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmgpDecoder)
-            .with_message_handler(client_handler)
+        let conn = ClientBuilder::new(endpoint, client_handler, SmgpDecoder)
             .client_config(ClientConfig::default())
             .connect()
             .await
