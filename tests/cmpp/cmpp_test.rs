@@ -1630,3 +1630,59 @@ async fn test_cmpp_v20_new_path_e2e() {
 
     handle.abort();
 }
+
+/// D3b 心跳收归——CMPP 服务端自动回 ActiveTestResp（Task 5）。
+///
+/// 验证：
+/// (a) 客户端发 ActiveTest → 服务端自动回 ActiveTestResp（命中新分支，不落 catch-all Stop）；
+/// (b) ActiveTest 后连接仍存活——再发 Submit 仍能收到 SubmitResp（证明未被 Stop 断连）。
+#[tokio::test]
+async fn cmpp_server_auto_replies_active_test() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .try_init();
+
+    let auth = Arc::new(PasswordAuthHandler::new().add_account("106900", "password123"));
+    let biz = Arc::new(TestBusinessHandler::new());
+    let evt = Arc::new(TestEventHandler::new());
+    let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30)
+        .await
+        .unwrap();
+
+    let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
+    let client_handler = Arc::new(TestClientHandler::new());
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+        .with_message_handler(client_handler.clone())
+        .client_config(ClientConfig::new())
+        .connect()
+        .await
+        .expect("connect");
+
+    // 建连鉴权
+    let connect_pdu = client_handler.build_connect_pdu("106900", "password123");
+    conn.send_request(connect_pdu).await.expect("send connect");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(client_handler.is_connected(), "建连失败，前置条件不满足");
+
+    // (a) 发 ActiveTest，断言收到 ActiveTestResp（UnifiedMessage::PingResp → active_test_resp_count +1）
+    let ping_pdu = client_handler.build_active_test_pdu();
+    conn.send_request(ping_pdu).await.expect("send active test");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        client_handler.active_test_resp_count(),
+        1,
+        "服务端应自动回 ActiveTestResp（D3b），收到计数应为 1"
+    );
+
+    // (b) ActiveTest 后再发 Submit，断言仍能收到 SubmitResp（连接未被 Stop 断开）
+    let submit_pdu = client_handler.build_submit_pdu("13800138000", "106900", "post-ping msg");
+    conn.send_request(submit_pdu).await.expect("send submit after active test");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        client_handler.get_submit_status(),
+        Some(0),
+        "ActiveTest 后连接应存活，Submit 仍应得到 SubmitResp(status=0)"
+    );
+
+    handle.abort();
+}

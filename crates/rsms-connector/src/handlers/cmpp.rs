@@ -189,6 +189,16 @@ impl crate::protocol::ProtocolHandler for CmppHandler {
                 }
                 return Ok(HandleResult::Continue);
             }
+            CmppMessage::ActiveTest { version, sequence_id } => {
+                // 心跳收归框架（D3b）：CMPP ActiveTest 自动回 ActiveTestResp 并 Continue，
+                // 对齐 SMGP/SMPP；业务无需处理心跳。亦修掉 ActiveTest 此前命中 catch-all Stop 断连的 bug。
+                tracing::debug!(conn_id = conn.id(), remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "收到CMPP心跳: sequence_id={}", sequence_id);
+                let resp = CmppMessage::ActiveTestResp { version, sequence_id };
+                if let Ok(pdu) = encode_message(&resp) {
+                    conn.write_frame(&pdu).await?;
+                }
+                return Ok(HandleResult::Continue);
+            }
             _ => return Ok(HandleResult::Stop),
         }
     }
