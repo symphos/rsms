@@ -129,10 +129,9 @@ account_pool.update_config("900001", AccountConfig::new()
 当服务端剔除连接时，客户端通过以下方式感知：
 
 1. **ClientEventHandler.on_disconnected(conn_id)** — 连接断开回调
-2. **ConnectionEvent::Disconnected(id)** — 如果使用 `ClientPool`，通过事件通道通知
-3. **write_frame() 返回错误** — 尝试发送时发现连接已关闭
+2. **write_frame() 返回错误** — 尝试发送时发现连接已关闭
 
-客户端收到的是协议层 Close Packet（如 CMPP Terminate），而非突然的 TCP 断开，因此可以区分"服务端主动关闭"和"网络异常"。
+客户端收到的是协议层 Close Packet（如 CMPP Terminate），而非突然的 TCP 断开，因此可以区分"服务端主动关闭"和"网络异常"。断连后框架自动触发重连（按 `EndpointConfig.reconnect_interval_sec` 间隔）。
 
 ## 日志
 
@@ -143,7 +142,7 @@ account_pool.update_config("900001", AccountConfig::new()
 | INFO | `evicting excess connection` | `conn_id=3 remote_ip=10.0.1.5 remote_port=54321 evicting excess connection` |
 | INFO | `connection eviction completed` | `evicted=2 remaining=3 max_connections=3` |
 | WARN | `connection closed by framework (evict)` | `conn_id=3 remote_ip=10.0.1.5 remote_port=54321 protocol=cmpp` |
-| WARN | `connection disconnected` | ClientPool 感知断连 |
+| WARN | `connection disconnected` | 客户端连接断开，框架自动重连 |
 
 更多日志配置参见 [日志配置](05-logging.md)。
 

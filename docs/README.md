@@ -55,7 +55,7 @@ Rust 实现的多协议短信网关框架，支持 **CMPP 2.0/3.0**、**SMGP 3.0
 | `rsms-core` | 核心类型：`Frame`、`RawPdu`、`EncodedPdu` trait、`EndpointConfig`、`Protocol`、`Sequence` 入口 |
 | `rsms-model` | 窄腰统一模型：`UnifiedMessage`、`ProtocolAdapter` trait、`Sequence`、`Address`/`MessageId`/`Encoding` 等协议无关类型 |
 | `rsms-connector` | 连接管理：服务端 `ServerBuilder`、客户端 `ClientBuilder`、`AccountPool`、`MessageSource`、`adapter_registry::adapter_for` |
-| `rsms-business` | 业务处理器：`BusinessHandler` trait、`run_chain()` |
+| `rsms-business` | 业务处理器：`MessageHandler` trait、`MessageContext` |
 | `rsms-codec-cmpp` | CMPP 2.0/3.0 协议编解码 |
 | `rsms-codec-smgp` | SMGP 3.0.3 协议编解码 |
 | `rsms-codec-smpp` | SMPP 3.4/5.0 协议编解码 |

@@ -36,10 +36,9 @@ rsms-codec-cmpp = { path = "crates/rsms-codec-cmpp" }
 
 ```rust
 use rsms_connector::{ServerBuilder, AuthHandler, AuthCredentials, AuthResult};
-use rsms_business::{BusinessHandler, InboundContext};
-use rsms_core::{ConnectionInfo, EndpointConfig, Frame, Protocol, Result};
-use rsms_codec_cmpp::adapter::CmppAdapter;        // 各协议：rsms_codec_<proto>::adapter::<Proto>Adapter
-use rsms_model::{ProtocolAdapter, UnifiedMessage};
+use rsms_business::{MessageContext, MessageHandler};
+use rsms_core::{ConnectionInfo, EndpointConfig, Protocol, Result};
+use rsms_model::{UnifiedMessage, UnifiedSubmitResp, MessageId};
 
 struct MyAuth;
 #[async_trait]
@@ -53,15 +52,16 @@ impl AuthHandler for MyAuth {
 
 struct MyBiz;
 #[async_trait]
-impl BusinessHandler for MyBiz {
+impl MessageHandler for MyBiz {
     fn name(&self) -> &'static str { "my-biz" }
-    async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        // 窄腰统一模型：解码为 UnifiedMessage 后按枚举分支处理
-        match CmppAdapter.decode(frame)? {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        match msg {
             UnifiedMessage::Submit(_s) => {
-                // 框架不自动回 SubmitResp，业务方自行构造：
-                // let bytes = CmppAdapter.encode(&resp, CmppAdapter.sequence_of(frame))?;
-                // ctx.conn.write_frame(&bytes).await?;
+                // ctx.reply 自动按请求序列回包（窄腰，无需手剥序列/手拼字节）
+                ctx.reply(UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                    msg_id: MessageId::Binary(vec![0u8; 8]),
+                    status: 0,
+                })).await?;
             }
             _ => {}
         }
@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
         .with_log_level(tracing::Level::WARN));
 
     let server = ServerBuilder::new(config)
-        .handler(Arc::new(MyBiz))
+        .message_handler(Arc::new(MyBiz))
         .auth_handler(Arc::new(MyAuth))
         .serve()
         .await?;
@@ -88,17 +88,24 @@ async fn main() -> Result<()> {
 ### 客户端示例
 
 ```rust
-use rsms_connector::{ClientBuilder, CmppDecoder, ClientHandler};
-use rsms_core::{EndpointConfig, Frame, Result};
+use rsms_connector::{ClientBuilder, CmppDecoder};
+use rsms_business::{MessageContext, MessageHandler};
+use rsms_core::{EndpointConfig, Result};
 use rsms_codec_cmpp::adapter::CmppAdapter;
 use rsms_model::{ProtocolAdapter, UnifiedMessage};
 
 struct MyClient;
 #[async_trait]
-impl ClientHandler for MyClient {
+impl MessageHandler for MyClient {
     fn name(&self) -> &'static str { "my-client" }
-    async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        // 处理 SubmitResp / Deliver 等
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        match msg {
+            UnifiedMessage::SubmitResp(_r) => { /* 处理回执 */ }
+            UnifiedMessage::Report(_) => {
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
+            }
+            _ => {}
+        }
         Ok(())
     }
 }
@@ -106,15 +113,16 @@ impl ClientHandler for MyClient {
 #[tokio::main]
 async fn main() -> Result<()> {
     let endpoint = Arc::new(EndpointConfig::new("client", "127.0.0.1", 7890, 500, 60));
+    let handler = Arc::new(MyClient);
 
-    let conn = ClientBuilder::new(endpoint, Arc::new(MyClient), CmppDecoder)
+    let conn = ClientBuilder::new(endpoint, handler, CmppDecoder)
         .connect()
         .await?;
 
     // 构造 UnifiedMessage 经适配器编码后发送（CMPP 序列用 Sequence::Plain）
     let msg = UnifiedMessage::Submit(/* UnifiedSubmit { .. } */);
     let pdu_bytes = CmppAdapter.encode(&msg, rsms_model::Sequence::Plain(seq))?;
-    conn.write_frame(&pdu_bytes).await?;
+    conn.send_request(pdu_bytes).await?;
     Ok(())
 }
 ```
@@ -178,7 +186,7 @@ use rsms_codec_smpp::adapter::SmppAdapter;   // CmppAdapter | SmgpAdapter | Smpp
 | `rsms-core` | 核心类型：`Frame`、`RawPdu`、`EncodedPdu` trait、`EndpointConfig`、`Protocol` |
 | `rsms-model` | 窄腰统一模型：`UnifiedMessage`、`ProtocolAdapter` trait、`Sequence`、`Address`/`MessageId`/`Encoding` |
 | `rsms-connector` | 连接管理：服务端 `serve()`、客户端 `connect()`、`AccountPool`、`MessageSource`、`adapter_registry` |
-| `rsms-business` | 业务处理器：`BusinessHandler` trait |
+| `rsms-business` | 业务处理器：`MessageHandler` trait、`MessageContext` |
 | `rsms-codec-cmpp` | CMPP 2.0/3.0 协议编解码 |
 | `rsms-codec-smgp` | SMGP 3.0.3 协议编解码 |
 | `rsms-codec-smpp` | SMPP 3.4/5.0 协议编解码 |
