@@ -1,13 +1,13 @@
 use async_trait::async_trait;
-use rsms_business::{BusinessHandler, InboundContext};
+use rsms_business::{MessageContext, MessageHandler};
 // 窄腰统一模型：构造/解码全程走 SmppAdapter，不再裸 codec。
 use rsms_codec_smpp::adapter::SmppAdapter;
-use rsms_connector::client::{ClientConfig, ClientContext, ClientHandler, ClientConnection};
+use rsms_connector::client::{ClientConfig, ClientConnection};
 use rsms_connector::{
     ClientBuilder, ServerBuilder, AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler, AuthResult,
-    SmppDecoder,
+    NoopClientHandler, SmppDecoder,
 };
-use rsms_core::{ConnectionInfo, EndpointConfig, Protocol, Frame, RawPdu, Result};
+use rsms_core::{ConnectionInfo, EndpointConfig, Protocol, RawPdu, Result};
 use rsms_model::{
     Address, BindMode, Concat, Encoding, MessageId, ProtocolAdapter, ProtocolExtra, Sequence,
     SmppExtra, UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedSubmit, UnifiedSubmitResp,
@@ -120,32 +120,28 @@ impl LongMsgBizHandler {
 }
 
 #[async_trait]
-impl BusinessHandler for LongMsgBizHandler {
+impl MessageHandler for LongMsgBizHandler {
     fn name(&self) -> &'static str {
         "smpp-longmsg-biz"
     }
 
-    async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        if let Ok(msg) = SmppAdapter.decode(frame) {
-            match msg {
-                UnifiedMessage::Submit(s) => {
-                    // 窄腰：adapter 已把 UDH 剥成 s.concat、s.content 为纯载荷。
-                    // 这里据 concat 重建含 UDH 的分段字节，供后续 merge_segments 合包断言复用。
-                    self.received_segments
-                        .lock()
-                        .unwrap()
-                        .push(seg_with_udh(&s.concat, &s.content));
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        match msg {
+            UnifiedMessage::Submit(s) => {
+                // 窄腰：框架已解码，adapter 已把 UDH 剥成 s.concat、s.content 为纯载荷。
+                // 这里据 concat 重建含 UDH 的分段字节，供后续 merge_segments 合包断言复用。
+                self.received_segments
+                    .lock()
+                    .unwrap()
+                    .push(seg_with_udh(&s.concat, &s.content));
 
-                    // 回 SubmitResp（msg_id 空），sequence_of 回显请求序列。
-                    let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
-                        msg_id: MessageId::Text(String::new()),
-                        status: 0,
-                    });
-                    let resp_bytes = SmppAdapter.encode(&resp, SmppAdapter.sequence_of(frame))?;
-                    ctx.conn.write_frame(&resp_bytes).await?;
-                }
-                _ => {}
+                // 回 SubmitResp（msg_id 空），ctx.reply 自动回显请求序列。
+                ctx.reply(UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                    msg_id: MessageId::Text(String::new()),
+                    status: 0,
+                })).await?;
             }
+            _ => {}
         }
         Ok(())
     }
@@ -224,24 +220,14 @@ impl LongMsgClientHandler {
 }
 
 #[async_trait]
-impl ClientHandler for LongMsgClientHandler {
+impl MessageHandler for LongMsgClientHandler {
     fn name(&self) -> &'static str {
         "smpp-longmsg-client"
     }
 
-    async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        let pdu = frame.data_as_slice();
-        if pdu.len() < 16 {
-            return Ok(());
-        }
-
-        // 消息类型与结果码均经 SmppAdapter 透出到统一模型（command_status → status）。
-        let unified = match SmppAdapter.decode(frame) {
-            Ok(m) => m,
-            Err(_) => return Ok(()),
-        };
-
-        match unified {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 消息类型与结果码均经框架透出到统一模型（command_status → status）。
+        match msg {
             UnifiedMessage::BindResp(r) => {
                 if r.status == 0 {
                     self.connected.store(true, Ordering::Relaxed);
@@ -258,16 +244,12 @@ impl ClientHandler for LongMsgClientHandler {
                     .lock()
                     .unwrap()
                     .push(seg_with_udh(&d.concat, &d.content));
-                let resp_bytes =
-                    SmppAdapter.encode(&UnifiedMessage::DeliverResp, SmppAdapter.sequence_of(frame))?;
-                ctx.conn.write_frame(&resp_bytes).await?;
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
             // 万一收到回执位分段，raw 即分段内容（报告无 concat），同样入合包并回 DeliverResp。
             UnifiedMessage::Report(r) => {
                 self.deliver_segments.lock().unwrap().push(r.raw.clone());
-                let resp_bytes =
-                    SmppAdapter.encode(&UnifiedMessage::DeliverResp, SmppAdapter.sequence_of(frame))?;
-                ctx.conn.write_frame(&resp_bytes).await?;
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
             _ => {}
         }
@@ -320,7 +302,7 @@ fn merge_segments(segments: &[Vec<u8>]) -> Vec<u8> {
 }
 
 async fn start_server(
-    biz_handler: Arc<dyn BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
 ) -> Result<(
     u16,
     Arc<rsms_connector::ConnectionPool>,
@@ -332,7 +314,7 @@ async fn start_server(
     );
     let auth = Arc::new(PasswordAuthHandler::new().add_account(TEST_SYSTEM_ID, TEST_PASSWORD));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(auth)
         .account_config_provider(Arc::new(MockAccountConfigProvider) as Arc<dyn AccountConfigProvider>)
         .serve()
@@ -356,7 +338,8 @@ async fn connect_client(
             .with_protocol(Protocol::Smpp),
     );
     let handler = Arc::new(LongMsgClientHandler::new(smpp_version));
-    let conn = ClientBuilder::new(endpoint, handler.clone(), SmppDecoder)
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), SmppDecoder)
+        .with_message_handler(handler.clone())
         .client_config(ClientConfig::new())
         .connect()
         .await?;
