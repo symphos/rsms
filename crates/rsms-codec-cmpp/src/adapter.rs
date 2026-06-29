@@ -483,6 +483,14 @@ impl ProtocolAdapter for CmppAdapter {
         let msg = decode_message(frame.data_as_slice())?;
         Ok(cmpp_to_unified(msg))
     }
+    fn decode_with_version(
+        &self,
+        frame: &Frame,
+        version: Option<u8>,
+    ) -> Result<UnifiedMessage> {
+        let msg = decode_message_with_version(frame.data_as_slice(), version)?;
+        Ok(cmpp_to_unified(msg))
+    }
     fn encode(&self, msg: &UnifiedMessage, seq: Sequence) -> Result<Vec<u8>> {
         let cmpp = unified_to_cmpp(msg, seq)?;
         encode_message(&cmpp)
@@ -919,5 +927,48 @@ mod tests {
         let a = CmppAdapter.encode(&UnifiedMessage::ReportResp, seq).unwrap();
         let b = CmppAdapter.encode(&UnifiedMessage::DeliverResp, seq).unwrap();
         assert_eq!(a, b);
+    }
+
+    /// 构造 CMPP V2.0 Submit 帧：extra.version=0x20 使 encode 产 SubmitV20 wire 字节。
+    fn v20_submit_frame() -> Frame {
+        let submit = UnifiedMessage::Submit(UnifiedSubmit {
+            src: Address::plain("10086"),
+            dests: vec![Address::plain("13800138000")],
+            content: b"hi".to_vec(),
+            encoding: Encoding::Gbk,
+            want_report: false,
+            concat: None,
+            extra: ProtocolExtra::Cmpp(CmppExtra { version: 0x20, ..Default::default() }),
+            tlvs: vec![],
+        });
+        frame_of(CmppAdapter.encode(&submit, Sequence::Plain(7)).unwrap())
+    }
+
+    #[test]
+    fn decode_with_version_none_equals_decode() {
+        // ActiveTest 版本无关：默认（None）路径必须与 decode 一致。
+        // a 声明为 &dyn ProtocolAdapter：一方面绕开 inherent 方法同名遮蔽，
+        // 另一方面正好模拟框架驱动层真实调用路径（adapter 以 Arc<dyn ProtocolAdapter> 存储）。
+        let f = frame_of(vec![
+            0x00, 0x00, 0x00, 0x0C, // total_len = 12
+            0x00, 0x00, 0x00, 0x08, // ActiveTest
+            0x00, 0x00, 0x00, 0x01, // seq = 1
+        ]);
+        let a: &dyn ProtocolAdapter = &CmppAdapter;
+        assert_eq!(
+            a.decode_with_version(&f, None).unwrap(),
+            CmppAdapter.decode(&f).unwrap(),
+            "None 版本应等价于基础 decode"
+        );
+        assert_eq!(a.decode_with_version(&f, None).unwrap(), UnifiedMessage::Ping);
+    }
+
+    #[test]
+    fn decode_with_version_routes_v20() {
+        // V2.0 Submit 仅经 Some(0x20) 正确解出；用基础 decode（V3.0 布局）会字段错位/长度不符。
+        let f = v20_submit_frame();
+        let a: &dyn ProtocolAdapter = &CmppAdapter;
+        let msg = a.decode_with_version(&f, Some(0x20)).expect("V2.0 解码应成功");
+        assert!(matches!(msg, UnifiedMessage::Submit(_)), "Some(0x20) 应解出 Submit");
     }
 }

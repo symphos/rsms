@@ -739,4 +739,22 @@ mod tests {
         let b = SmgpAdapter.encode(&UnifiedMessage::DeliverResp, seq).unwrap();
         assert_eq!(a, b);
     }
+
+    /// 构造最简合法 SMGP 帧（ActiveTest 12B）：由 encode(Ping) 产出，版本无关。
+    fn smgp_active_test_frame() -> Frame {
+        frame_of(SmgpAdapter.encode(&UnifiedMessage::Ping, Sequence::Plain(1)).unwrap())
+    }
+
+    #[test]
+    fn decode_with_version_defaults_to_decode() {
+        // SMGP 单版本：decode_with_version 任意 version 都应等价于 decode（默认转发）。
+        // SmgpAdapter 无同名 inherent 方法，可直接通过 &dyn ProtocolAdapter 调（与框架路径一致）。
+        let f = smgp_active_test_frame();
+        let a: &dyn ProtocolAdapter = &SmgpAdapter;
+        assert_eq!(
+            a.decode_with_version(&f, Some(0x99)).unwrap(),
+            SmgpAdapter.decode(&f).unwrap(),
+            "SMGP 应忽略 version、默认转发 decode"
+        );
+    }
 }
