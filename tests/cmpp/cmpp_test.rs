@@ -1528,19 +1528,13 @@ async fn test_cmpp_v20_new_path_e2e() {
         .await
         .unwrap();
 
-    let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
+    let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30).with_protocol_version(0x20));
     let client_handler = Arc::new(TestClientHandler::new());
     let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
         .client_config(ClientConfig::new())
         .connect()
         .await
         .expect("connect");
-
-    // 版本预设：在发 Connect 前设置 protocol_version=0x20，使框架新路径以 V2.0 解码首个入站帧
-    // （ConnectResp）。服务端在收到 Connect 后回 V2.0 ConnectResp（body=1B status+16B auth+1B
-    // version=18B，总长 30B）。若此处不预设，默认 V3.0 解码器期望 21B body（33B total）与实际
-    // 30B 不符返回 InvalidPduLength，ConnectResp 被跳过、is_connected 永不为 true。
-    conn.set_protocol_version(0x20).await;
 
     // 发送 CMPP V2.0 Connect（version 字节 = 0x20）
     let timestamp = 0u32;

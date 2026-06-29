@@ -482,20 +482,14 @@ async fn run_stress_test(version: u8) {
         let client_state = Arc::new(ClientState::new(stats.clone(), version));
         let endpoint = Arc::new(EndpointConfig::new(
             "stress-client", "127.0.0.1", port, 1024, 30,
-        ).with_window_size(2048).with_log_level(tracing::Level::WARN));
+        ).with_window_size(2048).with_log_level(tracing::Level::WARN).with_protocol_version(version));
 
-        // V2.0 预设 protocol_version=0x20，框架版本感知 decode（D1a）自动处理 ConnectResp/SubmitResp 宽度差异。
         let conn = ClientBuilder::new(endpoint, client_state.clone(), CmppDecoder)
             .client_config(ClientConfig::new())
             .message_source(msg_source.clone() as Arc<dyn MessageSource>)
             .connect()
             .await
             .expect("connect");
-
-        // V2.0 版本预设：在发 Connect 前设置 protocol_version，使框架以 V2.0 解码首个入站帧（ConnectResp）。
-        if version == CMPP_VERSION_2_0 {
-            conn.set_protocol_version(0x20).await;
-        }
 
         let connect_pdu = client_state.build_connect_pdu();
         conn.send_request(connect_pdu).await.expect("send connect");

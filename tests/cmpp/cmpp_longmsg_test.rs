@@ -285,17 +285,12 @@ async fn start_server(
 }
 
 async fn connect_client(port: u16, version: u8) -> Result<(Arc<LongMsgClientHandler>, Arc<ClientConnection>)> {
-    let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
+    let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30).with_protocol_version(version));
     let handler = Arc::new(LongMsgClientHandler::new(version));
     let conn = ClientBuilder::new(endpoint, handler.clone(), CmppDecoder)
         .client_config(ClientConfig::new())
         .connect()
         .await?;
-    // V2.0 握手：预先设置 protocol_version，使框架版本感知 decode（decode_with_version）
-    // 在收到 V2.0 ConnectResp（30B）时走 V2.0 路径而非默认 V3.0（33B 期望）。
-    // 框架当前在客户端侧不自动从 Connect PDU 提取版本，须测试侧预设。
-    // V3.0 设 Some(0x30) 等价默认行为，可统一调用。
-    conn.set_protocol_version(version).await;
     let connect_pdu = handler.build_connect_pdu();
     conn.send_request(connect_pdu).await?;
     tokio::time::sleep(Duration::from_millis(200)).await;

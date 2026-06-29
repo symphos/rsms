@@ -167,7 +167,7 @@ impl MessageHandler for TestClientHandler {
     async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
         // 窄腰新路径：框架已按 conn.protocol_version() 版本感知解码，直接 match 统一消息枚举。
         // V2.0 ConnectResp（30B total）与 V3.0 ConnectResp（33B total）均能正确解码，
-        // 前提是客户端在发 Connect 前通过 conn.set_protocol_version(0x20) 设置版本。
+        // 前提是客户端通过 EndpointConfig::with_protocol_version(0x20) 声明版本（缺口#2修复）。
         match msg {
             UnifiedMessage::BindResp(resp) => {
                 *self.connect_resp_status.lock().unwrap() = Some(resp.status);
@@ -274,17 +274,13 @@ async fn test_connect_v20_version() {
     let auth = Arc::new(PasswordAuthHandler::new().add_account("106900", "password123"));
     let (port, handle) = start_test_server(auth.clone(), 30).await.unwrap();
 
-    let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
+    let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30).with_protocol_version(0x20));
     let client_handler = Arc::new(TestClientHandler::new_with_version(0x20));
     let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
         .client_config(ClientConfig::new())
         .connect()
         .await
         .expect("connect");
-
-    // 版本预设：在发 Connect 前设置 protocol_version=0x20，使框架新路径以 V2.0 解码
-    // ConnectResp（30B total）。若不预设，默认 V3.0 解码器期望 33B 导致解码失败。
-    conn.set_protocol_version(0x20).await;
 
     let connect_pdu = client_handler.build_connect_pdu_v2("106900", "password123");
     conn.send_request(connect_pdu).await.expect("send connect");
@@ -364,16 +360,13 @@ async fn test_submit_v20_after_connect() {
     let auth = Arc::new(PasswordAuthHandler::new().add_account("106900", "password123"));
     let (port, handle) = start_test_server(auth.clone(), 30).await.unwrap();
 
-    let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
+    let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30).with_protocol_version(0x20));
     let client_handler = Arc::new(TestClientHandler::new_with_version(0x20));
     let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
         .client_config(ClientConfig::new())
         .connect()
         .await
         .expect("connect");
-
-    // 版本预设：在发 Connect 前设置 protocol_version=0x20，使框架以 V2.0 正确解码 ConnectResp。
-    conn.set_protocol_version(0x20).await;
 
     let connect_pdu = client_handler.build_connect_pdu_v2("106900", "password123");
     conn.send_request(connect_pdu).await.expect("send connect");
