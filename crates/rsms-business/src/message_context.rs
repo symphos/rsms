@@ -47,10 +47,13 @@ impl MessageContext {
 
     /// 一步式回执：把统一消息编码为当前协议字节（回显请求帧序列）并写回对端。
     ///
-    /// 等价于手工 `adapter.encode(&msg, sequence_of(frame))? + conn.write_frame`，
+    /// 等价于手工 `adapter.encode_with_version(&msg, sequence_of(frame), conn.protocol_version())? + conn.write_frame`，
     /// 但协议无关——同一份处理器代码在四协议下都生成正确的响应帧。
+    /// CMPP V2.0 连接会产出 V2.0 规格应答（如 21B SubmitResp）；V3.0 及其余协议逐字节不变。
     pub async fn reply(&self, msg: UnifiedMessage) -> Result<()> {
-        let bytes = self.adapter.encode(&msg, self.frame_sequence)?;
+        let bytes = self
+            .adapter
+            .encode_with_version(&msg, self.frame_sequence, self.conn.protocol_version().await)?;
         self.conn.write_frame(&bytes).await
     }
 }
