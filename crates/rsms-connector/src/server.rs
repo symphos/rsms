@@ -32,7 +32,7 @@ pub struct BoundServer {
 ///
 /// ```ignore
 /// let server = ServerBuilder::new(config)
-///     .handler(Arc::new(MyBiz))
+///     .message_handler(Arc::new(MyBiz))
 ///     .auth_handler(Arc::new(MyAuth))
 ///     .serve()
 ///     .await?;

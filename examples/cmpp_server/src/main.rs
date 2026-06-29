@@ -352,7 +352,7 @@ impl MessageSource for FileMessageSource {
 }
 
 // ============================================================================
-// BusinessHandler：处理 Submit，回 SubmitResp，推送 Report，长短信合包
+// MessageHandler：处理 Submit，回 SubmitResp，推送 Report，长短信合包
 // ============================================================================
 
 struct CmppBusinessHandler {

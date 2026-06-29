@@ -1,5 +1,5 @@
 //! 对接面入站处理器抽象：协议无关的 [`MessageHandler`]（重塑后的主路径）与
-//! 裸帧 [`RawFrameHandler`]（逃生舱口）。WP4 起由主循环驱动；当前与 `BusinessHandler` 并存。
+//! 裸帧 [`RawFrameHandler`]（逃生舱口）。主循环解码后驱动（重塑后唯一入站路径）。
 
 use crate::MessageContext;
 use async_trait::async_trait;
@@ -36,7 +36,7 @@ pub trait RawFrameHandler: Send + Sync {
 /// 顺序驱动一组 [`MessageHandler`]：对同一条消息依次调用各处理器，
 /// 任一返回 `Err` 即中断并上抛；空链为 no-op。
 ///
-/// 与面向 `BusinessHandler` 的 `run_chain` 对称，供 WP4 主循环在解码后调用。
+/// 供主循环在解码后调用。
 pub async fn run_message_chain(
     ctx: &MessageContext,
     msg: &UnifiedMessage,

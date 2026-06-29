@@ -49,7 +49,7 @@ fn is_submit(protocol: Protocol, command_id: u32) -> bool {
 
 /// 收侧自动驱动：一帧经 adapter 解码后路由到 TM 的对应回调。
 /// 只识别 SubmitResp/Report/Deliver(MO)，其余（BindResp/Ping/...）忽略。
-/// 解码失败静默跳过——与 `unified-shadow` 同源解码，错误隔离不影响主收包路径。
+/// 解码失败静默跳过——错误隔离，不影响主收包路径。
 pub(crate) async fn drive_inbound(tm: &TransactionManager, protocol: Protocol, frame: &Frame) {
     let Ok(msg) = adapter_for(protocol).decode(frame) else {
         return;

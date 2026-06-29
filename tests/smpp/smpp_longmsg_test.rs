@@ -4,7 +4,8 @@ use rsms_business::{MessageContext, MessageHandler};
 use rsms_codec_smpp::adapter::SmppAdapter;
 use rsms_connector::client::{ClientConfig, ClientConnection};
 use rsms_connector::{
-    ClientBuilder, ServerBuilder, AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler, AuthResult, SmppDecoder,
+    AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler, AuthResult,
+    ClientBuilder, ServerBuilder, SmppDecoder,
 };
 use rsms_core::{ConnectionInfo, EndpointConfig, Protocol, RawPdu, Result};
 use rsms_model::{

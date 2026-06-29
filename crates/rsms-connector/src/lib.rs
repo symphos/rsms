@@ -18,7 +18,7 @@ pub mod transaction;
 pub use client::{
     ClientBuilder, ClientConnection,
     CmppDecoder, SgipDecoder, SmgpDecoder, SmppDecoder,
-    ClientConfig, ConnectionEvent,
+    ClientConfig,
 };
 pub use connection::Connection;
 pub use handlers::cmpp::CmppHandler;

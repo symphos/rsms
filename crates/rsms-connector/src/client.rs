@@ -153,23 +153,6 @@ fn decode_frames(buf: &mut Vec<u8>, min_len: usize, extract_header: fn(&[u8]) ->
     Ok(out)
 }
 
-/// 连接向池发送的事件
-#[derive(Debug, Clone)]
-pub enum ConnectionEvent {
-    Disconnected(u64),
-    HeartbeatTimeout(u64),
-}
-
-impl ConnectionEvent {
-    pub fn disconnected(id: u64) -> Self {
-        ConnectionEvent::Disconnected(id)
-    }
-
-    pub fn heartbeat_timeout(id: u64) -> Self {
-        ConnectionEvent::HeartbeatTimeout(id)
-    }
-}
-
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -215,7 +198,7 @@ pub struct ClientConnection {
     config: ClientConfig,
     last_active: StdMutex<std::time::Instant>,
     last_sent: StdMutex<std::time::Instant>,
-    event_tx: Mutex<Option<mpsc::Sender<ConnectionEvent>>>,
+
     pending_responses: Mutex<HashMap<u32, oneshot::Sender<Result<Vec<u8>>>>>,
     decoder: Arc<tokio::sync::Mutex<Box<dyn FrameDecoder>>>,
     pending_queue: Mutex<VecDeque<RawPdu>>,
@@ -252,7 +235,7 @@ impl ClientConnection {
             config,
             last_active: StdMutex::new(std::time::Instant::now()),
             last_sent: StdMutex::new(std::time::Instant::now()),
-            event_tx: Mutex::new(None),
+
             pending_responses: Mutex::new(HashMap::new()),
             decoder,
             pending_queue: Mutex::new(VecDeque::new()),
@@ -304,10 +287,6 @@ impl ClientConnection {
             let _ = tokio::time::timeout(Duration::from_secs(3), h).await;
         }
         info!(conn_id = self.id, "client connection shutdown complete");
-    }
-
-    pub async fn set_event_tx(&self, tx: mpsc::Sender<ConnectionEvent>) {
-        *self.event_tx.lock().await = Some(tx);
     }
 
     pub fn touch(&self) {
@@ -404,9 +383,6 @@ impl ClientConnection {
         self.ready.store(false, Ordering::Release);
         let g = self.ctx.lock().await;
         g.mark_disconnected();
-        if let Some(tx) = self.event_tx.lock().await.take() {
-            let _ = tx.send(ConnectionEvent::disconnected(self.id)).await;
-        }
         // 连接断开：立即让所有在途 send_request 失败，而非各自挂到 endpoint.timeout。
         // 否则断开-重连场景下大量在途请求全部卡满超时窗口，造成延迟尖峰。
         let mut pending = self.pending_responses.lock().await;
@@ -1103,8 +1079,8 @@ mod wp4_client_tests {
         let ep = Arc::new(rsms_core::EndpointConfig::new("ep", "127.0.0.1", 7890, 16, 60));
         let handler: Arc<dyn MessageHandler> = Arc::new(DummyMh);
         let b = ClientBuilder::new(ep, Arc::clone(&handler), crate::CmppDecoder);
-        // 构造即持有，无需额外 with_message_handler
-        let _ = b;
+        // 构造即持有，无需额外 with_message_handler；字段直接可达（同 crate 子模块）
+        assert_eq!(b.handler.name(), "dummy");
     }
 }
 

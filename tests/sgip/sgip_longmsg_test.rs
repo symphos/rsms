@@ -8,7 +8,8 @@ use rsms_model::{
 };
 use rsms_connector::client::ClientConfig;
 use rsms_connector::{
-    ClientBuilder, ServerBuilder, AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler, AuthResult, SgipDecoder,
+    AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler, AuthResult,
+    ClientBuilder, ServerBuilder, SgipDecoder,
 };
 use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Protocol, RawPdu, Result};
 use rsms_longmsg::split::SmsAlphabet;
