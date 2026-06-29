@@ -14,6 +14,7 @@ use rsms_core::{ConnectionInfo, EncodedPdu, Metrics, Protocol, RawPdu, EndpointC
 // compute_connect_auth 是 MD5 鉴权工具（非裸消息构造），保留。
 use rsms_codec_cmpp::adapter::CmppAdapter;
 use rsms_codec_cmpp::auth::compute_connect_auth;
+use rsms_codec_cmpp::CmppVersion;
 use rsms_model::{
     Address, CmppExtra, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra,
     Sequence, UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmit,
@@ -1471,6 +1472,161 @@ async fn test_delivery_callback_autowire() {
     }
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(spy.reports.load(Ordering::Relaxed), 1, "应自动回调 on_report 并按 msg_id 关联到原 Submit");
+
+    handle.abort();
+}
+
+/// V2.0 版本感知服务端业务处理器：收到 Submit 时检查连接协议版本，
+/// 按版本回送对应格式的 SubmitResp，确保客户端在版本感知新路径下能正确解码。
+///
+/// V2.0 SubmitResp = 12B 头 + 8B msg_id + 1B result = 21B total（V3.0 是 24B）。
+pub struct V20AwareBusinessHandler {
+    pub submit_count: Arc<AtomicUsize>,
+    pub messages: Arc<Mutex<Vec<String>>>,
+}
+
+impl V20AwareBusinessHandler {
+    pub fn new() -> Self {
+        Self {
+            submit_count: Arc::new(AtomicUsize::new(0)),
+            messages: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn submit_count(&self) -> usize {
+        self.submit_count.load(Ordering::Relaxed)
+    }
+
+    pub fn get_messages(&self) -> Vec<String> {
+        self.messages.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl MessageHandler for V20AwareBusinessHandler {
+    fn name(&self) -> &'static str {
+        "v20-aware-biz-handler"
+    }
+
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        if let UnifiedMessage::Submit(s) = msg {
+            self.submit_count.fetch_add(1, Ordering::Relaxed);
+            let content = String::from_utf8_lossy(&s.content).to_string();
+            self.messages.lock().unwrap().push(content);
+
+            // 版本感知回送：V2.0 连接发 V2.0 SubmitResp（21B total），V3.0 发 24B。
+            // 必要性：客户端以 V2.0 版本解码入站帧，若服务端发 V3.0 SubmitResp（24B），
+            // V2.0 解码器因长度不符（期望 21B）报 InvalidPduLength，导致 on_message 无法触发。
+            let protocol_version = ctx.conn.protocol_version().await;
+            let resp_msg = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                msg_id: MessageId::Binary(vec![0u8; 8]),
+                status: 0,
+            });
+            let bytes = if protocol_version == Some(0x20) {
+                CmppAdapter.encode_with_version(&resp_msg, ctx.frame_sequence(), CmppVersion::V20)?
+            } else {
+                CmppAdapter.encode(&resp_msg, ctx.frame_sequence())?
+            };
+            ctx.conn.write_frame(&bytes).await?;
+        }
+        Ok(())
+    }
+}
+
+/// CMPP V2.0 新路径端到端集成测试（Task 2 + Task 3 的端到端验证）。
+///
+/// 验证链路：
+/// 1. 客户端预设 protocol_version=0x20 → 框架以 V2.0 正确解码服务端 ConnectResp（18B body / 30B total）
+/// 2. 客户端发 V2.0 格式 Submit（extra.version=0x20）→ 服务端新路径以 V2.0 解码 → UnifiedSubmit 字段正确
+/// 3. 服务端版本感知回 V2.0 SubmitResp（21B）→ 客户端新路径以 V2.0 解码 → status 字段正确
+///
+/// 若 Task 2（服务端 decode_with_version）缺失：Submit 以 V3.0 错误解码 → 字段错位 / 解码失败。
+/// 若 Task 3（客户端 decode_with_version）缺失：ConnectResp / SubmitResp 以 V3.0 错误解码 → 永不置 connected。
+#[tokio::test]
+async fn test_cmpp_v20_new_path_e2e() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .try_init();
+
+    let auth = Arc::new(PasswordAuthHandler::new().add_account("106900", "password123"));
+    let biz = Arc::new(V20AwareBusinessHandler::new());
+    let evt = Arc::new(TestEventHandler::new());
+    let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30)
+        .await
+        .unwrap();
+
+    let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
+    let client_handler = Arc::new(TestClientHandler::new());
+    let conn = ClientBuilder::new(endpoint, Arc::new(NoopClientHandler), CmppDecoder)
+        .with_message_handler(client_handler.clone())
+        .client_config(ClientConfig::new())
+        .connect()
+        .await
+        .expect("connect");
+
+    // 版本预设：在发 Connect 前设置 protocol_version=0x20，使框架新路径以 V2.0 解码首个入站帧
+    // （ConnectResp）。服务端在收到 Connect 后回 V2.0 ConnectResp（body=1B status+16B auth+1B
+    // version=18B，总长 30B）。若此处不预设，默认 V3.0 解码器期望 21B body（33B total）与实际
+    // 30B 不符返回 InvalidPduLength，ConnectResp 被跳过、is_connected 永不为 true。
+    conn.set_protocol_version(0x20).await;
+
+    // 发送 CMPP V2.0 Connect（version 字节 = 0x20）
+    let timestamp = 0u32;
+    let auth_bytes = compute_connect_auth("106900", "password123", timestamp);
+    let bind_v20 = UnifiedMessage::Bind(UnifiedBind {
+        client_id: "106900".to_string(),
+        authenticator: auth_bytes.to_vec(),
+        timestamp,
+        version: 0x20,
+        system_type: None,
+        mode: rsms_model::BindMode::default(),
+        login_mode: None,
+    });
+    let connect_bytes = CmppAdapter.encode(&bind_v20, Sequence::Plain(1)).expect("encode bind v20");
+    conn.send_request(RawPdu::from_vec(connect_bytes)).await.expect("send connect v20");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 断言（Task 3）：ConnectResp 被新路径以 V2.0 正确解码 → connected=true
+    assert!(
+        client_handler.is_connected(),
+        "V2.0 ConnectResp 应被客户端新路径正确解码，连接应成功"
+    );
+
+    // 发送 V2.0 格式 Submit（extra.version=0x20 → CmppAdapter.encode 产 SubmitV20 字节）
+    let submit_v20 = UnifiedMessage::Submit(UnifiedSubmit {
+        src: Address::plain("13800138000"),
+        dests: vec![Address::plain("106900")],
+        content: b"Hello V2.0 SMS".to_vec(),
+        encoding: Encoding::Ascii,
+        want_report: true,
+        concat: None,
+        extra: ProtocolExtra::Cmpp(CmppExtra { version: 0x20, ..Default::default() }),
+        tlvs: vec![],
+    });
+    let submit_bytes = CmppAdapter
+        .encode(&submit_v20, Sequence::Plain(2))
+        .expect("encode submit v20");
+    conn.send_request(RawPdu::from_vec(submit_bytes)).await.expect("send submit v20");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 断言（Task 2）：服务端新路径以 V2.0 正确解码 Submit，字段无错位
+    assert_eq!(
+        biz.submit_count(),
+        1,
+        "服务端应收到 1 条 V2.0 Submit（decode_with_version 路径）"
+    );
+    assert_eq!(
+        biz.get_messages(),
+        vec!["Hello V2.0 SMS"],
+        "服务端 Submit 内容字段应正确（V2.0 解码无字段错位）"
+    );
+
+    // 断言（Task 3）：V2.0 SubmitResp（21B）被客户端新路径正确解码，status 字段无错位
+    assert_eq!(
+        client_handler.get_submit_status(),
+        Some(0),
+        "客户端新路径应正确解码 V2.0 SubmitResp，status=0（非 V3.0 误解导致的字段偏移）"
+    );
 
     handle.abort();
 }
