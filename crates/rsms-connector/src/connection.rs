@@ -449,7 +449,7 @@ pub async fn run_connection(
                     // 窄腰主路径：按协议解码为统一消息，构造 MessageContext，顺序驱动 MessageHandler 链。
                     use rsms_model::ProtocolAdapter as _;
                     let adapter = crate::adapter_registry::adapter_for(protocol);
-                    match adapter.decode(&frame) {
+                    match adapter.decode_with_version(&frame, ProtocolConnection::protocol_version(&*conn_arc).await) {
                         Ok(unified) => {
                             let id_gen = conn_arc
                                 .account_connections()
