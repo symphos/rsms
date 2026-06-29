@@ -16,7 +16,7 @@ pub mod server;
 pub mod transaction;
 
 pub use client::{
-    ClientBuilder, ClientConnection, ClientHandler, ClientContext, NoopClientHandler,
+    ClientBuilder, ClientConnection,
     CmppDecoder, SgipDecoder, SmgpDecoder, SmppDecoder,
     ClientConfig, ConnectionEvent,
 };

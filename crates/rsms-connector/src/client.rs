@@ -596,32 +596,6 @@ impl BusinessProtocolConnection for ClientConnection {
     }
 }
 
-/// 客户端连接上下文（用于业务处理器）。
-pub struct ClientContext<'a> {
-    pub endpoint: &'a EndpointConfig,
-    pub conn: &'a Arc<ClientConnection>,
-}
-
-#[async_trait]
-pub trait ClientHandler: Send + Sync {
-    fn name(&self) -> &'static str;
-    async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()>;
-}
-
-/// 空客户端处理器：迁到 [`ClientBuilder::with_message_handler`] 后，`ClientBuilder::new` 仍强制
-/// 传入一个 `ClientHandler`（其他协议 example 共用该签名），用它占位。WP4-3 删 `client_handler` 时移除。
-pub struct NoopClientHandler;
-
-#[async_trait]
-impl ClientHandler for NoopClientHandler {
-    fn name(&self) -> &'static str {
-        "noop-client"
-    }
-    async fn on_inbound(&self, _ctx: &ClientContext<'_>, _frame: &Frame) -> Result<()> {
-        Ok(())
-    }
-}
-
 /// 客户端构建器：链式配置后调用 [`ClientBuilder::connect`] 建连并启动读循环。
 ///
 /// ```ignore
