@@ -495,6 +495,22 @@ impl ProtocolAdapter for CmppAdapter {
         let cmpp = unified_to_cmpp(msg, seq)?;
         encode_message(&cmpp)
     }
+
+    fn encode_with_version(
+        &self,
+        msg: &UnifiedMessage,
+        seq: Sequence,
+        version: Option<u8>,
+    ) -> Result<Vec<u8>> {
+        // Option<u8> → CmppVersion：复用 codec 的 from_wire（0x20/0x00/0x01→V20，0x30→V30）；
+        // None 或未知字节默认 V3.0，与 trait encode 行为一致（保证零回归）。
+        let v = match version {
+            Some(b) => CmppVersion::from_wire(b).unwrap_or(CmppVersion::V30),
+            None => CmppVersion::V30,
+        };
+        let cmpp = unified_to_cmpp_with_version(msg, seq, v)?;
+        encode_message(&cmpp)
+    }
 }
 
 impl CmppAdapter {
@@ -970,5 +986,51 @@ mod tests {
         let a: &dyn ProtocolAdapter = &CmppAdapter;
         let msg = a.decode_with_version(&f, Some(0x20)).expect("V2.0 解码应成功");
         assert!(matches!(msg, UnifiedMessage::Submit(_)), "Some(0x20) 应解出 Submit");
+    }
+
+    /// 最简合法 SubmitResp（用于 encode_with_version 测试）。
+    fn sample_submit_resp() -> UnifiedMessage {
+        UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+            msg_id: MessageId::Binary(vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]),
+            status: 0,
+        })
+    }
+
+    #[test]
+    fn encode_with_version_none_equals_encode() {
+        // 版本无关默认路径：None 必须逐字节等于 encode（保证 V3.0/ctx.reply 零回归）。
+        // 经 &dyn ProtocolAdapter 调用——绕开 inherent encode_with_version(_, CmppVersion) 的遮蔽。
+        let a: &dyn ProtocolAdapter = &CmppAdapter;
+        let msg = sample_submit_resp();
+        let seq = Sequence::Plain(7);
+        assert_eq!(
+            a.encode_with_version(&msg, seq, None).unwrap(),
+            a.encode(&msg, seq).unwrap(),
+            "None 版本应逐字节等于 encode"
+        );
+    }
+
+    #[test]
+    fn encode_with_version_some30_equals_encode() {
+        // Some(0x30) 与 None 同走 V3.0，必须等于 encode。
+        let a: &dyn ProtocolAdapter = &CmppAdapter;
+        let msg = sample_submit_resp();
+        let seq = Sequence::Plain(7);
+        assert_eq!(
+            a.encode_with_version(&msg, seq, Some(0x30)).unwrap(),
+            a.encode(&msg, seq).unwrap(),
+            "Some(0x30) 应逐字节等于 encode"
+        );
+    }
+
+    #[test]
+    fn encode_with_version_v20_differs_from_v30() {
+        // Some(0x20) 产出 V2.0 应答（SubmitResp 21B），与 V3.0（24B）不同——证明版本感知生效。
+        let a: &dyn ProtocolAdapter = &CmppAdapter;
+        let msg = sample_submit_resp();
+        let seq = Sequence::Plain(7);
+        let v20 = a.encode_with_version(&msg, seq, Some(0x20)).unwrap();
+        let v30 = a.encode(&msg, seq).unwrap();
+        assert_ne!(v20, v30, "Some(0x20) 应产出与 V3.0 不同的 V2.0 字节");
     }
 }

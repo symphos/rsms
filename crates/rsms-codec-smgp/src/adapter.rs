@@ -757,4 +757,25 @@ mod tests {
             "SMGP 应忽略 version、默认转发 decode"
         );
     }
+
+    /// 最简合法 SMGP SubmitResp（用于 encode_with_version 测试）。
+    fn sample_smgp_submit_resp() -> UnifiedMessage {
+        UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+            msg_id: MessageId::Binary(vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a]),
+            status: 0,
+        })
+    }
+
+    #[test]
+    fn encode_with_version_defaults_to_encode() {
+        // SMGP 单版本：encode_with_version 任意 version 都应等于 encode（默认转发）。
+        let a: &dyn ProtocolAdapter = &SmgpAdapter;
+        let msg = sample_smgp_submit_resp();
+        let seq = Sequence::Plain(3);
+        assert_eq!(
+            a.encode_with_version(&msg, seq, Some(0x99)).unwrap(),
+            a.encode(&msg, seq).unwrap(),
+            "SMGP 应忽略 version、默认转发 encode"
+        );
+    }
 }
