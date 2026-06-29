@@ -117,7 +117,9 @@ mod tests {
 
     #[tokio::test]
     async fn reply_encodes_with_frame_sequence_then_writes() {
-        // reply 应等价 adapter.encode(msg, frame_sequence) 再 write_frame：
+        // reply 实走 adapter.encode_with_version(msg, frame_sequence, conn.protocol_version()) 再 write_frame：
+        // MockConn.protocol_version() 返回 None，encode_with_version(None) 默认转 encode，
+        // 故此处与 adapter.encode(msg, frame_sequence) 逐字节等价。
         // 验证 MessageContext 的编排职责（不验证 codec 字节正确性——那是 adapter 自己的测试）。
         let conn = Arc::new(MockConn::default());
         let ctx = make_ctx(conn.clone(), Sequence::Plain(42));
