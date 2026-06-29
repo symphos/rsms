@@ -14,7 +14,6 @@ use rsms_core::{ConnectionInfo, EncodedPdu, Metrics, Protocol, RawPdu, EndpointC
 // compute_connect_auth 是 MD5 鉴权工具（非裸消息构造），保留。
 use rsms_codec_cmpp::adapter::CmppAdapter;
 use rsms_codec_cmpp::auth::compute_connect_auth;
-use rsms_codec_cmpp::CmppVersion;
 use rsms_model::{
     Address, CmppExtra, DeliveryStatus, Encoding, MessageId, ProtocolAdapter, ProtocolExtra,
     Sequence, UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmit,
@@ -1514,20 +1513,12 @@ impl MessageHandler for V20AwareBusinessHandler {
             let content = String::from_utf8_lossy(&s.content).to_string();
             self.messages.lock().unwrap().push(content);
 
-            // 版本感知回送：V2.0 连接发 V2.0 SubmitResp（21B total），V3.0 发 24B。
-            // 必要性：客户端以 V2.0 版本解码入站帧，若服务端发 V3.0 SubmitResp（24B），
-            // V2.0 解码器因长度不符（期望 21B）报 InvalidPduLength，导致 on_message 无法触发。
-            let protocol_version = ctx.conn.protocol_version().await;
-            let resp_msg = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+            // 版本感知回送：Task2 后 ctx.reply 自动按 conn.protocol_version() 编码，
+            // V2.0 连接自动产 V2.0 SubmitResp（21B），V3.0 产 24B，无需手动分支。
+            ctx.reply(UnifiedMessage::SubmitResp(UnifiedSubmitResp {
                 msg_id: MessageId::Binary(vec![0u8; 8]),
                 status: 0,
-            });
-            let bytes = if protocol_version == Some(0x20) {
-                CmppAdapter.encode_with_version(&resp_msg, ctx.frame_sequence(), CmppVersion::V20)?
-            } else {
-                CmppAdapter.encode(&resp_msg, ctx.frame_sequence())?
-            };
-            ctx.conn.write_frame(&bytes).await?;
+            })).await?;
         }
         Ok(())
     }
