@@ -964,7 +964,7 @@ async fn run_client_read_loop(
                 // 窄腰主路径：解码为统一消息，构造 MessageContext，调 on_message。
                 use rsms_model::ProtocolAdapter as _;
                 let adapter = crate::adapter_registry::adapter_for(conn.endpoint.protocol);
-                match adapter.decode(&frame) {
+                match adapter.decode_with_version(&frame, BusinessProtocolConnection::protocol_version(&*conn).await) {
                     Ok(unified) => {
                         let ctx = MessageContext::new(
                             conn.endpoint.clone(),
