@@ -785,68 +785,6 @@ fn create_decoder(protocol: Protocol) -> Box<dyn FrameDecoder + Send + Sync> {
     }
 }
 
-/// 连接函数，由 ClientPool 调用，连接的生命周期由 Pool 管理（内部 API）
-pub(crate) async fn connect_with_pool(
-    stream: TcpStream,
-    endpoint: Arc<EndpointConfig>,
-    client_handler: Arc<dyn ClientHandler>,
-    client_config: Option<ClientConfig>,
-    message_source: Option<Arc<dyn MessageSource>>,
-    event_handler: Option<Arc<dyn ClientEventHandler>>,
-    event_tx: mpsc::Sender<ConnectionEvent>,
-) -> Result<Arc<ClientConnection>> {
-    let decoder: Arc<tokio::sync::Mutex<Box<dyn FrameDecoder>>> = Arc::new(tokio::sync::Mutex::new(create_decoder(endpoint.protocol)));
-    let decoder_for_conn = Arc::clone(&decoder);
-    let config = client_config.unwrap_or_default();
-    // ClientPool 路径：交付链路沿用 AccountConnections 上的 TM（手动驱动），此处直连字段置 None。
-    let conn = ClientConnection::new(stream, endpoint.clone(), config, decoder_for_conn, None).await;
-    conn.set_event_tx(event_tx).await;
-
-    // 缺口#2 修复：客户端按配置声明的版本自动预设（服务端收 Connect 自动协商，客户端侧无此入站时机）。
-    if let Some(v) = endpoint.protocol_version {
-        conn.set_protocol_version(v).await;
-    }
-
-    if let Some(window) = &conn.window {
-        window.start_monitor();
-    }
-
-    let conn_clone = Arc::clone(&conn);
-    let client_handler_clone = Arc::clone(&client_handler);
-
-    if let Some(handler) = &event_handler {
-        let conn_for_handler = conn_clone.clone() as Arc<dyn ProtocolConnection>;
-        handler.on_connected(&conn_for_handler).await;
-    }
-
-    // ClientPool 管理的连接本期不接指标(用 Noop);池侧指标留作后续小增量。
-    let metrics: Arc<dyn Metrics> = Arc::new(NoopMetrics);
-    let metrics_for_read = Arc::clone(&metrics);
-    let read_handle = tokio::spawn(async move {
-        run_client_read_loop(conn_clone, client_handler_clone, None, decoder, event_handler, metrics_for_read).await;
-    });
-    conn.register_task(read_handle).await;
-
-    // 启动 keepalive 任务
-    let protocol = endpoint.protocol;
-    let idle_timeout = endpoint.idle_time_sec as u32;
-    let keepalive_handle = start_keepalive_task(Arc::clone(&conn), protocol, idle_timeout);
-    conn.register_task(keepalive_handle).await;
-
-    conn.mark_connected().await;
-    info!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "connection established");
-
-    if let Some(source) = message_source {
-        let conn_clone = Arc::clone(&conn);
-        let fetch_handle = tokio::spawn(async move {
-            run_outbound_fetcher(conn_clone, source, metrics).await;
-        });
-        conn.register_task(fetch_handle).await;
-    }
-
-    Ok(conn)
-}
-
 async fn run_client_read_loop(
     conn: Arc<ClientConnection>,
     client_handler: Arc<dyn ClientHandler>,
