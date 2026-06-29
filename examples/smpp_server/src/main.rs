@@ -15,7 +15,7 @@
 // 核心流程：
 //   1. 从 accounts.conf 读取账号配置
 //   2. 客户端连接 → 框架自动完成 SMPP 协议握手（Bind/BindResp）
-//   3. 客户端发送 Submit → BusinessHandler.on_inbound() 收到，统一模型解码
+//   3. 客户端发送 Submit → MessageHandler.on_message() 收到，统一模型解码
 //   4. 业务方回 SubmitResp、处理业务（含长短信合包）
 //   5. 通过 MessageSource 异步发送 Deliver（MO）/ Report（回执）
 //
@@ -321,7 +321,7 @@ impl MessageSource for FileMessageSource {
 }
 
 // ============================================================================
-// BusinessHandler：统一模型分支处理客户端上行的所有帧
+// MessageHandler：统一模型分支处理客户端上行的所有帧
 //
 // 长短信 MT 合包：
 //   - adapter.decode 不透传 esm_class，故对 UnifiedSubmit.content 直接跑 UdhParser

@@ -328,7 +328,7 @@ impl MessageSource for FileMessageSource {
 }
 
 // ============================================================================
-// BusinessHandler：统一模型分支处理客户端上行的所有帧
+// MessageHandler：统一模型分支处理客户端上行的所有帧
 // ============================================================================
 
 struct SgipBusinessHandler {
@@ -445,7 +445,7 @@ impl SgipBusinessHandler {
             );
         }
 
-        // 需要状态报告：取被报告 Submit 的复合序列（ctx.frame_sequence，由框架从请求帧头解出）
+        // 需要状态报告：取被报告 Submit 的复合序列（ctx.frame_sequence()，由框架从请求帧头解出）
         // 作为 Report.submit_sequence（delta-2：SgipAdapter.encode 从 msg_id 12B Binary 反解还原）。
         if submit.want_report {
             if let Some(account) = ctx.conn.authenticated_account().await {

@@ -261,7 +261,7 @@ impl MessageSource for ClientMessageSource {
 }
 
 // ============================================================================
-// ClientHandler：统一模型分支处理服务端下发的所有帧
+// MessageHandler：统一模型分支处理服务端下发的所有帧
 //
 // - BindResp：认证结果
 // - SubmitResp：提交结果（看 status）
@@ -391,7 +391,7 @@ fn sgip_timestamp() -> u32 {
 //   1. connect() 建立 TCP 连接，启动读循环、keepalive、outbound fetcher
 //   2. write_frame() 发送 Bind 认证（不能用 send_request，SGIP 复合序列偏移不同）
 //   3. MessageSource.fetch() 被 outbound fetcher 循环调用，认证后自动发出 Submit
-//   4. ClientHandler.on_inbound() 处理所有服务端响应
+//   4. MessageHandler.on_message() 处理所有服务端响应
 //   5. 定时等待 Report/MO，然后显式 Unbind 干净关闭
 // ============================================================================
 

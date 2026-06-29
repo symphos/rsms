@@ -240,7 +240,7 @@ impl MessageHandler for ServerHandler {
         let account = ctx.conn.authenticated_account().await.unwrap_or_else(|| "unknown".to_string());
         match msg {
             UnifiedMessage::Submit(s) => {
-                let _count = self.submit_count.fetch_add(1, Ordering::Relaxed);
+                self.submit_count.fetch_add(1, Ordering::Relaxed);
 
                 // 回 SubmitResp：ctx.reply 自动回显请求帧序列（含 SGIP 复合序列）。
                 let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {

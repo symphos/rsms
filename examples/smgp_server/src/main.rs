@@ -275,7 +275,7 @@ impl MessageSource for FileMessageSource {
 }
 
 // ============================================================================
-// BusinessHandler：统一模型分支处理客户端上行帧（Submit / ActiveTest …）
+// MessageHandler：统一模型分支处理客户端上行帧（Submit / ActiveTest …）
 // ============================================================================
 
 struct SmgpBusinessHandler {
