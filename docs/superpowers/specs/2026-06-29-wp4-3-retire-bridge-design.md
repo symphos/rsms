@@ -47,6 +47,7 @@ WP4-1（CMPP）/ WP4-2（SMGP/SMPP/SGIP）已把四协议主链路的 example / 
 
 - **D-切分**：拆 3 子包 3a/3b/3c，门禁串联（§4）。每子包独立 spec→plan→评审，延续 WP4-1/4-2 节奏。
 - **D1a 版本感知内化**：`ProtocolAdapter` 加 `decode_with_version(&self, frame, version: Option<u8>) -> Result<UnifiedMessage>`，**默认实现转调 `decode`**；仅 CMPP override 转 `CmppAdapter::decode_with_version`。服务端新路径与客户端新路径的解码调用点均改传 `conn.protocol_version()`。
+- **D1b 版本感知编码内化（WP4-3a-followup，2026-06-29 追加）**：D1a 的 encode 镜像。`ProtocolAdapter` 加 `encode_with_version(&self, msg, seq, version: Option<u8>) -> Result<Vec<u8>>`，**默认转调 `encode`**，仅 CMPP override（`CmppVersion::from_wire` 映射 + `unified_to_cmpp_with_version`）；`MessageContext::reply` 改传 `conn.protocol_version()`。使 V2.0 服务端 `ctx.reply` 自动回 V2.0 应答，消除手动 `encode_with_version` 特例。WP4-3a scope 从「仅 decode 版本感知」扩为「decode+encode 对称」。**前置于 WP4-3b**：3b 迁 cmpp20_test/stress 可统一用 `ctx.reply`、不留手动 encode 特例。零回归命脉=V3.0/单版本 `encode_with_version(None/Some(0x30))` 逐字节等于 `encode`。
 - **D3b 心跳收归（handle_frame 统一，偏离原设计笔记的「统一 decode 层」倾向）**：心跳与握手/关闭同属协议层 resp，保持在各协议 `handle_frame` 里框架自动回。仅给 CMPP `handlers/cmpp.rs` 补 ActiveTest 自动回（对齐 SMGP/SMPP），**不动**已验证的 SMGP/SMPP，SGIP 无心跳不动。理由：与握手同层架构一致 + 不扰动已真机验证路径 + 改动面最小。
 - **D-遗留全迁**：3b **全迁**所有遗留 target，**不留任何旧路径样本**。逐 target 判断是否有触裸帧需求 → 用 `RawFrameHandler` 逃生舱口，否则 `MessageHandler`。
 - **D-客户端签名**：3c 删 `NoopClientHandler` 占位，`ClientBuilder::new(endpoint, handler, decoder)` 第二参直接收 `Arc<dyn MessageHandler>`（breaking）。
