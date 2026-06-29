@@ -730,6 +730,11 @@ impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
 
     let conn = ClientConnection::new(stream, endpoint.clone(), config, decoder_for_conn, tm).await;
 
+    // 缺口#2 修复：客户端按配置声明的版本自动预设（服务端收 Connect 自动协商，客户端侧无此入站时机）。
+    if let Some(v) = endpoint.protocol_version {
+        conn.set_protocol_version(v).await;
+    }
+
     if let Some(window) = &conn.window {
         window.start_monitor();
     }
@@ -796,6 +801,11 @@ pub(crate) async fn connect_with_pool(
     // ClientPool 路径：交付链路沿用 AccountConnections 上的 TM（手动驱动），此处直连字段置 None。
     let conn = ClientConnection::new(stream, endpoint.clone(), config, decoder_for_conn, None).await;
     conn.set_event_tx(event_tx).await;
+
+    // 缺口#2 修复：客户端按配置声明的版本自动预设（服务端收 Connect 自动协商，客户端侧无此入站时机）。
+    if let Some(v) = endpoint.protocol_version {
+        conn.set_protocol_version(v).await;
+    }
 
     if let Some(window) = &conn.window {
         window.start_monitor();
