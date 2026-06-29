@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use rsms_business::{
-    run_chain, run_message_chain, BusinessHandler, MessageContext, MessageHandler,
+    run_message_chain, MessageContext, MessageHandler,
     ProtocolConnection as BusinessProtocolConnection, RateLimiter,
 };
 use rsms_codec_cmpp::CommandId as CmppCommandId;
@@ -332,7 +332,6 @@ impl RateLimiter for SubmitLimiterAdapter {
 pub async fn run_connection(
     read: OwnedReadHalf,
     conn: Arc<Connection>,
-    handlers: Vec<Arc<dyn BusinessHandler>>,
     message_handlers: Vec<Arc<dyn MessageHandler>>,
     account_pool: Option<Arc<AccountPool>>,
     account_config_provider: Option<Arc<dyn AccountConfigProvider>>,
@@ -367,8 +366,8 @@ pub async fn run_connection(
         .min(Duration::from_secs(1))
         .max(Duration::from_millis(100));
 
-    // 窄腰路径要求 MessageContext.id_generator 非 Option；account pool 在 run_chain 之后才注册，
-    // 首帧时连接可能尚未入池。为此每连接持一个 fallback 生成器，未入池时用它，保证连接内计数连续。
+    // MessageContext.id_generator 非 Option；首帧时账号尚未入池，每连接持一个 fallback 生成器，
+    // 保证连接内计数连续。
     let fallback_id_gen: Arc<dyn rsms_core::IdGenerator> = Arc::new(crate::SimpleIdGenerator::new());
 
     loop {
@@ -439,38 +438,30 @@ pub async fn run_connection(
             };
 
             if action == HandleResult::Continue {
-                if message_handlers.is_empty() {
-                    // 旧路径（BusinessHandler）：行为保持不变。
-                    let id_gen = conn_arc.account_connections().await.map(|ac| ac.id_generator().clone());
-                    if let Err(e) = run_chain(conn.config.clone(), conn_arc.clone() as Arc<dyn rsms_business::ProtocolConnection>, &handlers, &frame, id_gen).await {
-                        error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "business: {}", e);
+                // 窄腰主路径：按协议解码为统一消息，构造 MessageContext，顺序驱动 MessageHandler 链。
+                use rsms_model::ProtocolAdapter as _;
+                let adapter = crate::adapter_registry::adapter_for(protocol);
+                match adapter.decode_with_version(&frame, ProtocolConnection::protocol_version(&*conn_arc).await) {
+                    Ok(unified) => {
+                        let id_gen = conn_arc
+                            .account_connections()
+                            .await
+                            .map(|ac| ac.id_generator().clone())
+                            .unwrap_or_else(|| fallback_id_gen.clone());
+                        let ctx = MessageContext::new(
+                            conn.config.clone(),
+                            conn_arc.clone() as Arc<dyn rsms_business::ProtocolConnection>,
+                            id_gen,
+                            adapter,
+                            adapter.sequence_of(&frame),
+                        );
+                        if let Err(e) = run_message_chain(&ctx, &unified, &message_handlers).await {
+                            error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "message business: {}", e);
+                        }
                     }
-                } else {
-                    // 窄腰主路径：按协议解码为统一消息，构造 MessageContext，顺序驱动 MessageHandler 链。
-                    use rsms_model::ProtocolAdapter as _;
-                    let adapter = crate::adapter_registry::adapter_for(protocol);
-                    match adapter.decode_with_version(&frame, ProtocolConnection::protocol_version(&*conn_arc).await) {
-                        Ok(unified) => {
-                            let id_gen = conn_arc
-                                .account_connections()
-                                .await
-                                .map(|ac| ac.id_generator().clone())
-                                .unwrap_or_else(|| fallback_id_gen.clone());
-                            let ctx = MessageContext::new(
-                                conn.config.clone(),
-                                conn_arc.clone() as Arc<dyn rsms_business::ProtocolConnection>,
-                                id_gen,
-                                adapter,
-                                adapter.sequence_of(&frame),
-                            );
-                            if let Err(e) = run_message_chain(&ctx, &unified, &message_handlers).await {
-                                error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "message business: {}", e);
-                            }
-                        }
-                        // 解码失败仅告警、跳过该帧（对齐 example 现状，不因业务消息解码失败断连）。
-                        Err(e) => {
-                            tracing::warn!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "统一模型解码失败（跳过该帧）: {e}");
-                        }
+                    // 解码失败仅告警、跳过该帧（对齐 example 现状，不因业务消息解码失败断连）。
+                    Err(e) => {
+                        tracing::warn!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "统一模型解码失败（跳过该帧）: {e}");
                     }
                 }
             }

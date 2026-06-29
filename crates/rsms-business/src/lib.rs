@@ -66,20 +66,6 @@ pub trait BusinessHandler: Send + Sync {
     }
 }
 
-pub struct NoopBusiness;
-
-#[async_trait]
-impl BusinessHandler for NoopBusiness {
-    fn name(&self) -> &'static str {
-        "noop"
-    }
-
-    async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        tracing::debug!(endpoint = %ctx.endpoint.id, conn_id = ctx.conn.id(), pdu_len = frame.len(), "noop business handler");
-        Ok(())
-    }
-}
-
 #[async_trait]
 pub trait RateLimiter: Send + Sync {
     async fn try_acquire(&self) -> bool;
@@ -98,19 +84,3 @@ pub trait ProtocolConnection: Send + Sync {
     async fn protocol_version(&self) -> Option<u8>;
 }
 
-pub async fn run_chain(
-    endpoint: Arc<EndpointConfig>,
-    conn: Arc<dyn ProtocolConnection>,
-    handlers: &[Arc<dyn BusinessHandler>],
-    frame: &Frame,
-    id_generator: Option<Arc<dyn IdGenerator>>,
-) -> Result<()> {
-    let ctx = InboundContext { endpoint, conn, id_generator };
-    if handlers.is_empty() {
-        return NoopBusiness.on_inbound(&ctx, frame).await;
-    }
-    for h in handlers {
-        h.on_inbound(&ctx, frame).await?;
-    }
-    Ok(())
-}
