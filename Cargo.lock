@@ -55,6 +55,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "bytes",
+ "rsms-business",
  "rsms-codec-cmpp",
  "rsms-connector",
  "rsms-core",
@@ -577,6 +578,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "bytes",
+ "rsms-business",
  "rsms-codec-sgip",
  "rsms-connector",
  "rsms-core",
@@ -635,6 +637,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "bytes",
+ "rsms-business",
  "rsms-codec-smgp",
  "rsms-connector",
  "rsms-core",
@@ -668,6 +671,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "bytes",
+ "rsms-business",
  "rsms-codec-smpp",
  "rsms-connector",
  "rsms-core",
