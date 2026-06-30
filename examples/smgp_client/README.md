@@ -47,14 +47,14 @@ cargo run -p smgp-client-example
 2. 调用 `connect()` 建立 TCP 连接，框架启动读循环、keepalive、outbound fetcher
 3. 通过 `send_request()` 发送 Login 认证请求（MD5），等待 LoginResp
 4. 认证成功后，`MessageSource.fetch()` 被框架 outbound fetcher 循环调用，自动发出 Submit
-5. `ClientHandler.on_inbound()` 处理所有服务端响应：SubmitResp、Deliver（Report/MO）
+5. `MessageHandler.on_message()` 处理所有服务端响应：SubmitResp、Deliver（Report/MO）
 
 ## 代码结构
 
 | 组件 | 职责 |
 |---|---|
 | `ClientMessageSource` | 实现 `MessageSource` trait，维护待发送的 Submit PDU 队列。认证前 `fetch()` 返回空，认证后按批次返回消息。框架的 `run_outbound_fetcher` 循环调用 `fetch(endpoint_id, 16)` 取出消息通过 `write_frame` 直接发出 |
-| `SmgpClientHandler` | 实现 `ClientHandler` trait，处理服务端下发的所有帧：LoginResp（认证结果）、SubmitResp（提交结果）、Deliver（状态报告或 MO 上行）、ActiveTestResp（心跳响应）。收到 Deliver 后回 DeliverResp |
+| `SmgpClientHandler` | 实现 `MessageHandler` trait，处理服务端下发的所有帧：LoginResp（认证结果）、SubmitResp（提交结果）、Deliver（状态报告或 MO 上行）、ActiveTestResp（心跳响应）。收到 Deliver 后在 `on_message` 中用 `ctx.reply(UnifiedMessage::DeliverResp)` 回响应 |
 | `main()` | 组装各组件：创建 EndpointConfig、构建 MessageSource 和 Handler、调用 `connect()` 建立连接、通过 `send_request()` 发送 Login 认证 |
 
 ## 与 CMPP 客户端的差异

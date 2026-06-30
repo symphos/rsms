@@ -100,7 +100,7 @@ Offset  Value   说明
 ### 服务端：接收长短信
 
 ```rust
-// 在 BusinessHandler::on_inbound 中（窄腰：Adapter 已把级联 UDH 剥进 submit.concat、
+// 在 MessageHandler::on_message 中（窄腰：Adapter 已把级联 UDH 剥进 submit.concat、
 // content 为纯载荷）。据 concat 重建含 UDH 的分段帧喂 merger：
 if let Some(c) = submit.concat {
     let mut seg = c.to_udh_prefix();          // 据 concat 重建 UDH 头

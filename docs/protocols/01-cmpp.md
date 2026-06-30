@@ -118,9 +118,13 @@ let bytes = pdu.to_pdu_bytes(sequence_id);
 ### MT 响应：SubmitResp
 
 ```rust
-// 在 BusinessHandler::on_inbound 中收到 Submit 后，业务方构造 SubmitResp
-let resp_bytes = build_submit_resp(sequence_id, msg_id, result);
-ctx.conn.write_frame(&resp_bytes).await?;
+// 在 MessageHandler::on_message 中收到 UnifiedMessage::Submit 后，业务方用 ctx.reply 回 SubmitResp
+// （框架按请求帧序列编码并写回，业务不再手剥序列/手拼字节）。
+ctx.reply(UnifiedMessage::SubmitResp(rsms_model::UnifiedSubmitResp {
+    msg_id: MessageId::Binary(msg_id.to_vec()),
+    status: 0,
+}))
+.await?;
 ```
 
 ### MO 上行和状态报告：Deliver
@@ -159,10 +163,12 @@ let deliver = Deliver {
 | 版本号 | `0x20` | `0x30` |
 | Submit 结构 | `SubmitV20`（无 `link_id`/`dest_terminal_type`/`fee_terminal_type`，有 `reserve: [u8;8]`） | `Submit`（有额外字段） |
 | `fee_terminal_id` 最大长度 | 21 | 32 |
-| 解码入口 | `decode_message_with_version(pdu, Some(0x20))` | `decode_message_with_version(pdu, Some(0x30))` 或 `decode_message(pdu)` |
+| 底层解码原语 | `decode_message_with_version(pdu, Some(0x20))` | `decode_message_with_version(pdu, Some(0x30))` 或 `decode_message(pdu)` |
+
+窄腰模型下，**业务无需手动按版本解码**：框架按连接协商版本（`conn.protocol_version()`）调用 `CmppAdapter::decode_with_version`，业务在 `MessageHandler::on_message` 收到的已是解码完成的 `UnifiedMessage`。上表的 `decode_message_with_version` 仅是框架内部使用的底层原语，等价于：
 
 ```rust
-// 服务端根据客户端连接时的 version 字段选择解码路径
+// 框架内部按协商版本自动解码（业务侧通常不直接调用）
 let version = conn.protocol_version().await.unwrap_or(0x30);
 let message = decode_message_with_version(pdu, Some(version))?;
 ```
@@ -244,7 +250,7 @@ let config = Arc::new(EndpointConfig::new("cmpp-gateway", "0.0.0.0", 7890, 500, 
     .with_protocol(Protocol::Cmpp));
 
 let server = ServerBuilder::new(config)
-    .handler(Arc::new(MyBizHandler))
+    .message_handlers(vec![Arc::new(MyBizHandler)])
     .auth_handler(Arc::new(CmppAuth::new()))
     .account_config_provider(Arc::new(MyConfigProvider))
     .serve().await?;
@@ -261,6 +267,7 @@ tokio::spawn(async move { let _ = server.run().await; });
 ```rust
 let endpoint = Arc::new(EndpointConfig::new("cmpp-client", "127.0.0.1", port, 500, 60));
 
+// 第二参为 Arc<dyn MessageHandler>（MyClientHandler 实现 MessageHandler trait 的 on_message）。
 let conn = ClientBuilder::new(endpoint, Arc::new(MyClientHandler), CmppDecoder)
     .client_config(ClientConfig::default())
     .connect().await?;

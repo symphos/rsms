@@ -9,7 +9,7 @@
 重构并压测多协议（CMPP/SMGP/SMPP/SGIP）消息中间件框架。四协议的集成测试和压测已全部完成。
 
 核心目标：
-1. **框架重构**：移除框架对 SubmitResp/SubmitSmResp 的自动发送，业务方在 `BusinessHandler::on_inbound` 中自己处理
+1. **框架重构**：移除框架对 SubmitResp/SubmitSmResp 的自动发送，业务方在 `MessageHandler::on_message` 中自己处理
 2. **消息队列**：使用方自己建内存消息队列，通过 `MessageSource.fetch()` 拉取，按账号隔离
 3. **ID 生成器**：按账号维度的 MsgId/SequenceId 生成器，`AccountConnections` 持有 `IdGenerator` 实例
 4. **客户端**：业务方自己维护 msgId → 业务信息映射，用于匹配 Report
@@ -73,7 +73,7 @@
 - **所有压测必须用 WARN 级别**
 
 ### 8. Handler 设计一致性
-- CMPP/SMGP/SMPP 三个 handler 对 Submit 都只返回 `Continue`（不自动回 SubmitResp），由 BusinessHandler 回
+- CMPP/SMGP/SMPP 三个 handler 对 Submit 都只返回 `Continue`（不自动回 SubmitResp），由 MessageHandler 回
 - 但 SMGP 和 SMPP 的 ActiveTest/EnquireLink 原来返回 `Stop`（会断连），需要改为 `Continue`
 
 ### 9. ~~SMPP 多账号压测 MT TPS 骤降问题~~ **已解决**
@@ -153,7 +153,7 @@
 ### IdGenerator 重构（✅ 已完成）
 - ✅ `IdGenerator` trait 定义在 `rsms-core`，`SimpleIdGenerator` 实现在 `rsms-connector`
 - ✅ `AccountConnections` 按账号持有独立 `IdGenerator` 实例
-- ✅ `InboundContext.id_generator` 传递给业务 Handler
+- ✅ `MessageContext.id_generator` 传递给业务 Handler
 - ✅ 移除 `Protocol` trait 死代码（`next_msg_id`、`encode_submit_resp`、4个 Protocol struct）
 - ✅ 修复 `decode_frames_drain` sequence_id 偏移量（SMPP/SGIP 用 offset 12）
 - ✅ 四协议示例 server 接入 `id_generator`

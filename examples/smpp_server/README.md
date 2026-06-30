@@ -40,8 +40,8 @@ cargo run -p smpp-server-example
 
 1. 启动时从 `accounts.conf` 读取账号配置，从 `messages.conf` 加载预定义 MO 消息
 2. 客户端连接后，框架自动完成 SMPP 协议握手（BindTransmitter/Resp）
-3. 客户端发送 SubmitSm 时，`BusinessHandler.on_inbound()` 收到请求
-4. 业务方自行解码 SubmitSm、回复 SubmitSmResp、处理业务逻辑
+3. 客户端发送 SubmitSm 时，框架解码为统一模型，`MessageHandler.on_message()` 收到 `UnifiedMessage::Submit`
+4. 业务方按枚举分支处理，用 `ctx.reply(UnifiedMessage::SubmitResp(..))` 回执（框架按请求帧序列编码写回）
 5. 需要状态报告时（`registered_delivery == 1`），通过 MessageSource 异步发送 DeliverSm Report
 6. 框架的 `run_outbound_fetcher` 循环调用 `MessageSource.fetch(account, batch_size)` 投递消息
 
@@ -115,11 +115,7 @@ SMPP 的 message_id 是 `String` 类型（如 `"0000000001"`），而 CMPP 是 `
 
 ### 5. 版本参数
 
-解码 SMPP 消息时需要传入版本参数：
-
-```rust
-decode_message_with_version(data, Some(SmppVersion::V34))
-```
+SMPP 版本差异（V3.4/V5.0）仅是字段长度限制，统一模型由 `SmppAdapter` 内部封装，业务无需显式处理；如需限定版本可在 `EndpointConfig` 侧设置（本例使用默认）。
 
 ## 长短信
 
@@ -194,12 +190,12 @@ src/main.rs
 │   └── load_mo_messages()     — 从 messages.conf 读取预定义 MO 消息
 ├── SmppAuthHandler            — 明文认证处理器（实现 AuthHandler trait）
 ├── FileMessageSource          — 内存消息队列（按账号隔离，实现 MessageSource trait）
-├── SmppBusinessHandler        — 业务处理器（实现 BusinessHandler trait）
-│   ├── handle_submit()        — 处理 SubmitSm，回 SubmitSmResp，推送 Report
-│   └── on_inbound()           — 分发 SubmitSm/DeliverSm/EnquireLink
+├── SmppBusinessHandler        — 业务处理器（实现 MessageHandler trait）
+│   ├── handle_submit()        — 处理 Submit，ctx.reply 回 SubmitResp，推送 Report
+│   └── on_message()           — 分发 Submit/Deliver/Ping(EnquireLink)
 ├── 辅助函数
-│   ├── build_deliver_sm_report() — 构建状态报告 DeliverSm
-│   └── build_deliver_sm_mo()     — 构建上行 DeliverSm
+│   ├── encode_deliver_report()   — 构建状态报告（UnifiedMessage::Report）
+│   └── encode_deliver_mo()       — 构建上行 MO（UnifiedMessage::Deliver）
 ├── SimpleAccountConfigProvider  — 账号配置（限流、最大连接数）
 ├── SmppServerEventHandler       — 连接事件回调
 └── main()                       — 组装各组件并启动服务
