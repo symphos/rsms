@@ -23,7 +23,7 @@
 - `MessageSource` trait：`fetch(account, batch_size) -> Vec<Vec<u8>>`，使用方自己序列化/反序列化
 - **`IdGenerator` trait（rsms-core）**：`next_msg_id() -> u64` + `next_sequence_id() -> u32`，按账号隔离
 - **`AccountConnections` 持有 `Arc<dyn IdGenerator>`**：`SimpleIdGenerator`（rsms-connector）为默认实现
-- **`InboundContext.id_generator`**：`Option<Arc<dyn IdGenerator>>`，业务 Handler 通过 `ctx.id_generator` 获取
+- **`MessageContext.id_generator`**：`Option<Arc<dyn IdGenerator>>`，业务 Handler 通过 `ctx.id_generator` 获取
 - 客户端匹配完 msgId 后立即移除
 - `send_request` 改用 `window.offer()` 等待而非 `try_offer()` 立即报错
 - 压测要有两个时间维度：压测时间 + 程序总时间
@@ -204,7 +204,7 @@ crates/rsms-connector/src/handlers/smgp.rs         # SMGP handler
 crates/rsms-connector/src/handlers/smpp.rs         # SMPP handler
 crates/rsms-connector/src/handlers/sgip.rs         # SGIP handler
 crates/rsms-connector/src/pool.rs                  # AccountConnections + id_generator
-crates/rsms-business/src/lib.rs                    # InboundContext + id_generator, run_chain
+crates/rsms-business/src/lib.rs                    # MessageContext + id_generator, MessageHandler
 crates/rsms-core/src/endpoint.rs                   # EndpointConfig + window_size + protocol
 crates/rsms-window/src/window.rs                   # offer vs try_offer
 ```

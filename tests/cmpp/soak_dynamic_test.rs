@@ -112,7 +112,7 @@ async fn start_server() -> (u16, Arc<AccountPool>, tokio::task::JoinHandle<()>) 
             .with_max_qps(100_000),
     ));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![])
+        .message_handlers(vec![])
         .auth_handler(Arc::new(MultiAccountAuth))
         .account_config_provider(provider as Arc<dyn AccountConfigProvider>)
         .serve()

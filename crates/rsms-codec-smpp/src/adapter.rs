@@ -292,7 +292,8 @@ fn unified_to_smpp_bytes(msg: &UnifiedMessage, seq: Sequence) -> Result<Vec<u8>>
             // 统一模型 status 写回 SubmitSmResp.command_status → to_pdu_bytes 写进头部。
             Pdu::from(SubmitSmResp { message_id, command_status: r.status })
         }
-        UnifiedMessage::DeliverResp => Pdu::from(DeliverSmResp { message_id: String::new() }),
+        // SMPP 报告经 DeliverSm(esm_class=0x04) 承载，对报告的响应即 DeliverSmResp。
+        UnifiedMessage::DeliverResp | UnifiedMessage::ReportResp => Pdu::from(DeliverSmResp { message_id: String::new() }),
         UnifiedMessage::Bind(b) => {
             // 按 mode 选 bind 变体。system_id=client_id，口令明文（authenticator 为明文字节），
             // system_type 缺省为空串，interface_version 取 version。addr_ton/npi/address_range 默认。
@@ -756,5 +757,14 @@ mod tests {
         // encode 重建 UDH + 置 esm_class 0x40 → 字节与原始无损一致。
         let reencoded = SmppAdapter.encode(&unified, Sequence::Plain(30)).unwrap();
         assert_eq!(reencoded, original, "级联 Submit 经统一模型往返字节应无损一致");
+    }
+
+    #[test]
+    fn report_resp_equals_deliver_resp() {
+        // SMPP 报告经 DeliverSm(esm_class=0x04) 承载，对报告的响应即 DeliverSmResp。
+        let seq = Sequence::Plain(42);
+        let a = SmppAdapter.encode(&UnifiedMessage::ReportResp, seq).unwrap();
+        let b = SmppAdapter.encode(&UnifiedMessage::DeliverResp, seq).unwrap();
+        assert_eq!(a, b);
     }
 }

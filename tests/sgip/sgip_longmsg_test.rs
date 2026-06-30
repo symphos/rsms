@@ -1,17 +1,17 @@
 use async_trait::async_trait;
-use rsms_business::{BusinessHandler, InboundContext};
+use rsms_business::{MessageContext, MessageHandler};
 // 窄腰统一模型：收发一律走 SgipAdapter + UnifiedMessage，不再手构裸 codec / 手剥头部字节。
 use rsms_codec_sgip::adapter::SgipAdapter;
 use rsms_model::{
     Address, Concat, Encoding, ProtocolAdapter, ProtocolExtra, Sequence, SgipExtra, UnifiedBind,
     UnifiedDeliver, UnifiedMessage, UnifiedSubmit, UnifiedSubmitResp,
 };
-use rsms_connector::client::{ClientConfig, ClientContext, ClientHandler};
+use rsms_connector::client::ClientConfig;
 use rsms_connector::{
-    ClientBuilder, ServerBuilder, AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler, AuthResult,
-    SgipDecoder,
+    AccountConfig, AccountConfigProvider, AuthCredentials, AuthHandler, AuthResult,
+    ClientBuilder, ServerBuilder, SgipDecoder,
 };
-use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Protocol, Frame, RawPdu, Result};
+use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Protocol, RawPdu, Result};
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
 use std::collections::HashMap;
@@ -115,32 +115,32 @@ impl LongMsgBizHandler {
 }
 
 #[async_trait]
-impl BusinessHandler for LongMsgBizHandler {
+impl MessageHandler for LongMsgBizHandler {
     fn name(&self) -> &'static str {
         "sgip-longmsg-biz"
     }
 
-    async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        if let Ok(UnifiedMessage::Submit(s)) = SgipAdapter.decode(frame) {
-            // tpudhi 取自 SGIP 方言字段（adapter 据 concat 已置位）；
-            // 窄腰：adapter 已把 UDH 剥成 s.concat、s.content 为纯载荷，
-            // 这里据 concat 重建含 UDH 的分段字节，供后续 has_udhi/merge 断言复用。
-            let tpudhi = match &s.extra {
-                ProtocolExtra::Sgip(e) => e.tpudhi,
-                _ => 0,
-            };
-            self.received_segments.lock().unwrap().push(SgipSegment {
-                tpudhi,
-                msg_content: seg_with_udh(&s.concat, &s.content),
-            });
-
-            // 回 SubmitResp：序列用 sequence_of 回显请求复合序列。
-            let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
-                msg_id: rsms_model::MessageId::Text(String::new()),
-                status: 0,
-            });
-            let resp_bytes = SgipAdapter.encode(&resp, SgipAdapter.sequence_of(frame))?;
-            ctx.conn.write_frame(resp_bytes.as_slice()).await?;
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        match msg {
+            UnifiedMessage::Submit(s) => {
+                // tpudhi 取自 SGIP 方言字段（adapter 据 concat 已置位）；
+                // 窄腰：框架已解码，adapter 已把 UDH 剥成 s.concat、s.content 为纯载荷，
+                // 这里据 concat 重建含 UDH 的分段字节，供后续 has_udhi/merge 断言复用。
+                let tpudhi = match &s.extra {
+                    ProtocolExtra::Sgip(e) => e.tpudhi,
+                    _ => 0,
+                };
+                self.received_segments.lock().unwrap().push(SgipSegment {
+                    tpudhi,
+                    msg_content: seg_with_udh(&s.concat, &s.content),
+                });
+                // 回 SubmitResp：ctx.reply 内部自动回显 12B 复合序列（delta-2 已验证）。
+                ctx.reply(UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                    msg_id: rsms_model::MessageId::Text(String::new()),
+                    status: 0,
+                })).await?;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -220,18 +220,13 @@ impl LongMsgClientHandler {
 }
 
 #[async_trait]
-impl ClientHandler for LongMsgClientHandler {
+impl MessageHandler for LongMsgClientHandler {
     fn name(&self) -> &'static str {
         "sgip-longmsg-client"
     }
 
-    async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        let unified = match SgipAdapter.decode(frame) {
-            Ok(m) => m,
-            Err(_) => return Ok(()),
-        };
-
-        match unified {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        match msg {
             UnifiedMessage::BindResp(resp) => {
                 if resp.status == 0 {
                     self.connected.store(true, Ordering::Relaxed);
@@ -241,16 +236,14 @@ impl ClientHandler for LongMsgClientHandler {
                 self.submit_resp_count.fetch_add(1, Ordering::Relaxed);
             }
             UnifiedMessage::Deliver(d) => {
-                // 窄腰：adapter 已把 UDH 剥成 d.concat、d.content 为纯载荷；
+                // 窄腰：框架已解码，adapter 已把 UDH 剥成 d.concat、d.content 为纯载荷；
                 // 据 concat 重建含 UDH 段供合包断言复用。
                 self.deliver_segments
                     .lock()
                     .unwrap()
                     .push(seg_with_udh(&d.concat, &d.content));
-                // 回 DeliverResp：序列用 sequence_of 回显请求复合序列。
-                let resp_bytes =
-                    SgipAdapter.encode(&UnifiedMessage::DeliverResp, SgipAdapter.sequence_of(frame))?;
-                ctx.conn.write_frame(resp_bytes.as_slice()).await?;
+                // 回 DeliverResp：ctx.reply 内部自动回显 12B 复合序列（delta-2 已验证）。
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
             _ => {}
         }
@@ -314,14 +307,14 @@ fn merge_sgip_segments(segments: &[SgipSegment]) -> Vec<u8> {
 }
 
 async fn start_server(
-    biz_handler: Arc<dyn BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
 ) -> Result<(u16, Arc<rsms_connector::ConnectionPool>, tokio::task::JoinHandle<()>)> {
     let cfg = Arc::new(
         EndpointConfig::new("sgip-longmsg-server", "127.0.0.1", 0, 8, 30)
             .with_protocol(Protocol::Sgip),
     );
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(Arc::new(PasswordAuthHandler::new().add_account(TEST_ACCOUNT, TEST_PASSWORD)))
         .account_config_provider(Arc::new(MockAccountConfigProvider) as Arc<dyn AccountConfigProvider>)
         .serve()

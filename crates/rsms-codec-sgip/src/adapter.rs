@@ -162,10 +162,8 @@ fn sgip_to_unified(msg: SgipMessage) -> UnifiedMessage {
         SgipMessage::Report(r) => UnifiedMessage::Report(report_to_unified(r)),
         // ReportResp 是独立 Report 命令的响应；统一模型暂无对应变体，退化为 Unknown 并保留真实
         // command_id，不可伪装成 DeliverResp（那是 MO-Deliver 的响应，语义不同、会在路由层误判）。
-        SgipMessage::ReportResp(_) => UnifiedMessage::Unknown {
-            command_id: CommandId::ReportResp as u32,
-            raw: vec![],
-        },
+        // 独立 Report 命令的响应：统一模型已有 ReportResp 变体，直接映射，不再退化为 Unknown。
+        SgipMessage::ReportResp(_) => UnifiedMessage::ReportResp,
         SgipMessage::Bind(b) => UnifiedMessage::Bind(rsms_model::UnifiedBind {
             client_id: b.login_name,
             authenticator: b.login_password.into_bytes(),
@@ -317,13 +315,8 @@ fn unified_to_sgip_bytes(msg: &UnifiedMessage, seq: Sequence) -> Result<Vec<u8>>
             };
             report.to_pdu_bytes(node, ts, num)
         }
-        // SGIP 收到独立 Report 必须回 ReportResp；decode 把 ReportResp 退化为 Unknown，
-        // 故这里据 command_id 还原回 ReportResp（example client 回执依赖此臂）。
-        UnifiedMessage::Unknown { command_id, .. }
-            if *command_id == CommandId::ReportResp as u32 =>
-        {
-            ReportResp { result: 0 }.to_pdu_bytes(node, ts, num)
-        }
+        // SGIP 收到独立 Report 必须回 Report_Resp（result=0 表示成功接收）。
+        UnifiedMessage::ReportResp => ReportResp { result: 0 }.to_pdu_bytes(node, ts, num),
         other => {
             return Err(RsmsError::Other(format!(
                 "SGIP encode 暂不支持该消息类型（含 Ping，SGIP 无心跳）: {other:?}"
@@ -473,19 +466,30 @@ mod tests {
 
     #[test]
     fn report_resp_roundtrip_via_unified() {
-        // decode 把 ReportResp 退化为 Unknown{command_id=ReportResp}；
-        // encode 据 command_id 还原回 ReportResp（example client 回执依赖此臂）。
+        // Task 2 之后：ReportResp 映射到 UnifiedMessage::ReportResp，不再退化为 Unknown。
         let resp = ReportResp { result: 0 };
         let original = resp.to_pdu_bytes(0, 0, 8).to_vec();
         let unified = SgipAdapter.decode(&frame_of(original.clone())).unwrap();
-        match &unified {
-            UnifiedMessage::Unknown { command_id, .. } => {
-                assert_eq!(*command_id, CommandId::ReportResp as u32);
-            }
-            _ => panic!("SGIP ReportResp 应退化为 Unknown 并保留 command_id"),
-        }
+        assert_eq!(
+            unified,
+            UnifiedMessage::ReportResp,
+            "SGIP ReportResp 应映射到 UnifiedMessage::ReportResp，不再退化为 Unknown"
+        );
         let reencoded = SgipAdapter.encode(&unified, Sequence::Plain(8)).unwrap();
         assert_eq!(reencoded, original, "SGIP ReportResp 经统一模型往返后字节应无损一致");
+    }
+
+    #[test]
+    fn report_resp_roundtrip() {
+        // SGIP 有独立 Report_Resp 命令：encode→帧字节→decode 应无损回到 ReportResp。
+        let seq = Sequence::Sgip { node_id: 1, timestamp: 2, number: 3 };
+        let bytes = SgipAdapter.encode(&UnifiedMessage::ReportResp, seq).unwrap();
+        let frame = frame_of(bytes);
+        assert_eq!(
+            SgipAdapter.decode(&frame).unwrap(),
+            UnifiedMessage::ReportResp,
+            "encode→decode 往返后应无损回到 ReportResp"
+        );
     }
 
     #[test]

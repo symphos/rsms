@@ -10,6 +10,10 @@ use rsms_codec_cmpp::CommandId as CmppCommandId;
 use rsms_codec_sgip::CommandId as SgipCommandId;
 use rsms_codec_smgp::CommandId as SmgpCommandId;
 use rsms_codec_smpp::CommandId as SmppCommandId;
+use rsms_business::{
+    MessageContext, MessageHandler, ProtocolConnection as BusinessProtocolConnection,
+    RateLimiter as BusinessRateLimiter,
+};
 use rsms_core::{ConnectionInfo, Metrics, NoopMetrics, Protocol, RawPdu, EndpointConfig, Frame, Result, RsmsError, SessionState};
 use rsms_session::ConnectionContext;
 use rsms_window::{Window, WindowConfig};
@@ -149,23 +153,6 @@ fn decode_frames(buf: &mut Vec<u8>, min_len: usize, extract_header: fn(&[u8]) ->
     Ok(out)
 }
 
-/// 连接向池发送的事件
-#[derive(Debug, Clone)]
-pub enum ConnectionEvent {
-    Disconnected(u64),
-    HeartbeatTimeout(u64),
-}
-
-impl ConnectionEvent {
-    pub fn disconnected(id: u64) -> Self {
-        ConnectionEvent::Disconnected(id)
-    }
-
-    pub fn heartbeat_timeout(id: u64) -> Self {
-        ConnectionEvent::HeartbeatTimeout(id)
-    }
-}
-
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -211,7 +198,7 @@ pub struct ClientConnection {
     config: ClientConfig,
     last_active: StdMutex<std::time::Instant>,
     last_sent: StdMutex<std::time::Instant>,
-    event_tx: Mutex<Option<mpsc::Sender<ConnectionEvent>>>,
+
     pending_responses: Mutex<HashMap<u32, oneshot::Sender<Result<Vec<u8>>>>>,
     decoder: Arc<tokio::sync::Mutex<Box<dyn FrameDecoder>>>,
     pending_queue: Mutex<VecDeque<RawPdu>>,
@@ -225,6 +212,8 @@ pub struct ClientConnection {
     sending: AtomicBool,
     /// 本连接派生的后台 task 句柄（读循环 / keepalive / 出站 fetcher），供 `shutdown` 收尾 await。
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// 该连接的 ID/序列号生成器。窄腰 `MessageContext` 要求非 Option；客户端无连接池语义，自持一个。
+    pub(crate) id_generator: Arc<dyn rsms_core::IdGenerator>,
 }
 
 impl ClientConnection {
@@ -246,7 +235,7 @@ impl ClientConnection {
             config,
             last_active: StdMutex::new(std::time::Instant::now()),
             last_sent: StdMutex::new(std::time::Instant::now()),
-            event_tx: Mutex::new(None),
+
             pending_responses: Mutex::new(HashMap::new()),
             decoder,
             pending_queue: Mutex::new(VecDeque::new()),
@@ -255,6 +244,7 @@ impl ClientConnection {
             tm,
             sending: AtomicBool::new(true),
             tasks: Mutex::new(Vec::new()),
+            id_generator: Arc::new(crate::SimpleIdGenerator::new()),
         })
     }
 
@@ -297,10 +287,6 @@ impl ClientConnection {
             let _ = tokio::time::timeout(Duration::from_secs(3), h).await;
         }
         info!(conn_id = self.id, "client connection shutdown complete");
-    }
-
-    pub async fn set_event_tx(&self, tx: mpsc::Sender<ConnectionEvent>) {
-        *self.event_tx.lock().await = Some(tx);
     }
 
     pub fn touch(&self) {
@@ -397,9 +383,6 @@ impl ClientConnection {
         self.ready.store(false, Ordering::Release);
         let g = self.ctx.lock().await;
         g.mark_disconnected();
-        if let Some(tx) = self.event_tx.lock().await.take() {
-            let _ = tx.send(ConnectionEvent::disconnected(self.id)).await;
-        }
         // 连接断开：立即让所有在途 send_request 失败，而非各自挂到 endpoint.timeout。
         // 否则断开-重连场景下大量在途请求全部卡满超时窗口，造成延迟尖峰。
         let mut pending = self.pending_responses.lock().await;
@@ -564,29 +547,42 @@ impl ProtocolConnection for ClientConnection {
     }
 }
 
-/// 客户端连接上下文（用于业务处理器）。
-pub struct ClientContext<'a> {
-    pub endpoint: &'a EndpointConfig,
-    pub conn: &'a Arc<ClientConnection>,
-}
-
+/// 窄腰 `MessageContext` 要求 `rsms_business::ProtocolConnection`；客户端连接据此参与统一处理链。
+/// 与上方 `crate::protocol::ProtocolConnection` 委托同一份连接状态（客户端无限流，故 `rate_limiter` 恒 `None`）。
 #[async_trait]
-pub trait ClientHandler: Send + Sync {
-    fn name(&self) -> &'static str;
-    async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()>;
+impl BusinessProtocolConnection for ClientConnection {
+    fn id(&self) -> u64 {
+        self.id
+    }
+
+    async fn write_frame(&self, data: &[u8]) -> Result<()> {
+        ClientConnection::write_frame(self, data).await
+    }
+
+    async fn authenticated_account(&self) -> Option<String> {
+        Some(self.endpoint.id.clone())
+    }
+
+    async fn rate_limiter(&self) -> Option<Arc<dyn BusinessRateLimiter>> {
+        None
+    }
+
+    async fn protocol_version(&self) -> Option<u8> {
+        self.ctx.lock().await.protocol_version()
+    }
 }
 
 /// 客户端构建器：链式配置后调用 [`ClientBuilder::connect`] 建连并启动读循环。
 ///
 /// ```ignore
-/// let conn = ClientBuilder::new(endpoint, Arc::new(MyClient), CmppDecoder)
+/// let conn = ClientBuilder::new(endpoint, handler, CmppDecoder)
 ///     .message_source(source)
 ///     .connect()
 ///     .await?;
 /// ```
 pub struct ClientBuilder<D: FrameDecoder + Send + Sync + 'static> {
     endpoint: Arc<EndpointConfig>,
-    client_handler: Arc<dyn ClientHandler>,
+    handler: Arc<dyn MessageHandler>,
     decoder: D,
     client_config: Option<ClientConfig>,
     message_source: Option<Arc<dyn MessageSource>>,
@@ -596,14 +592,19 @@ pub struct ClientBuilder<D: FrameDecoder + Send + Sync + 'static> {
 }
 
 impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
+    /// 创建客户端构建器。
+    ///
+    /// - `endpoint`：连接配置（协议、地址、认证、窗口大小等）。
+    /// - `handler`：统一消息处理器，处理所有入站帧（Submit/Deliver/Report/Ping 等）。
+    /// - `decoder`：帧解码器（`CmppDecoder` / `SmgpDecoder` / `SmppDecoder` / `SgipDecoder`）。
     pub fn new(
         endpoint: Arc<EndpointConfig>,
-        client_handler: Arc<dyn ClientHandler>,
+        handler: Arc<dyn MessageHandler>,
         decoder: D,
     ) -> Self {
         Self {
             endpoint,
-            client_handler,
+            handler,
             decoder,
             client_config: None,
             message_source: None,
@@ -646,7 +647,7 @@ impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
     pub async fn connect(self) -> Result<Arc<ClientConnection>> {
         let ClientBuilder {
             endpoint,
-            client_handler,
+            handler,
             decoder,
             client_config,
             message_source,
@@ -674,22 +675,26 @@ impl<D: FrameDecoder + Send + Sync + 'static> ClientBuilder<D> {
 
     let conn = ClientConnection::new(stream, endpoint.clone(), config, decoder_for_conn, tm).await;
 
+    // 缺口#2 修复：客户端按配置声明的版本自动预设（服务端收 Connect 自动协商，客户端侧无此入站时机）。
+    if let Some(v) = endpoint.protocol_version {
+        conn.set_protocol_version(v).await;
+    }
+
     if let Some(window) = &conn.window {
         window.start_monitor();
     }
 
     let conn_clone = Arc::clone(&conn);
-    let client_handler_clone = Arc::clone(&client_handler);
 
-    if let Some(handler) = &event_handler {
+    if let Some(ev) = &event_handler {
         let conn_for_handler = conn_clone.clone() as Arc<dyn ProtocolConnection>;
-        handler.on_connected(&conn_for_handler).await;
+        ev.on_connected(&conn_for_handler).await;
     }
 
     metrics.connection_opened();
     let metrics_for_read = Arc::clone(&metrics);
     let read_handle = tokio::spawn(async move {
-        run_client_read_loop(conn_clone, client_handler_clone, Arc::clone(&decoder), event_handler, metrics_for_read).await;
+        run_client_read_loop(conn_clone, handler, Arc::clone(&decoder), event_handler, metrics_for_read).await;
     });
     conn.register_task(read_handle).await;
 
@@ -723,66 +728,9 @@ fn create_decoder(protocol: Protocol) -> Box<dyn FrameDecoder + Send + Sync> {
     }
 }
 
-/// 连接函数，由 ClientPool 调用，连接的生命周期由 Pool 管理（内部 API）
-pub(crate) async fn connect_with_pool(
-    stream: TcpStream,
-    endpoint: Arc<EndpointConfig>,
-    client_handler: Arc<dyn ClientHandler>,
-    client_config: Option<ClientConfig>,
-    message_source: Option<Arc<dyn MessageSource>>,
-    event_handler: Option<Arc<dyn ClientEventHandler>>,
-    event_tx: mpsc::Sender<ConnectionEvent>,
-) -> Result<Arc<ClientConnection>> {
-    let decoder: Arc<tokio::sync::Mutex<Box<dyn FrameDecoder>>> = Arc::new(tokio::sync::Mutex::new(create_decoder(endpoint.protocol)));
-    let decoder_for_conn = Arc::clone(&decoder);
-    let config = client_config.unwrap_or_default();
-    // ClientPool 路径：交付链路沿用 AccountConnections 上的 TM（手动驱动），此处直连字段置 None。
-    let conn = ClientConnection::new(stream, endpoint.clone(), config, decoder_for_conn, None).await;
-    conn.set_event_tx(event_tx).await;
-
-    if let Some(window) = &conn.window {
-        window.start_monitor();
-    }
-
-    let conn_clone = Arc::clone(&conn);
-    let client_handler_clone = Arc::clone(&client_handler);
-
-    if let Some(handler) = &event_handler {
-        let conn_for_handler = conn_clone.clone() as Arc<dyn ProtocolConnection>;
-        handler.on_connected(&conn_for_handler).await;
-    }
-
-    // ClientPool 管理的连接本期不接指标(用 Noop);池侧指标留作后续小增量。
-    let metrics: Arc<dyn Metrics> = Arc::new(NoopMetrics);
-    let metrics_for_read = Arc::clone(&metrics);
-    let read_handle = tokio::spawn(async move {
-        run_client_read_loop(conn_clone, client_handler_clone, decoder, event_handler, metrics_for_read).await;
-    });
-    conn.register_task(read_handle).await;
-
-    // 启动 keepalive 任务
-    let protocol = endpoint.protocol;
-    let idle_timeout = endpoint.idle_time_sec as u32;
-    let keepalive_handle = start_keepalive_task(Arc::clone(&conn), protocol, idle_timeout);
-    conn.register_task(keepalive_handle).await;
-
-    conn.mark_connected().await;
-    info!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "connection established");
-
-    if let Some(source) = message_source {
-        let conn_clone = Arc::clone(&conn);
-        let fetch_handle = tokio::spawn(async move {
-            run_outbound_fetcher(conn_clone, source, metrics).await;
-        });
-        conn.register_task(fetch_handle).await;
-    }
-
-    Ok(conn)
-}
-
 async fn run_client_read_loop(
     conn: Arc<ClientConnection>,
-    client_handler: Arc<dyn ClientHandler>,
+    handler: Arc<dyn MessageHandler>,
     decoder: Arc<tokio::sync::Mutex<Box<dyn FrameDecoder>>>,
     event_handler: Option<Arc<dyn ClientEventHandler>>,
     metrics: Arc<dyn Metrics>,
@@ -880,11 +828,6 @@ async fn run_client_read_loop(
                 drive_inbound(tm, conn.endpoint.protocol, &frame).await;
             }
 
-            let ctx = ClientContext {
-                endpoint: &conn.endpoint,
-                conn: &conn,
-            };
-
             if conn.endpoint.log_level.is_none_or(|max| tracing::Level::INFO <= max) {
                 tracing::info!(
                     conn_id = conn.id,
@@ -895,21 +838,27 @@ async fn run_client_read_loop(
                     "received frame"
                 );
             }
-            
-            // 影子比对（客户端收包方向）：unified-shadow feature 开启时，对每帧经 registry
-            // 做统一模型解码并打日志。只观测、不接管，错误隔离不影响旧路径。
-            #[cfg(feature = "unified-shadow")]
+
+
+            // 窄腰主路径：解码为统一消息，构造 MessageContext，调 on_message。
             {
                 use rsms_model::ProtocolAdapter as _;
-                let protocol = conn.endpoint.protocol;
-                match crate::adapter_registry::adapter_for(protocol).decode(&frame) {
-                    Ok(unified) => tracing::debug!(conn_id = conn.id, proto = protocol.as_str(), cmd_id = frame.command_id, ?unified, "shadow decode ok"),
-                    Err(e) => tracing::warn!(conn_id = conn.id, proto = protocol.as_str(), cmd_id = frame.command_id, "shadow decode err: {e}"),
+                let adapter = crate::adapter_registry::adapter_for(conn.endpoint.protocol);
+                match adapter.decode_with_version(&frame, BusinessProtocolConnection::protocol_version(&*conn).await) {
+                    Ok(unified) => {
+                        let ctx = MessageContext::new(
+                            conn.endpoint.clone(),
+                            conn.clone() as Arc<dyn BusinessProtocolConnection>,
+                            conn.id_generator.clone(),
+                            adapter,
+                            adapter.sequence_of(&frame),
+                        );
+                        if let Err(e) = handler.on_message(&ctx, &unified).await {
+                            error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "message handler error: {}", e);
+                        }
+                    }
+                    Err(e) => tracing::warn!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "统一模型解码失败（跳过该帧）: {e}"),
                 }
-            }
-
-            if let Err(e) = client_handler.on_inbound(&ctx, &frame).await {
-                error!(conn_id = conn.id, remote_ip = %conn.remote_ip(), remote_port = conn.remote_port(), "client handler error: {}", e);
             }
         }
         
@@ -943,7 +892,7 @@ async fn run_outbound_fetcher(
             continue;
         }
 
-        let account = conn.authenticated_account().await.unwrap_or_default();
+        let account = ProtocolConnection::authenticated_account(&*conn).await.unwrap_or_default();
 
         let items = match source.fetch(&account, 16).await {
             Ok(items) if !items.is_empty() => items,
@@ -1109,6 +1058,30 @@ fn build_sgip_keepalive_pdu() -> Vec<u8> {
     pdu.extend_from_slice(&command_id);
     pdu.extend_from_slice(&[0u8; 12]);
     pdu
+}
+
+#[cfg(test)]
+mod wp4_client_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use rsms_business::{MessageContext, MessageHandler};
+    use rsms_model::UnifiedMessage;
+
+    struct DummyMh;
+    #[async_trait]
+    impl MessageHandler for DummyMh {
+        fn name(&self) -> &'static str { "dummy" }
+        async fn on_message(&self, _ctx: &MessageContext, _msg: &UnifiedMessage) -> rsms_core::Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn handler_stored_in_builder() {
+        let ep = Arc::new(rsms_core::EndpointConfig::new("ep", "127.0.0.1", 7890, 16, 60));
+        let handler: Arc<dyn MessageHandler> = Arc::new(DummyMh);
+        let b = ClientBuilder::new(ep, Arc::clone(&handler), crate::CmppDecoder);
+        // 构造即持有，无需额外 with_message_handler；字段直接可达（同 crate 子模块）
+        assert_eq!(b.handler.name(), "dummy");
+    }
 }
 
 #[cfg(test)]

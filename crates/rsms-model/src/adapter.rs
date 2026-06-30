@@ -22,4 +22,27 @@ pub trait ProtocolAdapter: Send + Sync {
     fn sequence_of(&self, frame: &Frame) -> Sequence {
         Sequence::Plain(frame.sequence_id)
     }
+
+    /// 版本感知解码：默认转调 [`decode`](Self::decode)（适用于单版本/版本透明协议）。
+    ///
+    /// 版本无法从帧字节判定（CMPP V2.0/V3.0 命令字相同、仅字段布局不同），须由握手协商的
+    /// `version`（如 CMPP `0x20`/`0x30`，其余协议传 `None`）决定。框架驱动层按
+    /// `conn.protocol_version()` 调用本方法；只有 CMPP 适配器需 override。
+    fn decode_with_version(&self, frame: &Frame, _version: Option<u8>) -> Result<UnifiedMessage> {
+        self.decode(frame)
+    }
+
+    /// 版本感知编码：默认转调 [`encode`](Self::encode)（适用于单版本/版本透明协议）。
+    ///
+    /// 与 [`decode_with_version`](Self::decode_with_version) 对称：版本由握手协商的 `version`
+    /// 决定（CMPP `0x20`/`0x30`，其余协议传 `None`）。框架的 `ctx.reply` 按 `conn.protocol_version()`
+    /// 调用本方法；只有 CMPP 适配器需 override，以产出 V2.0 应答（如 SubmitResp 21B）。
+    fn encode_with_version(
+        &self,
+        msg: &UnifiedMessage,
+        seq: Sequence,
+        _version: Option<u8>,
+    ) -> Result<Vec<u8>> {
+        self.encode(msg, seq)
+    }
 }

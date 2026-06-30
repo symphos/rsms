@@ -303,9 +303,10 @@ fn unified_to_smgp(msg: &UnifiedMessage, seq: Sequence) -> Result<SmgpMessage> {
                 },
             }
         }
-        UnifiedMessage::DeliverResp => SmgpMessage::DeliverResp {
+        UnifiedMessage::DeliverResp | UnifiedMessage::ReportResp => SmgpMessage::DeliverResp {
             sequence_id: seq,
             // adapter 的 DeliverResp 不携带回执 MsgId（统一模型无此字段），置默认；仅用于 shadow/收敛。
+            // ReportResp 同理：SMGP 报告经 Deliver(is_report=1) 承载，对报告的响应即 DeliverResp。
             resp: DeliverResp { msg_id: SmgpMsgId::default(), status: 0 },
         },
         UnifiedMessage::Bind(b) => {
@@ -728,5 +729,53 @@ mod tests {
             }
             _ => panic!("expected Report"),
         }
+    }
+
+    #[test]
+    fn report_resp_equals_deliver_resp() {
+        // SMGP 报告经 Deliver(is_report=1) 承载，对报告的响应即 DeliverResp。
+        let seq = Sequence::Plain(42);
+        let a = SmgpAdapter.encode(&UnifiedMessage::ReportResp, seq).unwrap();
+        let b = SmgpAdapter.encode(&UnifiedMessage::DeliverResp, seq).unwrap();
+        assert_eq!(a, b);
+    }
+
+    /// 构造最简合法 SMGP 帧（ActiveTest 12B）：由 encode(Ping) 产出，版本无关。
+    fn smgp_active_test_frame() -> Frame {
+        frame_of(SmgpAdapter.encode(&UnifiedMessage::Ping, Sequence::Plain(1)).unwrap())
+    }
+
+    #[test]
+    fn decode_with_version_defaults_to_decode() {
+        // SMGP 单版本：decode_with_version 任意 version 都应等价于 decode（默认转发）。
+        // SmgpAdapter 无同名 inherent 方法，可直接通过 &dyn ProtocolAdapter 调（与框架路径一致）。
+        let f = smgp_active_test_frame();
+        let a: &dyn ProtocolAdapter = &SmgpAdapter;
+        assert_eq!(
+            a.decode_with_version(&f, Some(0x99)).unwrap(),
+            SmgpAdapter.decode(&f).unwrap(),
+            "SMGP 应忽略 version、默认转发 decode"
+        );
+    }
+
+    /// 最简合法 SMGP SubmitResp（用于 encode_with_version 测试）。
+    fn sample_smgp_submit_resp() -> UnifiedMessage {
+        UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+            msg_id: MessageId::Binary(vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a]),
+            status: 0,
+        })
+    }
+
+    #[test]
+    fn encode_with_version_defaults_to_encode() {
+        // SMGP 单版本：encode_with_version 任意 version 都应等于 encode（默认转发）。
+        let a: &dyn ProtocolAdapter = &SmgpAdapter;
+        let msg = sample_smgp_submit_resp();
+        let seq = Sequence::Plain(3);
+        assert_eq!(
+            a.encode_with_version(&msg, seq, Some(0x99)).unwrap(),
+            a.encode(&msg, seq).unwrap(),
+            "SMGP 应忽略 version、默认转发 encode"
+        );
     }
 }

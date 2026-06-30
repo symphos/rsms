@@ -4,8 +4,9 @@ use rsms_connector::{
     AccountConfig, AccountConfigProvider, SgipDecoder, ClientBuilder,
     AccountPool,
 };
-use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler, ClientConnection};
-use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Frame, Result};
+use rsms_connector::client::{ClientConfig, ClientConnection};
+use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Result};
+use rsms_business::{MessageContext, MessageHandler};
 // 窄腰统一模型：收发一律走 SgipAdapter + UnifiedMessage，不再手构裸 codec / 手剥头部字节。
 use rsms_codec_sgip::adapter::SgipAdapter;
 use rsms_model::{
@@ -81,10 +82,10 @@ impl TestClientHandler {
 }
 
 #[async_trait]
-impl ClientHandler for TestClientHandler {
+impl MessageHandler for TestClientHandler {
     fn name(&self) -> &'static str { "test-client" }
-    async fn on_inbound(&self, _ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        if let Ok(UnifiedMessage::SubmitResp(_)) = SgipAdapter.decode(frame) {
+    async fn on_message(&self, _ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        if let UnifiedMessage::SubmitResp(_) = msg {
             self.submit_resp_count.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
@@ -147,7 +148,7 @@ async fn start_server(
     ).with_protocol(Protocol::Sgip));
     let auth = Arc::new(PasswordAuthHandler::new().add_account(TEST_ACCOUNT, TEST_PASSWORD));
     let server = rsms_connector::ServerBuilder::new(cfg)
-        .handlers(vec![])
+        .message_handlers(vec![])
         .auth_handler(auth)
         .account_config_provider(config_provider as Arc<dyn AccountConfigProvider>)
         .serve()

@@ -4,7 +4,7 @@ use crate::protocol::{
     AccountConfigProvider, AuthHandler, AccountConfig, AccountPoolConfig,
     MessageSource, ServerEventHandler,
 };
-use rsms_business::BusinessHandler;
+use rsms_business::MessageHandler;
 use rsms_core::{Metrics, NoopMetrics, Result};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +16,7 @@ use tracing::{error, info};
 pub struct BoundServer {
     pub local_addr: SocketAddr,
     config: Arc<rsms_core::EndpointConfig>,
-    handlers: Vec<Arc<dyn BusinessHandler>>,
+    message_handlers: Vec<Arc<dyn MessageHandler>>,
     pool: Arc<ConnectionPool>,
     account_pool: Arc<AccountPool>,
     account_config_provider: Option<Arc<dyn AccountConfigProvider>>,
@@ -32,7 +32,7 @@ pub struct BoundServer {
 ///
 /// ```ignore
 /// let server = ServerBuilder::new(config)
-///     .handler(Arc::new(MyBiz))
+///     .message_handler(Arc::new(MyBiz))
 ///     .auth_handler(Arc::new(MyAuth))
 ///     .serve()
 ///     .await?;
@@ -40,7 +40,7 @@ pub struct BoundServer {
 /// ```
 pub struct ServerBuilder {
     config: Arc<rsms_core::EndpointConfig>,
-    handlers: Vec<Arc<dyn BusinessHandler>>,
+    message_handlers: Vec<Arc<dyn MessageHandler>>,
     auth_handler: Option<Arc<dyn AuthHandler>>,
     message_source: Option<Arc<dyn MessageSource>>,
     account_config_provider: Option<Arc<dyn AccountConfigProvider>>,
@@ -53,7 +53,7 @@ impl ServerBuilder {
     pub fn new(config: Arc<rsms_core::EndpointConfig>) -> Self {
         Self {
             config,
-            handlers: Vec::new(),
+            message_handlers: Vec::new(),
             auth_handler: None,
             message_source: None,
             account_config_provider: None,
@@ -63,15 +63,15 @@ impl ServerBuilder {
         }
     }
 
-    /// 追加一个业务处理器。
-    pub fn handler(mut self, handler: Arc<dyn BusinessHandler>) -> Self {
-        self.handlers.push(handler);
+    /// 追加一个窄腰统一消息处理器（主路径）。
+    pub fn message_handler(mut self, handler: Arc<dyn MessageHandler>) -> Self {
+        self.message_handlers.push(handler);
         self
     }
 
-    /// 一次性设置业务处理器列表（覆盖已有）。
-    pub fn handlers(mut self, handlers: Vec<Arc<dyn BusinessHandler>>) -> Self {
-        self.handlers = handlers;
+    /// 一次性设置窄腰处理器列表（覆盖已有）。
+    pub fn message_handlers(mut self, handlers: Vec<Arc<dyn MessageHandler>>) -> Self {
+        self.message_handlers = handlers;
         self
     }
 
@@ -120,7 +120,7 @@ impl ServerBuilder {
         Ok(BoundServer {
             local_addr,
             config: self.config,
-            handlers: self.handlers,
+            message_handlers: self.message_handlers,
             pool,
             account_pool,
             account_config_provider: self.account_config_provider,
@@ -178,7 +178,7 @@ impl BoundServer {
             }
             
             let (conn, read) = Connection::new_with_window(socket, self.config.clone(), self.config.window_size);
-            let h = self.handlers.clone();
+            let mh = self.message_handlers.clone();
             let pool2 = Arc::clone(&self.pool);
             let account_pool2 = Arc::clone(&self.account_pool);
             let account_config_provider = account_config_provider.clone();
@@ -195,7 +195,7 @@ impl BoundServer {
                 conn.mark_connected().await;
                 conn.mark_ready().await;
                 pool2.add(Arc::clone(&conn)).await;
-                run_connection(read, Arc::clone(&conn), h, Some(account_pool2), account_config_provider, auth_handler_clone, protocol, event_handler_clone, metrics_clone, shutdown_clone).await;
+                run_connection(read, Arc::clone(&conn), mh, Some(account_pool2), account_config_provider, auth_handler_clone, protocol, event_handler_clone, metrics_clone, shutdown_clone).await;
                 pool2.remove(id).await;
             });
         }
@@ -278,6 +278,30 @@ impl ServerShutdown {
             conn.close().await;
         }
         info!("server graceful shutdown complete");
+    }
+}
+
+#[cfg(test)]
+mod wp4_bridge_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use rsms_business::{MessageContext, MessageHandler};
+    use rsms_model::UnifiedMessage;
+
+    struct DummyMh;
+    #[async_trait]
+    impl MessageHandler for DummyMh {
+        fn name(&self) -> &'static str { "dummy" }
+        async fn on_message(&self, _ctx: &MessageContext, _msg: &UnifiedMessage) -> rsms_core::Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn message_handlers_setter_stores_handlers() {
+        let cfg = Arc::new(rsms_core::EndpointConfig::new("ep", "127.0.0.1", 0, 8, 60));
+        let b = ServerBuilder::new(cfg)
+            .message_handler(Arc::new(DummyMh))
+            .message_handler(Arc::new(DummyMh));
+        assert_eq!(b.message_handlers.len(), 2, "message_handler 应累加进列表");
     }
 }
 

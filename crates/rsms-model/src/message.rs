@@ -11,6 +11,9 @@ pub enum UnifiedMessage {
     SubmitResp(UnifiedSubmitResp),
     Deliver(UnifiedDeliver),
     DeliverResp,
+    /// 对「收到的投递报告」的响应。协议无关：SGIP 编为独立 `Report_Resp`；
+    /// CMPP/SMGP/SMPP 的报告经 Deliver 承载，故等价各自的 `DeliverResp`。
+    ReportResp,
     Report(UnifiedReport),
     Bind(UnifiedBind),
     BindResp(UnifiedBindResp),
@@ -137,5 +140,13 @@ mod tests {
     fn bind_resp_is_success_reflects_status() {
         assert!(UnifiedBindResp { status: 0 }.is_success());
         assert!(!UnifiedBindResp { status: 0x0D }.is_success());
+    }
+
+    #[test]
+    fn report_resp_variant_exists() {
+        // ReportResp 是无字段 unit 变体，可构造、可 match、可比较。
+        let m = UnifiedMessage::ReportResp;
+        assert!(matches!(m, UnifiedMessage::ReportResp));
+        assert_eq!(m, UnifiedMessage::ReportResp);
     }
 }

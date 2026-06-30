@@ -107,7 +107,7 @@ pub trait IdGenerator: Send + Sync {
 }
 ```
 
-- **服务端**业务侧经 `InboundContext.id_generator`（`Option<Arc<dyn IdGenerator>>`，鉴权后才有值）获取；
+- **服务端**业务侧经 `MessageContext.id_generator`（`Option<Arc<dyn IdGenerator>>`，鉴权后才有值）获取；
 - 也可由 `account_connections.id_generator()` 取该账号的实例。
 
 **sequence_id 契约（重要）**：`send_request` 的 sequence_id 直接取自你构造的 PDU 头（框架不代生成）。
@@ -121,31 +121,19 @@ let seq = account_connections.id_generator().next_sequence_id();
 
 > 长短信的 reference 唯一性与入站合包的发送方分桶，另见 [长短信处理 · 拼接正确性与串号防护](03-longmessage.md#拼接正确性与串号防护)。
 
-### BusinessHandler
+### MessageHandler
 
-服务端业务处理器。框架在协议层解析完成后调用 `on_inbound`。
-
-```rust
-#[async_trait]
-pub trait BusinessHandler: Send + Sync {
-    fn name(&self) -> &'static str;
-    async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()>;
-}
-```
-
-**注意**：框架不会自动发送 SubmitResp / SubmitSmResp，业务方需要自己构造并调用 `ctx.conn.write_frame()` 发送。
-
-### ClientHandler
-
-客户端收到服务端消息时的回调。
+服务端和客户端通用的业务处理器。框架将协议帧解码为统一消息（`UnifiedMessage`）后调用 `on_message`，服务端与客户端实现同一 trait。
 
 ```rust
 #[async_trait]
-pub trait ClientHandler: Send + Sync {
+pub trait MessageHandler: Send + Sync {
     fn name(&self) -> &'static str;
-    async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()>;
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()>;
 }
 ```
+
+**回包**：用 `ctx.reply(UnifiedMessage::XxxResp)` 回复当前请求（框架自动按请求序列编码并写回），无需手剥序列或手拼字节。来自 `rsms_business::{MessageContext, MessageHandler}`。
 
 ### AuthHandler
 
@@ -171,10 +159,9 @@ use rsms_connector::{
     ServerBuilder, AuthHandler, AuthCredentials, AuthResult,
     AccountConfig, AccountConfigProvider,
 };
-use rsms_business::{BusinessHandler, InboundContext};
-use rsms_core::{ConnectionInfo, EndpointConfig, Frame, Protocol, Result};
-use rsms_codec_cmpp::adapter::CmppAdapter;
-use rsms_model::{ProtocolAdapter, UnifiedMessage};
+use rsms_business::{MessageContext, MessageHandler};
+use rsms_core::{ConnectionInfo, EndpointConfig, Protocol, Result};
+use rsms_model::{UnifiedMessage, UnifiedSubmitResp, MessageId};
 
 // 1. 认证
 struct MyAuth;
@@ -197,18 +184,19 @@ impl AuthHandler for MyAuth {
     }
 }
 
-// 2. 业务处理（窄腰统一模型：解码为 UnifiedMessage，按枚举分支处理）
+// 2. 业务处理（窄腰统一模型：框架已解码为 UnifiedMessage，按枚举分支处理）
 struct MyBiz;
 #[async_trait]
-impl BusinessHandler for MyBiz {
+impl MessageHandler for MyBiz {
     fn name(&self) -> &'static str { "my-biz" }
-    async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        match CmppAdapter.decode(frame)? {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        match msg {
             UnifiedMessage::Submit(_s) => {
-                // 框架不会自动回 SubmitResp，业务方自行构造并发送：
-                // let resp = UnifiedMessage::SubmitResp(..);
-                // let bytes = CmppAdapter.encode(&resp, CmppAdapter.sequence_of(frame))?;
-                // ctx.conn.write_frame(&bytes).await?;
+                // ctx.reply 自动按请求序列回包，无需手剥序列/手拼字节
+                ctx.reply(UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                    msg_id: MessageId::Binary(vec![0u8; 8]),
+                    status: 0,
+                })).await?;
             }
             _ => {}
         }
@@ -223,12 +211,13 @@ async fn main() -> Result<()> {
         .with_protocol(Protocol::Cmpp));
 
     let server = ServerBuilder::new(config)
-        .handler(Arc::new(MyBiz))
+        .message_handler(Arc::new(MyBiz))
         .auth_handler(Arc::new(MyAuth))
-        // .message_source(s)          // MessageSource（可选）
-        // .account_config_provider(p) // AccountConfigProvider（可选）
-        // .event_handler(e)           // ServerEventHandler（可选）
-        // .account_pool_config(c)     // AccountPoolConfig（可选）
+        // .message_handlers(vec![...]) // 多处理器链（可选）
+        // .message_source(s)           // MessageSource（可选）
+        // .account_config_provider(p)  // AccountConfigProvider（可选）
+        // .event_handler(e)            // ServerEventHandler（可选）
+        // .account_pool_config(c)      // AccountPoolConfig（可选）
         .serve().await?;
 
     server.run().await
@@ -238,37 +227,44 @@ async fn main() -> Result<()> {
 ## 客户端最小示例
 
 ```rust
-use rsms_connector::{ClientBuilder, CmppDecoder, ClientHandler, ClientConfig};
-use rsms_core::{EndpointConfig, Frame, Result};
+use rsms_connector::{ClientBuilder, CmppDecoder};
+use rsms_business::{MessageContext, MessageHandler};
+use rsms_core::{EndpointConfig, Result};
+use rsms_codec_cmpp::adapter::CmppAdapter;
+use rsms_model::{ProtocolAdapter, UnifiedMessage, Sequence};
 
 struct MyClient;
 #[async_trait]
-impl ClientHandler for MyClient {
+impl MessageHandler for MyClient {
     fn name(&self) -> &'static str { "my-client" }
-    async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        // 用 CmppAdapter.decode(frame)? 解为 UnifiedMessage 后分支处理
-        // （SubmitResp / Deliver / Report / PingResp 等）
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        match msg {
+            UnifiedMessage::SubmitResp(_r) => { /* 处理回执 */ }
+            UnifiedMessage::Report(_) => {
+                // ctx.reply 自动按请求序列回包
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
+            }
+            _ => {}
+        }
         Ok(())
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let endpoint = Arc::new(EndpointConfig::new("client", "127.0.0.1", 7890, 500, 60));
+    let endpoint = Arc::new(EndpointConfig::new("client", "127.0.0.1", 7890, 500, 60)
+        .with_protocol(Protocol::Cmpp));
+    let handler = Arc::new(MyClient);
 
-    let conn = ClientBuilder::new(endpoint, Arc::new(MyClient), CmppDecoder)
-        .client_config(ClientConfig::default())
+    let conn = ClientBuilder::new(endpoint, handler, CmppDecoder)
         // .message_source(s)   // MessageSource（可选）
         // .event_handler(e)    // ClientEventHandler（可选）
         .connect().await?;
 
-    // 发送消息：构造 UnifiedMessage 经适配器编码（CMPP 序列用 Sequence::Plain）
+    // 发送消息：构造 UnifiedMessage 经适配器编码，通过滑动窗口等待响应
     let msg = UnifiedMessage::Submit(/* UnifiedSubmit { .. } */);
     let pdu_bytes = CmppAdapter.encode(&msg, Sequence::Plain(seq))?;
-    conn.write_frame(&pdu_bytes).await?;
-
-    // 或者通过 window 等待响应
-    // conn.send_request(pdu_bytes).await?;
+    conn.send_request(pdu_bytes).await?;
 
     Ok(())
 }

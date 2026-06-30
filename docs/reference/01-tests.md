@@ -16,7 +16,7 @@
 按协议能力边界保留裸 codec 的少数处（已在源码注释）：
 - **CMPP**：CMPP 2.0 版本化 decode 与 V2.0 PDU 构造（adapter 仅 V3.0）
 - **SMPP**：客户端读 PDU 头 `command_status`（adapter 不透传结果码，失败用例需区分成败）
-- **SGIP**：`Report_Resp` 经 `UnifiedMessage::Unknown{command_id=ReportResp}`（统一模型无该变体）
+- **SGIP**：`Report_Resp` 经独立的 `UnifiedMessage::ReportResp` 变体编解码（SGIP 是四协议中唯一有独立 Report 命令的协议）
 
 ## 测试分类与目标名
 

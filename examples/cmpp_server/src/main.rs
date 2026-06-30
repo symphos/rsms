@@ -19,14 +19,13 @@
 // 核心流程：
 //   1. 从 accounts.conf 读取账号配置
 //   2. 客户端连接 → 框架自动完成 CMPP 协议握手（Connect/ConnectResp）
-//   3. 客户端发送 Submit → BusinessHandler.on_inbound() 收到
-//   4. 业务方解码为 UnifiedMessage::Submit、回 SubmitResp、处理业务（含长短信合包）
+//   3. 客户端发送 Submit → MessageHandler.on_message() 收到（框架已解码为 UnifiedMessage::Submit）
+//   4. 业务方按 UnifiedMessage::Submit 分支处理、用 ctx.reply 回 SubmitResp（含长短信合包）
 //   5. 通过 MessageSource 异步发送 Deliver(MO) / Report（状态报告）
 // ============================================================================
 
 use async_trait::async_trait;
-use rsms_business::BusinessHandler;
-use rsms_business::InboundContext;
+use rsms_business::{MessageContext, MessageHandler};
 // compute_connect_auth 是 MD5 加密工具（握手鉴权用），非消息 PDU 构造，保留。
 use rsms_codec_cmpp::adapter::CmppAdapter;
 use rsms_codec_cmpp::compute_connect_auth;
@@ -37,7 +36,7 @@ use rsms_connector::{
     ServerEventHandler, SimpleIdGenerator,
 };
 use rsms_core::{
-    ConnectionInfo, EncodedPdu, EndpointConfig, Frame, IdGenerator, Protocol, RawPdu, Result,
+    ConnectionInfo, EncodedPdu, EndpointConfig, IdGenerator, Protocol, RawPdu, Result,
 };
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
@@ -353,7 +352,7 @@ impl MessageSource for FileMessageSource {
 }
 
 // ============================================================================
-// BusinessHandler：处理 Submit，回 SubmitResp，推送 Report，长短信合包
+// MessageHandler：处理 Submit，回 SubmitResp，推送 Report，长短信合包
 // ============================================================================
 
 struct CmppBusinessHandler {
@@ -362,31 +361,16 @@ struct CmppBusinessHandler {
 }
 
 #[async_trait]
-impl BusinessHandler for CmppBusinessHandler {
+impl MessageHandler for CmppBusinessHandler {
     fn name(&self) -> &'static str {
         "cmpp-business"
     }
 
-    async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        // 握手协商的协议版本：V2.0/V3.0 命令字相同、仅字段布局不同，须按版本解码。
-        // protocol_version() 返回握手时记录的版本字节（CMPP 2.0 = 0x20）。
-        let version = ctx.conn.protocol_version().await;
-        let decoded = if version == Some(0x20) {
-            CmppAdapter.decode_with_version(frame, CmppVersion::V20)
-        } else {
-            CmppAdapter.decode(frame)
-        };
-        let unified = match decoded {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(conn_id = ctx.conn.id(), "消息解码失败: {}", e);
-                return Ok(());
-            }
-        };
-
-        match unified {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 框架已按协议解码为统一消息（WP4-1 走 V3.0 基础解码），业务直接按枚举分支处理。
+        match msg {
             UnifiedMessage::Submit(submit) => {
-                self.handle_submit(ctx, frame, submit, version).await?;
+                self.handle_submit(ctx, submit).await?;
             }
             UnifiedMessage::Ping => {
                 tracing::debug!(conn_id = ctx.conn.id(), "收到 ActiveTest（心跳）");
@@ -400,10 +384,8 @@ impl BusinessHandler for CmppBusinessHandler {
 impl CmppBusinessHandler {
     async fn handle_submit(
         &self,
-        ctx: &InboundContext,
-        frame: &Frame,
-        submit: rsms_model::UnifiedSubmit,
-        version: Option<u8>,
+        ctx: &MessageContext,
+        submit: &rsms_model::UnifiedSubmit,
     ) -> Result<()> {
         let phone = submit
             .dests
@@ -412,30 +394,22 @@ impl CmppBusinessHandler {
             .unwrap_or("unknown")
             .to_string();
 
-        // CMPP 方言字段 msg_id 在 ProtocolExtra::Cmpp 里。长短信级联信息已被 adapter
-        // 剥进 submit.concat（窄腰），业务不再读 tpudhi/手剥 UDH。
+        // CMPP 方言 msg_id 落在 ProtocolExtra::Cmpp；长短信级联已被 adapter 剥进 submit.concat（窄腰）。
         let msg_id = match &submit.extra {
             ProtocolExtra::Cmpp(e) => e.msg_id,
             _ => [0u8; 8],
         };
 
-        // 回 SubmitResp（框架不自动回，业务方自己回）。
-        // 用 CmppAdapter.sequence_of(frame) 回显请求序列号，跨协议统一写法。
-        let resp = UnifiedMessage::SubmitResp(rsms_model::UnifiedSubmitResp {
+        // 一步回执（窄腰）：框架按请求帧序列编码 SubmitResp 并写回，业务不再手剥序列/手拼字节。
+        ctx.reply(UnifiedMessage::SubmitResp(rsms_model::UnifiedSubmitResp {
             msg_id: MessageId::Binary(msg_id.to_vec()),
             status: 0,
-        });
-        // V2.0 时用版本感知编码（SubmitResp Result 1 字节，总长 21B）；否则默认 V3.0。
-        let resp_bytes = if version == Some(0x20) {
-            CmppAdapter.encode_with_version(&resp, CmppAdapter.sequence_of(frame), CmppVersion::V20)?
-        } else {
-            CmppAdapter.encode(&resp, CmppAdapter.sequence_of(frame))?
-        };
-        ctx.conn.write_frame(&resp_bytes).await?;
+        }))
+        .await?;
 
         // 处理长短信合包（窄腰）：adapter 已把 UDH 剥成 submit.concat、content 为纯载荷。
         // 据 concat 重建含 UDH 段喂 merger（merger 内部对多段 strip_udh 取纯载荷拼接）。
-        if let Some(c) = submit.concat {
+        if let Some(c) = &submit.concat {
             let mut seg_bytes = c.to_udh_prefix();
             seg_bytes.extend_from_slice(&submit.content);
             let frame_lm = LongMessageFrame::new(
@@ -482,9 +456,10 @@ impl CmppBusinessHandler {
             );
         }
 
-        // 需要状态报告 → 通过 MessageSource 异步发送。
+        // 需要状态报告 → 通过 MessageSource 异步发送（出站仍按协商版本编码，不受窄腰入站路径影响）。
         if submit.want_report {
             if let Some(account) = ctx.conn.authenticated_account().await {
+                let version = ctx.conn.protocol_version().await;
                 let report = build_deliver_report(&account, &msg_id, &phone, version);
                 self.msg_source.push(&account, report).await;
             }
@@ -654,7 +629,7 @@ async fn main() -> Result<()> {
     tracing::info!("CMPP 网关启动于 {}:{}", config.host, config.port);
 
     let server: BoundServer = ServerBuilder::new(config)
-        .handlers(vec![Arc::new(CmppBusinessHandler {
+        .message_handlers(vec![Arc::new(CmppBusinessHandler {
             msg_source: msg_source.clone(),
             merger: Arc::new(std::sync::Mutex::new(LongMessageMerger::new())),
         })])

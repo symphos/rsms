@@ -4,8 +4,9 @@ use rsms_connector::{
     AccountConfig, AccountConfigProvider, SmppDecoder, ClientBuilder,
     AccountPool,
 };
-use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler, ClientConnection};
-use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Frame, Result};
+use rsms_connector::client::{ClientConfig, ClientConnection};
+use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Result};
+use rsms_business::{MessageContext, MessageHandler};
 // 窄腰统一模型：构造/解码全程走 SmppAdapter，不再裸 codec。
 use rsms_codec_smpp::adapter::SmppAdapter;
 use rsms_model::{
@@ -79,11 +80,11 @@ impl TestClientHandler {
 }
 
 #[async_trait]
-impl ClientHandler for TestClientHandler {
+impl MessageHandler for TestClientHandler {
     fn name(&self) -> &'static str { "test-client" }
-    async fn on_inbound(&self, _ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        // 消息类型经 SmppAdapter 识别，只统计 SubmitResp 数量。
-        if let Ok(UnifiedMessage::SubmitResp(_)) = SmppAdapter.decode(frame) {
+    async fn on_message(&self, _ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 统一模型分支：仅统计 SubmitResp 数量。
+        if let UnifiedMessage::SubmitResp(_) = msg {
             self.submit_resp_count.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
@@ -135,7 +136,7 @@ async fn start_server(
     ).with_protocol(Protocol::Smpp));
     let auth = Arc::new(PasswordAuthHandler::new().add_account(TEST_SYSTEM_ID, TEST_PASSWORD));
     let server = rsms_connector::ServerBuilder::new(cfg)
-        .handlers(vec![])
+        .message_handlers(vec![])
         .auth_handler(auth)
         .account_config_provider(config_provider as Arc<dyn AccountConfigProvider>)
         .serve()

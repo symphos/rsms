@@ -1,15 +1,14 @@
 use async_trait::async_trait;
 use rsms_connector::{
     ClientBuilder, AuthCredentials, AuthHandler, AuthResult,
-    ClientEventHandler, ClientHandler, MessageSource, MessageItem, ProtocolConnection,
+    ClientEventHandler, MessageSource, MessageItem, ProtocolConnection,
     ServerEventHandler, AccountConfig, AccountConfigProvider,
     CmppDecoder,
     MessageCallback, SubmitInfo, ReportInfo, MoInfo,
     ServerShutdown,
 };
-use rsms_connector::client::{ClientContext, ClientConfig};
-use rsms_business::BusinessHandler;
-use rsms_business::InboundContext;
+use rsms_connector::client::ClientConfig;
+use rsms_business::{MessageContext, MessageHandler};
 use rsms_core::{ConnectionInfo, EncodedPdu, Metrics, Protocol, RawPdu, EndpointConfig, Frame, Result};
 // 窄腰统一模型：编解码全程经 CmppAdapter（decode→UnifiedMessage / encode UnifiedMessage→字节）。
 // compute_connect_auth 是 MD5 鉴权工具（非裸消息构造），保留。
@@ -142,15 +141,15 @@ impl TestBusinessHandler {
 }
 
 #[async_trait]
-impl BusinessHandler for TestBusinessHandler {
+impl MessageHandler for TestBusinessHandler {
     fn name(&self) -> &'static str {
         "test-biz-handler"
     }
 
-    async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        // 统一模型分支：Submit（含限流判定回 SubmitResp）；Report/Deliver 分别记 report/mo。
-        match CmppAdapter.decode(frame) {
-            Ok(UnifiedMessage::Submit(s)) => {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 窄腰路径：框架已 decode，直接 match 统一消息枚举。
+        match msg {
+            UnifiedMessage::Submit(s) => {
                 let result = if ctx.conn.authenticated_account().await.is_some() {
                     if let Some(limiter) = ctx.conn.rate_limiter().await {
                         if !limiter.try_acquire().await {
@@ -170,20 +169,18 @@ impl BusinessHandler for TestBusinessHandler {
                 } else {
                     3
                 };
-                let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                ctx.reply(UnifiedMessage::SubmitResp(UnifiedSubmitResp {
                     msg_id: MessageId::Binary(vec![0u8; 8]),
                     status: result,
-                });
-                let resp_bytes = CmppAdapter.encode(&resp, CmppAdapter.sequence_of(frame))?;
-                ctx.conn.write_frame(&resp_bytes).await?;
+                })).await?;
             }
             // 状态报告（CMPP Deliver registered_delivery=1）→ Report，记原始正文。
-            Ok(UnifiedMessage::Report(r)) => {
+            UnifiedMessage::Report(r) => {
                 let report = String::from_utf8_lossy(&r.raw).to_string();
                 self.reports.lock().unwrap().push(report);
             }
             // MO 上行（registered_delivery=0）→ Deliver，记 (src, content)。
-            Ok(UnifiedMessage::Deliver(d)) => {
+            UnifiedMessage::Deliver(d) => {
                 self.mo_messages.lock().unwrap().push((
                     d.src.number.clone(),
                     String::from_utf8_lossy(&d.content).to_string(),
@@ -306,19 +303,14 @@ impl TestClientHandler {
 }
 
 #[async_trait]
-impl ClientHandler for TestClientHandler {
+impl MessageHandler for TestClientHandler {
     fn name(&self) -> &'static str {
         "test-client-handler"
     }
 
-    async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        // 统一模型分支替代手剥字节：BindResp/SubmitResp/Deliver/Report/PingResp/UnbindResp。
-        let unified = match CmppAdapter.decode(frame) {
-            Ok(m) => m,
-            Err(_) => return Ok(()),
-        };
-
-        match unified {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 窄腰路径：框架已 decode，直接 match 统一消息枚举。
+        match msg {
             UnifiedMessage::BindResp(resp) => {
                 *self.connect_resp_status.lock().unwrap() = Some(resp.status);
                 if resp.status == 0 {
@@ -332,14 +324,12 @@ impl ClientHandler for TestClientHandler {
             UnifiedMessage::Report(_) => {
                 self.deliver_count.fetch_add(1, Ordering::Relaxed);
                 self.report_count.fetch_add(1, Ordering::Relaxed);
-                let resp_bytes = CmppAdapter.encode(&UnifiedMessage::DeliverResp, CmppAdapter.sequence_of(frame))?;
-                ctx.conn.write_frame(&resp_bytes).await?;
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
             // MO 上行（registered_delivery=0）：仅计 deliver，并回 DeliverResp。
             UnifiedMessage::Deliver(_) => {
                 self.deliver_count.fetch_add(1, Ordering::Relaxed);
-                let resp_bytes = CmppAdapter.encode(&UnifiedMessage::DeliverResp, CmppAdapter.sequence_of(frame))?;
-                ctx.conn.write_frame(&resp_bytes).await?;
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
             UnifiedMessage::PingResp => {
                 self.active_test_resp_count.fetch_add(1, Ordering::Relaxed);
@@ -359,7 +349,7 @@ use rsms_connector::ServerBuilder;
 /// 启动测试服务器
 async fn start_test_server(
     auth_handler: Arc<dyn AuthHandler>,
-    biz_handler: Arc<dyn BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
     event_handler: Arc<dyn ServerEventHandler>,
     idle_timeout_secs: u32,
 ) -> Result<(u16, tokio::task::JoinHandle<()>)> {
@@ -371,7 +361,7 @@ async fn start_test_server(
         idle_timeout_secs as u16,
     ));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(auth_handler)
         .account_config_provider(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>)
         .event_handler(event_handler)
@@ -389,7 +379,7 @@ async fn start_test_server(
 /// 启动测试服务器，返回server引用以便访问连接池
 async fn start_test_server_with_pool(
     auth_handler: Arc<dyn AuthHandler>,
-    biz_handler: Arc<dyn BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
     event_handler: Arc<dyn ServerEventHandler>,
     idle_timeout_secs: u32,
 ) -> Result<(u16, Arc<rsms_connector::ConnectionPool>, tokio::task::JoinHandle<()>)> {
@@ -401,7 +391,7 @@ async fn start_test_server_with_pool(
         idle_timeout_secs as u16,
     ));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(auth_handler)
         .account_config_provider(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>)
         .event_handler(event_handler)
@@ -498,12 +488,12 @@ impl MessageSource for OneShotSource {
 
 async fn start_test_server_with_metrics(
     auth_handler: Arc<dyn AuthHandler>,
-    biz_handler: Arc<dyn BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
     metrics: Arc<dyn Metrics>,
 ) -> Result<(u16, tokio::task::JoinHandle<()>)> {
     let cfg = Arc::new(EndpointConfig::new("metrics-server", "127.0.0.1", 0, 8, 30));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(auth_handler)
         .account_config_provider(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>)
         .metrics(metrics)
@@ -895,13 +885,13 @@ async fn test_deliver_report() {
 /// 启动测试服务器并返回优雅停机句柄 + 连接池（用于 B2 服务端停机测试）。
 async fn start_test_server_with_shutdown(
     auth_handler: Arc<dyn AuthHandler>,
-    biz_handler: Arc<dyn BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
     event_handler: Arc<dyn ServerEventHandler>,
     idle_timeout_secs: u32,
 ) -> Result<(u16, ServerShutdown, Arc<rsms_connector::ConnectionPool>, tokio::task::JoinHandle<()>)> {
     let cfg = Arc::new(EndpointConfig::new("test-server", "127.0.0.1", 0, 8, idle_timeout_secs as u16));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(auth_handler)
         .account_config_provider(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>)
         .event_handler(event_handler)
@@ -1036,7 +1026,7 @@ impl AccountConfigProvider for RateLimitConfigProvider {
 
 async fn start_test_server_with_rate_limit(
     auth_handler: Arc<dyn AuthHandler>,
-    biz_handler: Arc<dyn BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
     event_handler: Arc<dyn ServerEventHandler>,
     max_qps: u64,
     window_size_ms: u64,
@@ -1050,7 +1040,7 @@ async fn start_test_server_with_rate_limit(
     ));
     let config_provider = Arc::new(RateLimitConfigProvider::new(max_qps, window_size_ms));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(auth_handler)
         .account_config_provider(config_provider)
         .event_handler(event_handler)
@@ -1463,6 +1453,201 @@ async fn test_delivery_callback_autowire() {
     }
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(spy.reports.load(Ordering::Relaxed), 1, "应自动回调 on_report 并按 msg_id 关联到原 Submit");
+
+    handle.abort();
+}
+
+/// V2.0 版本感知服务端业务处理器：收到 Submit 时检查连接协议版本，
+/// 按版本回送对应格式的 SubmitResp，确保客户端在版本感知新路径下能正确解码。
+///
+/// V2.0 SubmitResp = 12B 头 + 8B msg_id + 1B result = 21B total（V3.0 是 24B）。
+pub struct V20AwareBusinessHandler {
+    pub submit_count: Arc<AtomicUsize>,
+    pub messages: Arc<Mutex<Vec<String>>>,
+}
+
+impl V20AwareBusinessHandler {
+    pub fn new() -> Self {
+        Self {
+            submit_count: Arc::new(AtomicUsize::new(0)),
+            messages: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn submit_count(&self) -> usize {
+        self.submit_count.load(Ordering::Relaxed)
+    }
+
+    pub fn get_messages(&self) -> Vec<String> {
+        self.messages.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl MessageHandler for V20AwareBusinessHandler {
+    fn name(&self) -> &'static str {
+        "v20-aware-biz-handler"
+    }
+
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        if let UnifiedMessage::Submit(s) = msg {
+            self.submit_count.fetch_add(1, Ordering::Relaxed);
+            let content = String::from_utf8_lossy(&s.content).to_string();
+            self.messages.lock().unwrap().push(content);
+
+            // 版本感知回送：Task2 后 ctx.reply 自动按 conn.protocol_version() 编码，
+            // V2.0 连接自动产 V2.0 SubmitResp（21B），V3.0 产 24B，无需手动分支。
+            ctx.reply(UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                msg_id: MessageId::Binary(vec![0u8; 8]),
+                status: 0,
+            })).await?;
+        }
+        Ok(())
+    }
+}
+
+/// CMPP V2.0 新路径端到端集成测试（Task 2 + Task 3 的端到端验证）。
+///
+/// 验证链路：
+/// 1. 客户端预设 protocol_version=0x20 → 框架以 V2.0 正确解码服务端 ConnectResp（18B body / 30B total）
+/// 2. 客户端发 V2.0 格式 Submit（extra.version=0x20）→ 服务端新路径以 V2.0 解码 → UnifiedSubmit 字段正确
+/// 3. 服务端版本感知回 V2.0 SubmitResp（21B）→ 客户端新路径以 V2.0 解码 → status 字段正确
+///
+/// 若 Task 2（服务端 decode_with_version）缺失：Submit 以 V3.0 错误解码 → 字段错位 / 解码失败。
+/// 若 Task 3（客户端 decode_with_version）缺失：ConnectResp / SubmitResp 以 V3.0 错误解码 → 永不置 connected。
+#[tokio::test]
+async fn test_cmpp_v20_new_path_e2e() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .try_init();
+
+    let auth = Arc::new(PasswordAuthHandler::new().add_account("106900", "password123"));
+    let biz = Arc::new(V20AwareBusinessHandler::new());
+    let evt = Arc::new(TestEventHandler::new());
+    let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30)
+        .await
+        .unwrap();
+
+    let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30).with_protocol_version(0x20));
+    let client_handler = Arc::new(TestClientHandler::new());
+    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+        .client_config(ClientConfig::new())
+        .connect()
+        .await
+        .expect("connect");
+
+    // 发送 CMPP V2.0 Connect（version 字节 = 0x20）
+    let timestamp = 0u32;
+    let auth_bytes = compute_connect_auth("106900", "password123", timestamp);
+    let bind_v20 = UnifiedMessage::Bind(UnifiedBind {
+        client_id: "106900".to_string(),
+        authenticator: auth_bytes.to_vec(),
+        timestamp,
+        version: 0x20,
+        system_type: None,
+        mode: rsms_model::BindMode::default(),
+        login_mode: None,
+    });
+    let connect_bytes = CmppAdapter.encode(&bind_v20, Sequence::Plain(1)).expect("encode bind v20");
+    conn.send_request(RawPdu::from_vec(connect_bytes)).await.expect("send connect v20");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 断言（Task 3）：ConnectResp 被新路径以 V2.0 正确解码 → connected=true
+    assert!(
+        client_handler.is_connected(),
+        "V2.0 ConnectResp 应被客户端新路径正确解码，连接应成功"
+    );
+
+    // 发送 V2.0 格式 Submit（extra.version=0x20 → CmppAdapter.encode 产 SubmitV20 字节）
+    let submit_v20 = UnifiedMessage::Submit(UnifiedSubmit {
+        src: Address::plain("13800138000"),
+        dests: vec![Address::plain("106900")],
+        content: b"Hello V2.0 SMS".to_vec(),
+        encoding: Encoding::Ascii,
+        want_report: true,
+        concat: None,
+        extra: ProtocolExtra::Cmpp(CmppExtra { version: 0x20, ..Default::default() }),
+        tlvs: vec![],
+    });
+    let submit_bytes = CmppAdapter
+        .encode(&submit_v20, Sequence::Plain(2))
+        .expect("encode submit v20");
+    conn.send_request(RawPdu::from_vec(submit_bytes)).await.expect("send submit v20");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 断言（Task 2）：服务端新路径以 V2.0 正确解码 Submit，字段无错位
+    assert_eq!(
+        biz.submit_count(),
+        1,
+        "服务端应收到 1 条 V2.0 Submit（decode_with_version 路径）"
+    );
+    assert_eq!(
+        biz.get_messages(),
+        vec!["Hello V2.0 SMS"],
+        "服务端 Submit 内容字段应正确（V2.0 解码无字段错位）"
+    );
+
+    // 断言（Task 3）：V2.0 SubmitResp（21B）被客户端新路径正确解码，status 字段无错位
+    assert_eq!(
+        client_handler.get_submit_status(),
+        Some(0),
+        "客户端新路径应正确解码 V2.0 SubmitResp，status=0（非 V3.0 误解导致的字段偏移）"
+    );
+
+    handle.abort();
+}
+
+/// D3b 心跳收归——CMPP 服务端自动回 ActiveTestResp（Task 5）。
+///
+/// 验证：
+/// (a) 客户端发 ActiveTest → 服务端自动回 ActiveTestResp（命中新分支，不落 catch-all Stop）；
+/// (b) ActiveTest 后连接仍存活——再发 Submit 仍能收到 SubmitResp（证明未被 Stop 断连）。
+#[tokio::test]
+async fn cmpp_server_auto_replies_active_test() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .try_init();
+
+    let auth = Arc::new(PasswordAuthHandler::new().add_account("106900", "password123"));
+    let biz = Arc::new(TestBusinessHandler::new());
+    let evt = Arc::new(TestEventHandler::new());
+    let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30)
+        .await
+        .unwrap();
+
+    let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
+    let client_handler = Arc::new(TestClientHandler::new());
+    let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
+        .client_config(ClientConfig::new())
+        .connect()
+        .await
+        .expect("connect");
+
+    // 建连鉴权
+    let connect_pdu = client_handler.build_connect_pdu("106900", "password123");
+    conn.send_request(connect_pdu).await.expect("send connect");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(client_handler.is_connected(), "建连失败，前置条件不满足");
+
+    // (a) 发 ActiveTest，断言收到 ActiveTestResp（UnifiedMessage::PingResp → active_test_resp_count +1）
+    let ping_pdu = client_handler.build_active_test_pdu();
+    conn.send_request(ping_pdu).await.expect("send active test");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        client_handler.active_test_resp_count(),
+        1,
+        "服务端应自动回 ActiveTestResp（D3b），收到计数应为 1"
+    );
+
+    // (b) ActiveTest 后再发 Submit，断言仍能收到 SubmitResp（连接未被 Stop 断开）
+    let submit_pdu = client_handler.build_submit_pdu("13800138000", "106900", "post-ping msg");
+    conn.send_request(submit_pdu).await.expect("send submit after active test");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        client_handler.get_submit_status(),
+        Some(0),
+        "ActiveTest 后连接应存活，Submit 仍应得到 SubmitResp(status=0)"
+    );
 
     handle.abort();
 }

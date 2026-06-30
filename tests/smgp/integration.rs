@@ -1,9 +1,7 @@
 use rsms_connector::{ServerBuilder, SmgpDecoder};
-use rsms_connector::client::ClientHandler;
 use rsms_connector::{AuthHandler, AuthCredentials, AuthResult, ServerEventHandler, AccountConfigProvider};
-use rsms_business::BusinessHandler;
-use rsms_business::InboundContext;
-use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Protocol, Frame, Result};
+use rsms_business::{MessageContext, MessageHandler};
+use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Protocol, Result};
 // 窄腰统一模型：业务/对端代码不再直接用裸 codec PDU，统一走 SmgpAdapter + UnifiedMessage。
 use rsms_codec_smgp::adapter::SmgpAdapter;
 use rsms_codec_smgp::datatypes::SmgpReport;
@@ -122,39 +120,36 @@ impl TestBusinessHandler {
 }
 
 #[async_trait]
-impl BusinessHandler for TestBusinessHandler {
+impl MessageHandler for TestBusinessHandler {
     fn name(&self) -> &'static str {
         "smgp-test-biz"
     }
 
-    async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        if let Ok(msg) = SmgpAdapter.decode(frame) {
-            match msg {
-                UnifiedMessage::Submit(s) => {
-                    self.submit_count.fetch_add(1, Ordering::Relaxed);
-                    let content = String::from_utf8_lossy(&s.content).to_string();
-                    self.messages.lock().unwrap().push(content);
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 框架已按协议解码为统一消息，直接 match 统一枚举。
+        match msg {
+            UnifiedMessage::Submit(s) => {
+                self.submit_count.fetch_add(1, Ordering::Relaxed);
+                let content = String::from_utf8_lossy(&s.content).to_string();
+                self.messages.lock().unwrap().push(content);
 
-                    // 立即回 SubmitResp：msg_id 为 10 字节二进制，sequence_of 回显请求序列。
-                    let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
-                        msg_id: MessageId::Binary(rsms_codec_smgp::SmgpMsgId::from_u64(1).bytes.to_vec()),
-                        status: 0,
-                    });
-                    let resp_bytes = SmgpAdapter.encode(&resp, SmgpAdapter.sequence_of(frame))?;
-                    ctx.conn.write_frame(&resp_bytes).await?;
-                }
-                // is_report=1 经 adapter 翻译为 Report，is_report=0 翻译为 Deliver。
-                UnifiedMessage::Report(r) => {
-                    self.reports.lock().unwrap().push(String::from_utf8_lossy(&r.raw).to_string());
-                }
-                UnifiedMessage::Deliver(d) => {
-                    self.mo_messages.lock().unwrap().push((
-                        d.src.number.clone(),
-                        String::from_utf8_lossy(&d.content).to_string(),
-                    ));
-                }
-                _ => {}
+                // 一步回执（窄腰）：框架按请求帧序列编码 SubmitResp 并写回。
+                ctx.reply(UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                    msg_id: MessageId::Binary(rsms_codec_smgp::SmgpMsgId::from_u64(1).bytes.to_vec()),
+                    status: 0,
+                })).await?;
             }
+            // is_report=1 经 adapter 翻译为 Report，is_report=0 翻译为 Deliver。
+            UnifiedMessage::Report(r) => {
+                self.reports.lock().unwrap().push(String::from_utf8_lossy(&r.raw).to_string());
+            }
+            UnifiedMessage::Deliver(d) => {
+                self.mo_messages.lock().unwrap().push((
+                    d.src.number.clone(),
+                    String::from_utf8_lossy(&d.content).to_string(),
+                ));
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -264,18 +259,14 @@ impl TestClientHandler {
 }
 
 #[async_trait]
-impl ClientHandler for TestClientHandler {
+impl MessageHandler for TestClientHandler {
     fn name(&self) -> &'static str {
         "smgp-test-client"
     }
 
-    async fn on_inbound(&self, ctx: &rsms_connector::client::ClientContext<'_>, frame: &Frame) -> Result<()> {
-        let unified = match SmgpAdapter.decode(frame) {
-            Ok(m) => m,
-            Err(_) => return Ok(()),
-        };
-
-        match unified {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 框架已按协议解码为统一消息，直接 match 统一枚举。
+        match msg {
             UnifiedMessage::BindResp(resp) => {
                 *self.login_resp_status.lock().unwrap() = Some(resp.status);
                 if resp.status == 0 {
@@ -289,14 +280,12 @@ impl ClientHandler for TestClientHandler {
             UnifiedMessage::Report(_) => {
                 self.deliver_count.fetch_add(1, Ordering::Relaxed);
                 tracing::info!("[客户端] 收到状态报告");
-                let bytes = SmgpAdapter.encode(&UnifiedMessage::DeliverResp, SmgpAdapter.sequence_of(frame))?;
-                ctx.conn.write_frame(&bytes).await?;
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
             UnifiedMessage::Deliver(_) => {
                 self.deliver_count.fetch_add(1, Ordering::Relaxed);
                 tracing::info!("[客户端] 收到上行短信");
-                let bytes = SmgpAdapter.encode(&UnifiedMessage::DeliverResp, SmgpAdapter.sequence_of(frame))?;
-                ctx.conn.write_frame(&bytes).await?;
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
             UnifiedMessage::PingResp => {
                 self.active_test_resp_count.fetch_add(1, Ordering::Relaxed);
@@ -313,7 +302,7 @@ impl ClientHandler for TestClientHandler {
 
 pub async fn start_test_server(
     auth_handler: Arc<dyn AuthHandler>,
-    biz_handler: Arc<dyn BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
     event_handler: Arc<dyn ServerEventHandler>,
     idle_timeout_secs: u32,
 ) -> Result<(u16, tokio::task::JoinHandle<()>)> {
@@ -325,7 +314,7 @@ pub async fn start_test_server(
         idle_timeout_secs as u16,
     ).with_protocol(Protocol::Smgp));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(auth_handler)
         .account_config_provider(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>)
         .event_handler(event_handler)
@@ -342,7 +331,7 @@ pub async fn start_test_server(
 
 pub async fn start_test_server_with_pool(
     auth_handler: Arc<dyn AuthHandler>,
-    biz_handler: Arc<dyn BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
     event_handler: Arc<dyn ServerEventHandler>,
     idle_timeout_secs: u32,
 ) -> Result<(u16, Arc<rsms_connector::ConnectionPool>, tokio::task::JoinHandle<()>)> {
@@ -354,7 +343,7 @@ pub async fn start_test_server_with_pool(
         idle_timeout_secs as u16,
     ).with_protocol(Protocol::Smgp));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(auth_handler)
         .account_config_provider(Arc::new(MockAccountConfigProvider::new()) as Arc<dyn AccountConfigProvider>)
         .event_handler(event_handler)
@@ -446,7 +435,7 @@ mod tests {
         let evt = Arc::new(TestEventHandler::new());
         let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30).await.unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smgp));
         let client_handler = Arc::new(TestClientHandler::new());
         let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmgpDecoder)
             .client_config(ClientConfig::new())
@@ -485,7 +474,7 @@ mod tests {
         let evt = Arc::new(TestEventHandler::new());
         let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30).await.unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smgp));
         let client_handler = Arc::new(TestClientHandler::new());
         let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmgpDecoder)
             .client_config(ClientConfig::new())
@@ -522,7 +511,7 @@ mod tests {
         let evt = Arc::new(TestEventHandler::new());
         let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30).await.unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smgp));
         let client_handler = Arc::new(TestClientHandler::new());
         let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmgpDecoder)
             .client_config(ClientConfig::new())
@@ -560,7 +549,7 @@ mod tests {
         let evt = Arc::new(TestEventHandler::new());
         let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30).await.unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smgp));
         let client_handler = Arc::new(TestClientHandler::new());
         let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmgpDecoder)
             .client_config(ClientConfig::new())
@@ -599,7 +588,7 @@ mod tests {
         let evt = Arc::new(TestEventHandler::new());
         let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30).await.unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smgp));
         let client_handler = Arc::new(TestClientHandler::new());
         let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmgpDecoder)
             .client_config(ClientConfig::new())
@@ -636,7 +625,7 @@ mod tests {
         let evt = Arc::new(TestEventHandler::new());
         let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 30).await.unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smgp));
         let client_handler = Arc::new(TestClientHandler::new());
         let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmgpDecoder)
             .client_config(ClientConfig::new())
@@ -674,7 +663,7 @@ mod tests {
         let client_evt = Arc::new(TestClientEventHandler::new());
         let (port, handle) = start_test_server(auth.clone(), biz.clone(), evt.clone(), 2).await.unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smgp));
         let client_handler = Arc::new(TestClientHandler::new());
         let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmgpDecoder)
             .client_config(ClientConfig::new())
@@ -711,7 +700,7 @@ mod tests {
             .await
             .unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smgp));
         let client_handler = Arc::new(TestClientHandler::new());
         let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmgpDecoder)
             .client_config(ClientConfig::new())
@@ -754,7 +743,7 @@ mod tests {
             .await
             .unwrap();
 
-        let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30));
+        let endpoint = Arc::new(EndpointConfig::new("smgp-client", "127.0.0.1", port, 8, 30).with_protocol(Protocol::Smgp));
         let client_handler = Arc::new(TestClientHandler::new());
         let conn = ClientBuilder::new(endpoint, client_handler.clone(), SmgpDecoder)
             .client_config(ClientConfig::new())

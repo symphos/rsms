@@ -1,14 +1,15 @@
 use async_trait::async_trait;
 use rsms_connector::{
     ClientBuilder, AuthCredentials, AuthHandler, AuthResult,
-    ClientEventHandler, ClientHandler, MessageSource, MessageItem, ProtocolConnection,
+    ClientEventHandler, MessageSource, MessageItem, ProtocolConnection,
     AccountConfig, AccountConfigProvider,
     CmppDecoder,
 };
-use rsms_connector::client::{ClientContext, ClientConfig};
-use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Frame, Result};
-// 窄腰统一模型：连接/提交构造与客户端收包分支经 CmppAdapter。
-// 但 V2.0 wire 级解码测试（decode_message_with_version + SubmitV20 + encoded_size_v20）adapter 无法
+use rsms_connector::client::ClientConfig;
+use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Result};
+use rsms_business::{MessageContext, MessageHandler};
+// 窄腰统一模型：连接/提交构造与客户端收包分支经 CmppAdapter（新路径版本感知 decode 在框架内）。
+// V2.0 wire 级解码测试（decode_message_with_version + SubmitV20 + encoded_size_v20）adapter 无法
 // 表达（adapter 仅 V3.0），故那部分保留裸 codec（见各测试内 use + 注释）。compute_connect_auth 保留。
 use rsms_codec_cmpp::adapter::CmppAdapter;
 use rsms_codec_cmpp::{decode_message_with_version, CmppMessage, Pdu};
@@ -158,19 +159,16 @@ impl TestClientHandler {
 }
 
 #[async_trait]
-impl ClientHandler for TestClientHandler {
+impl MessageHandler for TestClientHandler {
     fn name(&self) -> &'static str {
         "test-client-handler"
     }
 
-    async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        // 统一模型分支：BindResp/SubmitResp/(Deliver|Report 回 DeliverResp)。
-        let unified = match CmppAdapter.decode(frame) {
-            Ok(m) => m,
-            Err(_) => return Ok(()),
-        };
-
-        match unified {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 窄腰新路径：框架已按 conn.protocol_version() 版本感知解码，直接 match 统一消息枚举。
+        // V2.0 ConnectResp（30B total）与 V3.0 ConnectResp（33B total）均能正确解码，
+        // 前提是客户端通过 EndpointConfig::with_protocol_version(0x20) 声明版本（缺口#2修复）。
+        match msg {
             UnifiedMessage::BindResp(resp) => {
                 *self.connect_resp_status.lock().unwrap() = Some(resp.status);
                 if resp.status == 0 {
@@ -181,8 +179,7 @@ impl ClientHandler for TestClientHandler {
                 *self.submit_resp_status.lock().unwrap() = Some(resp.status);
             }
             UnifiedMessage::Deliver(_) | UnifiedMessage::Report(_) => {
-                let resp_bytes = CmppAdapter.encode(&UnifiedMessage::DeliverResp, CmppAdapter.sequence_of(frame))?;
-                ctx.conn.write_frame(&resp_bytes).await?;
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
             _ => {}
         }
@@ -247,7 +244,7 @@ async fn start_test_server(
         idle_timeout_secs as u16,
     ));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![])
+        .message_handlers(vec![])
         .auth_handler(auth_handler)
         .account_config_provider(Arc::new(MockAccountConfigProvider) as Arc<dyn AccountConfigProvider>)
         .serve()
@@ -277,7 +274,7 @@ async fn test_connect_v20_version() {
     let auth = Arc::new(PasswordAuthHandler::new().add_account("106900", "password123"));
     let (port, handle) = start_test_server(auth.clone(), 30).await.unwrap();
 
-    let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
+    let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30).with_protocol_version(0x20));
     let client_handler = Arc::new(TestClientHandler::new_with_version(0x20));
     let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
         .client_config(ClientConfig::new())
@@ -363,7 +360,7 @@ async fn test_submit_v20_after_connect() {
     let auth = Arc::new(PasswordAuthHandler::new().add_account("106900", "password123"));
     let (port, handle) = start_test_server(auth.clone(), 30).await.unwrap();
 
-    let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30));
+    let endpoint = Arc::new(EndpointConfig::new("test-client", "127.0.0.1", port, 8, 30).with_protocol_version(0x20));
     let client_handler = Arc::new(TestClientHandler::new_with_version(0x20));
     let conn = ClientBuilder::new(endpoint, client_handler.clone(), CmppDecoder)
         .client_config(ClientConfig::new())

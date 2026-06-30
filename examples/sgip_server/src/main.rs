@@ -21,14 +21,13 @@
 // ============================================================================
 
 use async_trait::async_trait;
-use rsms_business::BusinessHandler;
-use rsms_business::InboundContext;
+use rsms_business::{MessageContext, MessageHandler};
 use rsms_codec_sgip::adapter::SgipAdapter;
 use rsms_connector::{
     AccountConfig, AccountConfigProvider, AccountPoolConfig, AuthCredentials, AuthHandler,
     AuthResult, MessageItem, MessageSource, ProtocolConnection, ServerBuilder, ServerEventHandler,
 };
-use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Frame, Protocol, RawPdu, Result};
+use rsms_core::{ConnectionInfo, EncodedPdu, EndpointConfig, Protocol, RawPdu, Result};
 use rsms_longmsg::split::SmsAlphabet;
 use rsms_longmsg::{LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser};
 use rsms_model::{
@@ -329,7 +328,7 @@ impl MessageSource for FileMessageSource {
 }
 
 // ============================================================================
-// BusinessHandler：统一模型分支处理客户端上行的所有帧
+// MessageHandler：统一模型分支处理客户端上行的所有帧
 // ============================================================================
 
 struct SgipBusinessHandler {
@@ -338,23 +337,16 @@ struct SgipBusinessHandler {
 }
 
 #[async_trait]
-impl BusinessHandler for SgipBusinessHandler {
+impl MessageHandler for SgipBusinessHandler {
     fn name(&self) -> &'static str {
         "sgip-business"
     }
 
-    async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        let unified = match SgipAdapter.decode(frame) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(conn_id = ctx.conn.id(), "消息解码失败: {}", e);
-                return Ok(());
-            }
-        };
-
-        match unified {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 框架已按协议解码为统一消息，业务直接按枚举分支处理，无需手调 SgipAdapter.decode。
+        match msg {
             UnifiedMessage::Submit(submit) => {
-                self.handle_submit(ctx, frame, submit).await?;
+                self.handle_submit(ctx, submit).await?;
             }
             UnifiedMessage::Report(report) => {
                 tracing::info!(
@@ -363,14 +355,9 @@ impl BusinessHandler for SgipBusinessHandler {
                     dest = %report.dest.number,
                     "收到 Report"
                 );
-                // SGIP 独立 Report 须回 ReportResp；统一模型无 ReportResp 变体，
-                // 用 Unknown{command_id=ReportResp} 让 adapter 还原回 ReportResp 编码。
-                let resp = UnifiedMessage::Unknown {
-                    command_id: rsms_codec_sgip::CommandId::ReportResp as u32,
-                    raw: vec![],
-                };
-                let bytes = SgipAdapter.encode(&resp, SgipAdapter.sequence_of(frame))?;
-                ctx.conn.write_frame(&bytes).await?;
+                // delta-1：独立 Report 命令回 ReportResp（非 DeliverResp）；
+                // ctx.reply 内部经 SgipAdapter.encode 回显 12B 复合序列（delta-2 已验证）。
+                ctx.reply(UnifiedMessage::ReportResp).await?;
             }
             UnifiedMessage::Deliver(deliver) => {
                 // 按编码正确解码内容（UCS2 → UTF-16BE，否则 UTF-8 宽容解）。
@@ -382,9 +369,7 @@ impl BusinessHandler for SgipBusinessHandler {
                     "收到 Deliver（MO 上行）"
                 );
                 // MO-Deliver 的响应是 DeliverResp（语义不同于 ReportResp）。
-                let bytes =
-                    SgipAdapter.encode(&UnifiedMessage::DeliverResp, SgipAdapter.sequence_of(frame))?;
-                ctx.conn.write_frame(&bytes).await?;
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
             UnifiedMessage::Unbind => {
                 tracing::debug!(conn_id = ctx.conn.id(), "收到 Unbind");
@@ -400,9 +385,8 @@ impl BusinessHandler for SgipBusinessHandler {
 impl SgipBusinessHandler {
     async fn handle_submit(
         &self,
-        ctx: &InboundContext,
-        frame: &Frame,
-        submit: rsms_model::UnifiedSubmit,
+        ctx: &MessageContext,
+        submit: &rsms_model::UnifiedSubmit,
     ) -> Result<()> {
         let phone = submit
             .dests
@@ -410,18 +394,17 @@ impl SgipBusinessHandler {
             .map(|a| a.number.clone())
             .unwrap_or_else(|| "unknown".to_string());
 
-        // 回 SubmitResp（SGIP 无 msg_id，msg_id 给空 Text）；序列回显请求序列。
-        let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+        // 回 SubmitResp（delta-4：SGIP 无 msg_id，msg_id 给空 Text）；
+        // ctx.reply 内部经 SgipAdapter.encode 回显 12B 复合序列（delta-2 已验证）。
+        ctx.reply(UnifiedMessage::SubmitResp(UnifiedSubmitResp {
             msg_id: MessageId::Text(String::new()),
             status: 0,
-        });
-        let resp_bytes = SgipAdapter.encode(&resp, SgipAdapter.sequence_of(frame))?;
-        ctx.conn.write_frame(&resp_bytes).await?;
+        })).await?;
 
         // 处理长短信合包（窄腰）：adapter 已把级联 UDH 剥进 submit.concat、content 为纯载荷，
         // 业务不再读 SGIP tp_udhi / 手剥 UDH（与 cmpp/smgp/smpp server example 同范式）。
         // 据 concat 重建含 UDH 段喂 merger（merger 内部对多段 strip_udh 取纯载荷拼接）。
-        if let Some(c) = submit.concat {
+        if let Some(c) = &submit.concat {
             let mut seg_bytes = c.to_udh_prefix();
             seg_bytes.extend_from_slice(&submit.content);
             let frame_lm = LongMessageFrame::new(c.reference, c.total, c.sequence, seg_bytes, true, None);
@@ -462,16 +445,12 @@ impl SgipBusinessHandler {
             );
         }
 
-        // 需要状态报告：取被报告 Submit 的复合序列（即请求序列）作为 Report.submit_sequence，
-        // 并用一个新的复合序列作为 Report 帧自身的头部序列。
+        // 需要状态报告：取被报告 Submit 的复合序列（ctx.frame_sequence()，由框架从请求帧头解出）
+        // 作为 Report.submit_sequence（delta-2：SgipAdapter.encode 从 msg_id 12B Binary 反解还原）。
         if submit.want_report {
             if let Some(account) = ctx.conn.authenticated_account().await {
-                let submit_seq = SgipAdapter.sequence_of(frame);
-                let report_number = ctx
-                    .id_generator
-                    .as_ref()
-                    .map(|g| g.next_sequence_id())
-                    .unwrap_or(1);
+                let submit_seq = ctx.frame_sequence();
+                let report_number = ctx.id_generator.next_sequence_id();
                 let report = build_report(&submit_seq, &phone, report_number);
                 self.msg_source.push(&account, report).await;
             }
@@ -633,7 +612,7 @@ async fn main() -> Result<()> {
     tracing::info!("SGIP 网关启动于 {}:{}", config.host, config.port);
 
     let server = ServerBuilder::new(config)
-        .handlers(vec![Arc::new(SgipBusinessHandler {
+        .message_handlers(vec![Arc::new(SgipBusinessHandler {
             msg_source: msg_source.clone(),
             merger: Arc::new(std::sync::Mutex::new(LongMessageMerger::new())),
         })])

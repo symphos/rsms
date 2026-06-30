@@ -22,6 +22,10 @@ pub struct EndpointConfig {
     pub timeout: std::time::Duration,
     /// 框架日志级别，`None` 表示使用全局默认，`Some(Level)` 表示框架只输出该级别及以上的日志
     pub log_level: Option<tracing::Level>,
+    /// 客户端协议版本（仅 CMPP 区分 V2.0=0x20/V3.0=0x30）。`Some(v)` 时 `connect()` 建连后
+    /// 自动 `set_protocol_version(v)`，使客户端首帧响应按正确版本解码（解决服务端自动协商、
+    /// 客户端不自动设版本的不对称）。`None`（默认）走协议默认（CMPP 即 V3.0）。
+    pub protocol_version: Option<u8>,
 }
 
 impl EndpointConfig {
@@ -43,6 +47,7 @@ impl EndpointConfig {
             protocol: Protocol::Cmpp,
             timeout: std::time::Duration::from_secs(5),
             log_level: None,
+            protocol_version: None,
         }
     }
 
@@ -69,5 +74,29 @@ impl EndpointConfig {
     pub fn with_log_level(mut self, level: tracing::Level) -> Self {
         self.log_level = Some(level);
         self
+    }
+
+    /// 声明客户端协议版本（CMPP V2.0 传 `0x20`）。见字段 [`protocol_version`](Self::protocol_version)。
+    pub fn with_protocol_version(mut self, version: u8) -> Self {
+        self.protocol_version = Some(version);
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_protocol_version_sets_field() {
+        let cfg = EndpointConfig::new("c", "127.0.0.1", 7890, 8, 30)
+            .with_protocol_version(0x20);
+        assert_eq!(cfg.protocol_version, Some(0x20));
+    }
+
+    #[test]
+    fn protocol_version_defaults_none() {
+        let cfg = EndpointConfig::new("c", "127.0.0.1", 7890, 8, 30);
+        assert_eq!(cfg.protocol_version, None);
     }
 }

@@ -5,11 +5,11 @@ use rsms_connector::{
     AccountConfigProvider,
     protocol::MessageSource,
 };
-use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler};
-use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Frame, Result};
+use rsms_connector::client::ClientConfig;
+use rsms_business::{MessageContext, MessageHandler};
+use rsms_core::{ConnectionInfo, EncodedPdu, RawPdu, EndpointConfig, Protocol, Result};
 // 窄腰统一模型：收发一律走 SgipAdapter + UnifiedMessage，不再手构裸 codec / 手剥头部字节。
 use rsms_codec_sgip::adapter::SgipAdapter;
-use rsms_codec_sgip::CommandId;
 use rsms_model::{
     Address, DeliveryStatus, MessageId, ProtocolAdapter, ProtocolExtra, Sequence, SgipExtra,
     UnifiedBind, UnifiedDeliver, UnifiedMessage, UnifiedReport, UnifiedSubmit, UnifiedSubmitResp,
@@ -128,18 +128,13 @@ impl ClientState {
 }
 
 #[async_trait]
-impl ClientHandler for ClientState {
+impl MessageHandler for ClientState {
     fn name(&self) -> &'static str {
         "stress_client"
     }
 
-    async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        let unified = match SgipAdapter.decode(frame) {
-            Ok(m) => m,
-            Err(_) => return Ok(()),
-        };
-
-        match unified {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        match msg {
             UnifiedMessage::BindResp(resp) => {
                 *self.login_status.lock().unwrap() = Some(resp.status);
                 if resp.status == 0 {
@@ -174,12 +169,12 @@ impl ClientHandler for ClientState {
                     }
                 }
 
-                return build_report_resp(ctx, frame).await;
+                return ctx.reply(UnifiedMessage::ReportResp).await;
             }
             UnifiedMessage::Deliver(_) => {
                 self.stats.mo_received.fetch_add(1, Ordering::Relaxed);
                 tracing::trace!("[Client] Received Deliver/MO");
-                return build_deliver_resp(ctx, frame).await;
+                return ctx.reply(UnifiedMessage::DeliverResp).await;
             }
             _ => {}
         }
@@ -206,23 +201,6 @@ fn seq_to_msg_id(node_id: u32, timestamp: u32, number: u32) -> MessageId {
     MessageId::Binary(b)
 }
 
-// 回 ReportResp：统一模型无 ReportResp 变体，用 Unknown{command_id=ReportResp} 让 adapter 还原；
-// 序列用 sequence_of(frame) 回显请求复合序列（不手剥 pdu[8..20]）。
-async fn build_report_resp(ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-    let resp = UnifiedMessage::Unknown {
-        command_id: CommandId::ReportResp as u32,
-        raw: vec![],
-    };
-    let bytes = SgipAdapter.encode(&resp, SgipAdapter.sequence_of(frame))?;
-    ctx.conn.write_frame(bytes.as_slice()).await
-}
-
-// 回 DeliverResp：序列用 sequence_of(frame) 回显请求复合序列。
-async fn build_deliver_resp(ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-    let bytes = SgipAdapter.encode(&UnifiedMessage::DeliverResp, SgipAdapter.sequence_of(frame))?;
-    ctx.conn.write_frame(bytes.as_slice()).await
-}
-
 struct ServerHandler {
     submit_count: AtomicU64,
     msg_source: Arc<StressMockMessageSource>,
@@ -238,51 +216,46 @@ impl ServerHandler {
 }
 
 #[async_trait]
-impl rsms_business::BusinessHandler for ServerHandler {
+impl MessageHandler for ServerHandler {
     fn name(&self) -> &'static str {
         "stress-server-handler"
     }
 
-    async fn on_inbound(&self, ctx: &rsms_business::InboundContext, frame: &Frame) -> Result<()> {
-        if let Ok(unified) = SgipAdapter.decode(frame) {
-            match unified {
-                UnifiedMessage::Submit(s) => {
-                    let count = self.submit_count.fetch_add(1, Ordering::Relaxed);
-                    tracing::trace!("[Server] Received Submit #{}", count + 1);
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        match msg {
+            UnifiedMessage::Submit(s) => {
+                let count = self.submit_count.fetch_add(1, Ordering::Relaxed);
+                tracing::trace!("[Server] Received Submit #{}", count + 1);
 
-                    // 回 SubmitResp：序列用 sequence_of 回显请求复合序列。
-                    let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
-                        msg_id: MessageId::Text(String::new()),
-                        status: 0,
-                    });
-                    let resp_bytes = SgipAdapter.encode(&resp, SgipAdapter.sequence_of(frame))?;
-                    ctx.conn.write_frame(resp_bytes.as_slice()).await?;
+                // 回 SubmitResp：ctx.reply 自动回显请求帧序列（含 SGIP 复合序列）。
+                let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                    msg_id: MessageId::Text(String::new()),
+                    status: 0,
+                });
+                ctx.reply(resp).await?;
 
-                    // 被报告 Submit 的复合序列 number 分量：直接取自 sequence_of（不手剥 pdu[16..20]）。
-                    let submit_seq_number = match SgipAdapter.sequence_of(frame) {
-                        Sequence::Sgip { number, .. } => number,
-                        Sequence::Plain(n) => n,
-                    };
+                // 被报告 Submit 的复合序列 number 分量：由框架注入的 frame_sequence 取出。
+                let submit_seq_number = match ctx.frame_sequence() {
+                    Sequence::Sgip { number, .. } => number,
+                    Sequence::Plain(n) => n,
+                };
 
-                    let dest_number = s.dests.first().map(|a| a.number.clone()).unwrap_or_default();
-                    self.msg_source.push_item(STRESS_TEST_ACCOUNT, ReportItem {
-                        submit_seq_number,
-                        conn_id: ctx.conn.id(),
-                        dest_number,
-                    }.to_bytes()).await;
-                }
-                // ReportResp 经统一模型退化为 Unknown{command_id=ReportResp}；DeliverResp 为独立变体。
-                UnifiedMessage::Unknown { command_id, .. }
-                    if command_id == CommandId::ReportResp as u32 =>
-                {
-                    tracing::trace!("[Server] Received ReportResp");
-                }
-                UnifiedMessage::DeliverResp => {
-                    tracing::trace!("[Server] Received DeliverResp");
-                }
-                _ => {
-                    tracing::debug!("[Server] Received other message");
-                }
+                let dest_number = s.dests.first().map(|a| a.number.clone()).unwrap_or_default();
+                self.msg_source.push_item(STRESS_TEST_ACCOUNT, ReportItem {
+                    submit_seq_number,
+                    conn_id: ctx.conn.id(),
+                    dest_number,
+                }.to_bytes()).await;
+            }
+            // ReportResp 统一模型独立变体；DeliverResp 同。
+            UnifiedMessage::ReportResp => {
+                tracing::trace!("[Server] Received ReportResp");
+            }
+            UnifiedMessage::DeliverResp => {
+                tracing::trace!("[Server] Received DeliverResp");
+            }
+            _ => {
+                tracing::debug!("[Server] Received other message");
             }
         }
         Ok(())
@@ -327,7 +300,7 @@ impl AuthHandler for PasswordAuthHandler {
 }
 
 async fn start_test_server(
-    biz_handler: Arc<dyn rsms_business::BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
 ) -> Result<(u16, Arc<rsms_connector::AccountPool>, tokio::task::JoinHandle<()>)> {
     let cfg = Arc::new(EndpointConfig::new(
         "sgip-stress-server",
@@ -338,7 +311,7 @@ async fn start_test_server(
     ).with_protocol(Protocol::Sgip).with_log_level(tracing::Level::WARN));
     let auth = Arc::new(PasswordAuthHandler::new().add_account(STRESS_TEST_ACCOUNT, STRESS_TEST_PASSWORD));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(auth)
         .account_config_provider(Arc::new(MockAccountConfigProvider::with_limits(10000, 2048)) as Arc<dyn AccountConfigProvider>)
         .serve()

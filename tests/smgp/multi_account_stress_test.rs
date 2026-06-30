@@ -5,8 +5,9 @@ use rsms_connector::{
     ServerBuilder,
     protocol::MessageSource,
 };
-use rsms_connector::client::{ClientContext, ClientConfig, ClientHandler};
-use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Protocol, Frame, Result};
+use rsms_connector::client::ClientConfig;
+use rsms_business::{MessageContext, MessageHandler};
+use rsms_core::{ConnectionInfo, RawPdu, EndpointConfig, Protocol, Result};
 // 窄腰统一模型：编解码统一走 SmgpAdapter + UnifiedMessage。
 // SmgpMsgId 为 payload 格式化助手（非裸 PDU 消息类型），保留用于报告 id 匹配。
 use rsms_codec_smgp::adapter::SmgpAdapter;
@@ -148,18 +149,13 @@ impl ClientState {
 }
 
 #[async_trait]
-impl ClientHandler for ClientState {
+impl MessageHandler for ClientState {
     fn name(&self) -> &'static str {
         "multi-account-stress-client"
     }
 
-    async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        let unified = match SmgpAdapter.decode(frame) {
-            Ok(m) => m,
-            Err(_) => return Ok(()),
-        };
-
-        match unified {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        match msg {
             UnifiedMessage::BindResp(resp) => {
                 *self.login_status.lock().unwrap() = Some(resp.status);
                 if resp.status == 0 {
@@ -169,6 +165,7 @@ impl ClientHandler for ClientState {
             UnifiedMessage::SubmitResp(resp) => {
                 self.stats.submit_resp_received.fetch_add(1, Ordering::Relaxed);
                 if resp.status == 0 {
+                    // 框架已解码，adapter 给出 MessageId::Binary(10B)，转回 SmgpMsgId 存入待匹配队列。
                     let msg_id = msg_id_to_smgp(&resp.msg_id);
                     self.msg_ids.write().unwrap().push_back(msg_id);
                 } else {
@@ -192,14 +189,12 @@ impl ClientHandler for ClientState {
                         self.stats.report_matched.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                let resp_bytes = SmgpAdapter.encode(&UnifiedMessage::DeliverResp, SmgpAdapter.sequence_of(frame))?;
-                ctx.conn.write_frame(&resp_bytes).await?;
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
             // is_report=0→Deliver（MO）。
             UnifiedMessage::Deliver(_) => {
                 self.stats.mo_received.fetch_add(1, Ordering::Relaxed);
-                let resp_bytes = SmgpAdapter.encode(&UnifiedMessage::DeliverResp, SmgpAdapter.sequence_of(frame))?;
-                ctx.conn.write_frame(&resp_bytes).await?;
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
             _ => {}
         }
@@ -236,37 +231,34 @@ impl ServerHandler {
 }
 
 #[async_trait]
-impl rsms_business::BusinessHandler for ServerHandler {
+impl MessageHandler for ServerHandler {
     fn name(&self) -> &'static str {
         "multi-account-stress-server"
     }
 
-    async fn on_inbound(&self, ctx: &rsms_business::InboundContext, frame: &Frame) -> Result<()> {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
         let account = ctx.conn.authenticated_account().await.unwrap_or_else(|| "unknown".to_string());
-        if let Ok(msg) = SmgpAdapter.decode(frame) {
-            match msg {
-                UnifiedMessage::Submit(s) => {
-                    let count = self.submit_count.fetch_add(1, Ordering::Relaxed);
-                    let msg_id = SmgpMsgId::from_u64(count);
+        match msg {
+            UnifiedMessage::Submit(s) => {
+                let count = self.submit_count.fetch_add(1, Ordering::Relaxed);
+                let msg_id = SmgpMsgId::from_u64(count);
 
-                    let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
-                        msg_id: MessageId::Binary(msg_id.bytes.to_vec()),
-                        status: 0,
-                    });
-                    let resp_bytes = SmgpAdapter.encode(&resp, SmgpAdapter.sequence_of(frame))?;
-                    ctx.conn.write_frame(&resp_bytes).await?;
+                let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+                    msg_id: MessageId::Binary(msg_id.bytes.to_vec()),
+                    status: 0,
+                });
+                ctx.reply(resp).await?;
 
-                    let dest_id = s.dests.first().map(|a| a.number.clone()).unwrap_or_default();
-                    let item = ReportItem {
-                        msg_id: msg_id.to_bytes(),
-                        conn_id: ctx.conn.id(),
-                        dest_id,
-                    };
-                    self.msg_source.push_item(&account, item.to_bytes()).await;
-                }
-                UnifiedMessage::DeliverResp => {}
-                _ => {}
+                let dest_id = s.dests.first().map(|a| a.number.clone()).unwrap_or_default();
+                let item = ReportItem {
+                    msg_id: msg_id.to_bytes(),
+                    conn_id: ctx.conn.id(),
+                    dest_id,
+                };
+                self.msg_source.push_item(&account, item.to_bytes()).await;
             }
+            UnifiedMessage::DeliverResp => {}
+            _ => {}
         }
         Ok(())
     }
@@ -307,7 +299,7 @@ impl AuthHandler for PasswordAuthHandler {
 }
 
 async fn start_test_server(
-    biz_handler: Arc<dyn rsms_business::BusinessHandler>,
+    biz_handler: Arc<dyn MessageHandler>,
 ) -> Result<(u16, Arc<rsms_connector::AccountPool>, tokio::task::JoinHandle<()>)> {
     let cfg = Arc::new(EndpointConfig::new(
         "multi-account-stress-server",
@@ -321,7 +313,7 @@ async fn start_test_server(
         auth = auth.add_account(cred.client_id, cred.password);
     }
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(Arc::new(auth))
         .account_config_provider(Arc::new(MockAccountConfigProvider::with_limits(10000, 4096)) as Arc<dyn AccountConfigProvider>)
         .serve()
@@ -539,7 +531,7 @@ async fn stress_test_smgp_5accounts_5connections() {
                 port,
                 1024,
                 30,
-            ).with_window_size(WINDOW_SIZE as u16).with_log_level(tracing::Level::WARN));
+            ).with_protocol(Protocol::Smgp).with_window_size(WINDOW_SIZE as u16).with_log_level(tracing::Level::WARN));
 
             let conn = ClientBuilder::new(endpoint, client_state.clone(), SmgpDecoder)
                 .client_config(ClientConfig::new())

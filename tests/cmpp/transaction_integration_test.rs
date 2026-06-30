@@ -1,8 +1,8 @@
 use async_trait::async_trait;
-use rsms_connector::client::{ClientContext, ClientHandler};
-use rsms_connector::transaction::{MessageCallback, SubmitInfo, ReportInfo, MoInfo};
+use rsms_connector::transaction::{MessageCallback, SubmitInfo, ReportInfo, MoInfo, TransactionManager};
 use rsms_connector::{ClientBuilder, CmppDecoder, AccountConnections, AccountConfig};
-use rsms_core::{ConnectionInfo, EndpointConfig, Protocol, Frame, Result};
+use rsms_core::{ConnectionInfo, EndpointConfig, Protocol, Result};
+use rsms_business::{MessageContext, MessageHandler};
 // 窄腰统一模型：编解码经 CmppAdapter；compute_connect_auth 是 MD5 鉴权工具，保留。
 use rsms_codec_cmpp::adapter::CmppAdapter;
 use rsms_codec_cmpp::auth::compute_connect_auth;
@@ -19,6 +19,8 @@ const TEST_PASSWORD: &str = "pwd";
 
 #[allow(dead_code)]
 struct TransactionTestHandler {
+    /// 事务匹配驱动器：持有对 AccountConnections 同一 TM 的引用，在 on_message 里手动驱动。
+    tm: Option<Arc<TransactionManager>>,
     seq: AtomicU64,
     pending_seq: tokio::sync::Mutex<Option<u32>>,
     connected: std::sync::atomic::AtomicBool,
@@ -31,6 +33,7 @@ struct TransactionTestHandler {
 impl TransactionTestHandler {
     fn new() -> Self {
         Self {
+            tm: None,
             seq: AtomicU64::new(1),
             pending_seq: tokio::sync::Mutex::new(None),
             connected: std::sync::atomic::AtomicBool::new(false),
@@ -41,35 +44,37 @@ impl TransactionTestHandler {
         }
     }
 
+    /// 注入 TM 引用（与测试里 acc_connections.transaction_manager() 同一实例）。
+    fn with_tm(mut self, tm: Arc<TransactionManager>) -> Self {
+        self.tm = Some(tm);
+        self
+    }
+
     fn next_seq(&self) -> u32 {
         self.seq.fetch_add(1, Ordering::Relaxed) as u32
     }
 }
 
 #[async_trait]
-impl ClientHandler for TransactionTestHandler {
+impl MessageHandler for TransactionTestHandler {
     fn name(&self) -> &'static str {
         "transaction-test-handler"
     }
 
-    async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        // 统一模型分支：BindResp(status=0) 置 connected；SubmitResp 取 msg_id/status 驱动事务匹配。
-        let unified = match CmppAdapter.decode(frame) {
-            Ok(m) => m,
-            Err(_) => return Ok(()),
-        };
-
-        match unified {
+    async fn on_message(&self, _ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 窄腰路径：框架已 decode，直接 match 统一消息枚举。
+        // BindResp(status=0) 置 connected；SubmitResp 取 msg_id/status 驱动事务匹配。
+        match msg {
             UnifiedMessage::BindResp(resp) if resp.status == 0 => {
                 self.connected.store(true, Ordering::Relaxed);
             }
             UnifiedMessage::SubmitResp(resp) => {
                 // 事务匹配仍用 8 字节二进制 MsgId 的 hex 串（与原断言一致）。
-                let msg_id = match &resp.msg_id {
+                let msg_id: String = match &resp.msg_id {
                     MessageId::Binary(b) => b.iter().map(|x| format!("{:02x}", x)).collect(),
                     MessageId::Text(t) => t.clone(),
                 };
-                if let Some(tm) = ctx.conn.transaction_manager().await {
+                if let Some(tm) = &self.tm {
                     let pending = self.pending_seq.lock().await.take();
                     if let Some(pending_seq) = pending {
                         tm.on_submit_resp(pending_seq, Some(msg_id), resp.status).await;
@@ -136,8 +141,6 @@ impl MessageCallback for TestTransactionCallback {
 
 use rsms_connector::ServerBuilder;
 use rsms_connector::AuthHandler;
-use rsms_business::BusinessHandler;
-use rsms_business::InboundContext;
 
 struct TestBusinessHandler;
 
@@ -148,21 +151,20 @@ impl TestBusinessHandler {
 }
 
 #[async_trait::async_trait]
-impl BusinessHandler for TestBusinessHandler {
+impl MessageHandler for TestBusinessHandler {
     fn name(&self) -> &'static str {
         "test-business"
     }
 
-    async fn on_inbound(&self, ctx: &InboundContext, frame: &Frame) -> Result<()> {
-        // 统一模型：收到 Submit 即回 SubmitResp（已认证 status=0，否则 3）。msg_id 置全 0（与原一致）。
-        if let Ok(UnifiedMessage::Submit(_)) = CmppAdapter.decode(frame) {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 窄腰路径：框架已 decode，直接 match 统一消息枚举。
+        // 收到 Submit 即回 SubmitResp（已认证 status=0，否则 3）。msg_id 置全 0（与原一致）。
+        if let UnifiedMessage::Submit(_) = msg {
             let status = if ctx.conn.authenticated_account().await.is_some() { 0 } else { 3 };
-            let resp = UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+            ctx.reply(UnifiedMessage::SubmitResp(UnifiedSubmitResp {
                 msg_id: MessageId::Binary(vec![0u8; 8]),
                 status,
-            });
-            let resp_bytes = CmppAdapter.encode(&resp, CmppAdapter.sequence_of(frame))?;
-            ctx.conn.write_frame(&resp_bytes).await?;
+            })).await?;
         }
         Ok(())
     }
@@ -217,10 +219,10 @@ async fn start_test_server(port: u16) -> tokio::task::JoinHandle<()> {
     );
 
     let auth_handler: Arc<dyn AuthHandler> = Arc::new(TestAuthHandler::new());
-    let biz_handler: Arc<dyn BusinessHandler> = Arc::new(TestBusinessHandler::new());
-    
+    let biz_handler: Arc<dyn MessageHandler> = Arc::new(TestBusinessHandler::new());
+
     let server = ServerBuilder::new(config)
-        .handlers(vec![biz_handler])
+        .message_handlers(vec![biz_handler])
         .auth_handler(auth_handler)
         .serve()
         .await
@@ -258,6 +260,7 @@ async fn test_pending_requests_fail_immediately_on_disconnect() {
         EndpointConfig::new("test-4b1", "127.0.0.1", port, 100, 60)
             .with_timeout(Duration::from_secs(30)),
     );
+    // 此测试无需 TM 驱动，handler 不传 tm。
     let handler = Arc::new(TransactionTestHandler::new());
     let conn = ClientBuilder::new(endpoint, handler, CmppDecoder)
         .client_config(Default::default())
@@ -304,7 +307,7 @@ async fn test_transaction_manager_integration() {
 
     let acc_config = AccountConfig::new();
     let acc_connections = AccountConnections::new(TEST_ACCOUNT.to_string(), acc_config);
-    
+
     let tm = acc_connections.transaction_manager();
     let callback = Arc::new(TestTransactionCallback::default());
     tm.set_callback(Some(callback.clone())).await;
@@ -312,8 +315,9 @@ async fn test_transaction_manager_integration() {
     tm_clone.start_timeout_checker().await;
 
     let endpoint = Arc::new(EndpointConfig::new("test", "127.0.0.1", port, 100, 60));
-    let handler = Arc::new(TransactionTestHandler::new());
-    
+    // 把 TM 注入 handler，on_message 里直接用 self.tm 驱动事务匹配（与 acc_connections 同一实例）。
+    let handler = Arc::new(TransactionTestHandler::new().with_tm(Arc::clone(&tm)));
+
     let conn = ClientBuilder::new(endpoint, handler.clone(), CmppDecoder)
         .client_config(Default::default())
         .connect()
@@ -388,14 +392,15 @@ async fn test_transaction_manager_multiple_submits() {
 
     let acc_config = AccountConfig::new();
     let acc_connections = AccountConnections::new(TEST_ACCOUNT.to_string(), acc_config);
-    
+
     let tm = acc_connections.transaction_manager();
     let callback = Arc::new(TestTransactionCallback::default());
     tm.set_callback(Some(callback.clone())).await;
 
     let endpoint = Arc::new(EndpointConfig::new("test", "127.0.0.1", port, 100, 60));
-    let handler = Arc::new(TransactionTestHandler::new());
-    
+    // 把 TM 注入 handler，on_message 里直接用 self.tm 驱动事务匹配（与 acc_connections 同一实例）。
+    let handler = Arc::new(TransactionTestHandler::new().with_tm(Arc::clone(&tm)));
+
     let conn = ClientBuilder::new(endpoint, handler.clone(), CmppDecoder)
         .client_config(Default::default())
         .connect()

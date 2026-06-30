@@ -7,7 +7,11 @@ description = "Business handler trait and chain"
 
 [dependencies]
 async-trait.workspace = true
-rsms-codec-cmpp = { path = "../rsms-codec-cmpp" }
 rsms-core = { path = "../rsms-core" }
 rsms-model = { path = "../rsms-model" }
 tracing.workspace = true
+
+[dev-dependencies]
+# 仅 MessageContext 的单元测试用 CmppAdapter 验证 reply 编排；生产代码不依赖任何 codec。
+rsms-codec-cmpp = { path = "../rsms-codec-cmpp" }
+tokio = { workspace = true, features = ["macros", "rt"] }

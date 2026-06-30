@@ -12,10 +12,10 @@
 // ============================================================================
 
 use async_trait::async_trait;
+use rsms_business::{MessageContext, MessageHandler};
 use rsms_codec_smpp::adapter::SmppAdapter;
-use rsms_connector::client::{ClientContext, ClientHandler};
 use rsms_connector::{ClientBuilder, MessageItem, MessageSource, SmppDecoder};
-use rsms_core::{EncodedPdu, EndpointConfig, Frame, Protocol, RawPdu, Result};
+use rsms_core::{EncodedPdu, EndpointConfig, Protocol, RawPdu, Result};
 use rsms_longmsg::{
     split::SmsAlphabet, LongMessageFrame, LongMessageMerger, LongMessageSplitter, UdhParser,
 };
@@ -199,7 +199,7 @@ impl MessageSource for ClientMessageSource {
 }
 
 // ============================================================================
-// ClientHandler：统一模型分支处理服务端下发的所有帧
+// MessageHandler：统一模型分支处理服务端下发的所有帧
 // ============================================================================
 
 struct SmppClientHandler {
@@ -244,21 +244,14 @@ impl SmppClientHandler {
 }
 
 #[async_trait]
-impl ClientHandler for SmppClientHandler {
+impl MessageHandler for SmppClientHandler {
     fn name(&self) -> &'static str {
         "smpp-client"
     }
 
-    async fn on_inbound(&self, ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-        let unified = match SmppAdapter.decode(frame) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("解码失败 cmd_id=0x{:08x}: {}", frame.command_id, e);
-                return Ok(());
-            }
-        };
-
-        match unified {
+    async fn on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage) -> Result<()> {
+        // 框架已按协议解码为统一消息，业务直接按枚举分支处理。
+        match msg {
             UnifiedMessage::BindResp(resp) => {
                 if resp.status == 0 {
                     tracing::info!("✓ SMPP 认证成功");
@@ -269,9 +262,10 @@ impl ClientHandler for SmppClientHandler {
             }
             UnifiedMessage::SubmitResp(resp) => {
                 let count = self.submit_count.fetch_add(1, Ordering::Relaxed) + 1;
-                let id = match resp.msg_id {
-                    rsms_model::MessageId::Text(t) => t,
-                    rsms_model::MessageId::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
+                // msg: &UnifiedMessage，resp 为借用，msg_id 须 borrow 匹配。
+                let id = match &resp.msg_id {
+                    rsms_model::MessageId::Text(t) => t.clone(),
+                    rsms_model::MessageId::Binary(b) => String::from_utf8_lossy(b).into_owned(),
                 };
                 tracing::info!("[{}] SubmitResp: message_id={}", count, id);
             }
@@ -282,12 +276,14 @@ impl ClientHandler for SmppClientHandler {
                     count, report.src.number, report.dest.number, report.status,
                     String::from_utf8_lossy(&report.raw)
                 );
-                reply_deliver_resp(ctx, frame).await?;
+                // 一步回执（窄腰）：框架按请求帧序列编码 DeliverResp 并写回。
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
             UnifiedMessage::Deliver(deliver) => {
                 let enc = deliver.encoding;
-                self.handle_mo(&deliver.src.number, &deliver.dest.number, deliver.concat.as_ref(), deliver.content, enc);
-                reply_deliver_resp(ctx, frame).await?;
+                // msg: &UnifiedMessage，deliver.content 须 clone（handle_mo 取 Vec<u8>）。
+                self.handle_mo(&deliver.src.number, &deliver.dest.number, deliver.concat.as_ref(), deliver.content.clone(), enc);
+                ctx.reply(UnifiedMessage::DeliverResp).await?;
             }
             UnifiedMessage::UnbindResp => tracing::info!("收到 UnbindResp，连接将关闭"),
             UnifiedMessage::PingResp => tracing::debug!("收到心跳响应"),
@@ -295,12 +291,6 @@ impl ClientHandler for SmppClientHandler {
         }
         Ok(())
     }
-}
-
-/// 回 DeliverResp（经 adapter 编码，sequence_of 自动回显请求序列——跨协议统一写法）。
-async fn reply_deliver_resp(ctx: &ClientContext<'_>, frame: &Frame) -> Result<()> {
-    let bytes = SmppAdapter.encode(&UnifiedMessage::DeliverResp, SmppAdapter.sequence_of(frame))?;
-    ctx.conn.write_frame(&bytes).await
 }
 
 #[tokio::main]

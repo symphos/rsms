@@ -352,10 +352,11 @@ fn unified_to_cmpp_with_version(
                 resp: SubmitResp { msg_id, result: r.status },
             }
         }
-        UnifiedMessage::DeliverResp => CmppMessage::DeliverResp {
+        UnifiedMessage::DeliverResp | UnifiedMessage::ReportResp => CmppMessage::DeliverResp {
             version,
             sequence_id: seq,
             // 统一模型 DeliverResp 不携带回执 MsgId，置默认；result=0 表示成功。
+            // ReportResp 同理：CMPP 报告经 Deliver 承载，对报告的响应即 DeliverResp。
             resp: DeliverResp { msg_id: [0u8; 8], result: 0 },
         },
         UnifiedMessage::Ping => CmppMessage::ActiveTest { version: CmppVersion::V30, sequence_id: seq },
@@ -482,8 +483,32 @@ impl ProtocolAdapter for CmppAdapter {
         let msg = decode_message(frame.data_as_slice())?;
         Ok(cmpp_to_unified(msg))
     }
+    fn decode_with_version(
+        &self,
+        frame: &Frame,
+        version: Option<u8>,
+    ) -> Result<UnifiedMessage> {
+        let msg = decode_message_with_version(frame.data_as_slice(), version)?;
+        Ok(cmpp_to_unified(msg))
+    }
     fn encode(&self, msg: &UnifiedMessage, seq: Sequence) -> Result<Vec<u8>> {
         let cmpp = unified_to_cmpp(msg, seq)?;
+        encode_message(&cmpp)
+    }
+
+    fn encode_with_version(
+        &self,
+        msg: &UnifiedMessage,
+        seq: Sequence,
+        version: Option<u8>,
+    ) -> Result<Vec<u8>> {
+        // Option<u8> → CmppVersion：复用 codec 的 from_wire（0x20/0x00/0x01→V20，0x30→V30）；
+        // None 或未知字节默认 V3.0，与 trait encode 行为一致（保证零回归）。
+        let v = match version {
+            Some(b) => CmppVersion::from_wire(b).unwrap_or(CmppVersion::V30),
+            None => CmppVersion::V30,
+        };
+        let cmpp = unified_to_cmpp_with_version(msg, seq, v)?;
         encode_message(&cmpp)
     }
 }
@@ -909,5 +934,103 @@ mod tests {
             }
             other => panic!("encode_with_version(V20) 应产 DeliverV20，得到 {other:?}"),
         }
+    }
+
+    #[test]
+    fn report_resp_equals_deliver_resp() {
+        // CMPP 无独立 Report_Resp：报告经 Deliver 承载，故对报告的响应即 DeliverResp。
+        let seq = Sequence::Plain(42);
+        let a = CmppAdapter.encode(&UnifiedMessage::ReportResp, seq).unwrap();
+        let b = CmppAdapter.encode(&UnifiedMessage::DeliverResp, seq).unwrap();
+        assert_eq!(a, b);
+    }
+
+    /// 构造 CMPP V2.0 Submit 帧：extra.version=0x20 使 encode 产 SubmitV20 wire 字节。
+    fn v20_submit_frame() -> Frame {
+        let submit = UnifiedMessage::Submit(UnifiedSubmit {
+            src: Address::plain("10086"),
+            dests: vec![Address::plain("13800138000")],
+            content: b"hi".to_vec(),
+            encoding: Encoding::Gbk,
+            want_report: false,
+            concat: None,
+            extra: ProtocolExtra::Cmpp(CmppExtra { version: 0x20, ..Default::default() }),
+            tlvs: vec![],
+        });
+        frame_of(CmppAdapter.encode(&submit, Sequence::Plain(7)).unwrap())
+    }
+
+    #[test]
+    fn decode_with_version_none_equals_decode() {
+        // ActiveTest 版本无关：默认（None）路径必须与 decode 一致。
+        // a 声明为 &dyn ProtocolAdapter：一方面绕开 inherent 方法同名遮蔽，
+        // 另一方面正好模拟框架驱动层真实调用路径（adapter 以 Arc<dyn ProtocolAdapter> 存储）。
+        let f = frame_of(vec![
+            0x00, 0x00, 0x00, 0x0C, // total_len = 12
+            0x00, 0x00, 0x00, 0x08, // ActiveTest
+            0x00, 0x00, 0x00, 0x01, // seq = 1
+        ]);
+        let a: &dyn ProtocolAdapter = &CmppAdapter;
+        assert_eq!(
+            a.decode_with_version(&f, None).unwrap(),
+            CmppAdapter.decode(&f).unwrap(),
+            "None 版本应等价于基础 decode"
+        );
+        assert_eq!(a.decode_with_version(&f, None).unwrap(), UnifiedMessage::Ping);
+    }
+
+    #[test]
+    fn decode_with_version_routes_v20() {
+        // V2.0 Submit 仅经 Some(0x20) 正确解出；用基础 decode（V3.0 布局）会字段错位/长度不符。
+        let f = v20_submit_frame();
+        let a: &dyn ProtocolAdapter = &CmppAdapter;
+        let msg = a.decode_with_version(&f, Some(0x20)).expect("V2.0 解码应成功");
+        assert!(matches!(msg, UnifiedMessage::Submit(_)), "Some(0x20) 应解出 Submit");
+    }
+
+    /// 最简合法 SubmitResp（用于 encode_with_version 测试）。
+    fn sample_submit_resp() -> UnifiedMessage {
+        UnifiedMessage::SubmitResp(UnifiedSubmitResp {
+            msg_id: MessageId::Binary(vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]),
+            status: 0,
+        })
+    }
+
+    #[test]
+    fn encode_with_version_none_equals_encode() {
+        // 版本无关默认路径：None 必须逐字节等于 encode（保证 V3.0/ctx.reply 零回归）。
+        // 经 &dyn ProtocolAdapter 调用——绕开 inherent encode_with_version(_, CmppVersion) 的遮蔽。
+        let a: &dyn ProtocolAdapter = &CmppAdapter;
+        let msg = sample_submit_resp();
+        let seq = Sequence::Plain(7);
+        assert_eq!(
+            a.encode_with_version(&msg, seq, None).unwrap(),
+            a.encode(&msg, seq).unwrap(),
+            "None 版本应逐字节等于 encode"
+        );
+    }
+
+    #[test]
+    fn encode_with_version_some30_equals_encode() {
+        // Some(0x30) 与 None 同走 V3.0，必须等于 encode。
+        let a: &dyn ProtocolAdapter = &CmppAdapter;
+        let msg = sample_submit_resp();
+        let seq = Sequence::Plain(7);
+        assert_eq!(
+            a.encode_with_version(&msg, seq, Some(0x30)).unwrap(),
+            a.encode(&msg, seq).unwrap(),
+            "Some(0x30) 应逐字节等于 encode"
+        );
+    }
+
+    #[test]
+    fn encode_with_version_v20_differs_from_v30() {
+        // Some(0x20) 产出 V2.0 应答（SubmitResp 21B），与 V3.0（24B）不同——证明版本感知生效。
+        let a: &dyn ProtocolAdapter = &CmppAdapter;
+        let msg = sample_submit_resp();
+        let seq = Sequence::Plain(7);
+        let v20 = a.encode_with_version(&msg, seq, Some(0x20)).unwrap();
+        let v30 = a.encode(&msg, seq).unwrap();
+        assert_ne!(v20, v30, "Some(0x20) 应产出与 V3.0 不同的 V2.0 字节");
     }
 }

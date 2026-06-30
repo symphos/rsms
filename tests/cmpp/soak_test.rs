@@ -117,7 +117,7 @@ async fn soak_reconnect_no_resource_leak() {
             .with_max_qps(100_000),
     ));
     let server = ServerBuilder::new(cfg)
-        .handlers(vec![])
+        .message_handlers(vec![])
         .auth_handler(Arc::new(PasswordAuth))
         .account_config_provider(provider as Arc<dyn AccountConfigProvider>)
         .serve()
