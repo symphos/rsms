@@ -51,8 +51,8 @@ cargo run -p smgp-server-example
 
 1. 从 `accounts.conf` 读取账号配置
 2. 客户端连接后，框架自动完成 SMGP 协议握手（Login/LoginResp）
-3. 客户端发送 Submit，由 `BusinessHandler.on_inbound()` 接收处理
-4. 业务方在 handler 中解码 Submit、构造 SubmitResp 并回写、处理业务逻辑
+3. 客户端发送 Submit，由 `MessageHandler.on_message()` 接收处理
+4. 业务方在 `on_message` 中按 `UnifiedMessage::Submit` 分支处理、用 `ctx.reply(..)` 回 SubmitResp、处理业务逻辑
 5. 通过 MessageSource 异步发送 Deliver（MO 上行消息和状态报告）
 
 ## 代码结构
@@ -60,7 +60,7 @@ cargo run -p smgp-server-example
 | 组件 | 职责 |
 |---|---|
 | `SmgpAuthHandler` | 实现 `AuthHandler` trait，校验客户端账号是否存在。SMGP 的完整 MD5 认证由框架 smgp handler 完成，此处做账号存在性校验 |
-| `SmgpBusinessHandler` | 实现 `BusinessHandler` trait，处理收到的 Submit 请求：解码消息、回 SubmitResp、若需要状态报告则通过 MessageSource 异步推送 Report |
+| `SmgpBusinessHandler` | 实现 `MessageHandler` trait，处理收到的 Submit 请求：在 `on_message` 中用 `ctx.reply(..)` 回 SubmitResp、若需要状态报告则通过 MessageSource 异步推送 Report |
 | `FileMessageSource` | 实现 `MessageSource` trait，维护按账号隔离的内存消息队列。支持从文件预加载 MO 消息，也支持运行时动态 push Report/MO。框架的 `run_outbound_fetcher` 循环调用 `fetch(account, batch_size)` 批量取出消息并下发 |
 | `SimpleAccountConfigProvider` | 实现 `AccountConfigProvider` trait，返回每个账号的连接数上限和 QPS 限制 |
 | `SmgpServerEventHandler` | 实现 `ServerEventHandler` trait，处理连接/断开/认证成功等事件通知 |

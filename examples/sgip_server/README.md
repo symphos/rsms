@@ -45,8 +45,8 @@ SGIP 使用明文认证，无需 MD5 计算。每行定义一个账号及其密�
 1. **启动**：从 `accounts.conf` 读取账号配置，从 `messages.conf` 加载预定义 MO 消息到 MessageSource 队列
 2. **连接建立**：客户端连接后，框架自动完成 SGIP 协议握手（Bind/BindResp）
 3. **认证**：`SgipAuthHandler` 使用明文方式校验 login_name 和 login_password
-4. **接收 Submit**：`SgipBusinessHandler.on_inbound()` 收到客户端提交的短信
-5. **回 SubmitResp**：业务方解码 Submit 后，通过 `write_frame()` 发送 SubmitResp（result=0 表示成功）
+4. **接收 Submit**：`SgipBusinessHandler.on_message()` 收到框架解码后的统一消息 `UnifiedMessage::Submit`
+5. **回 SubmitResp**：业务方在 `on_message` 中通过 `ctx.reply(UnifiedMessage::SubmitResp(..))` 回 SubmitResp（status=0 表示成功）
 6. **推送 Report**：如果 Submit 的 report_flag=1，构建 Report PDU 推送到 MessageSource 队列
 7. **异步下发**：框架通过 MessageSource.fetch() 自动将 Report 和 Deliver 下发给客户端
 
@@ -130,10 +130,10 @@ sgip_server/
 - `extract_sgip_sequence()` -- 从原始 PDU 字节中提取 SgipSequence（bytes 8-19）
 - `SgipAuthHandler` -- SGIP 明文认证处理器，实现 `AuthHandler` trait
 - `FileMessageSource` -- 内存消息队列，实现 `MessageSource` trait，按账号隔离
-- `SgipBusinessHandler` -- 业务处理器，实现 `BusinessHandler` trait
-  - 处理 Submit：解码、回 SubmitResp、推送 Report 到队列
-  - 处理 Report：记录日志、回 ReportResp
-  - 处理 Deliver（MO 上行）：记录日志、回 DeliverResp
+- `SgipBusinessHandler` -- 业务处理器，实现 `MessageHandler` trait（`on_message`）
+  - 处理 Submit：按 `UnifiedMessage::Submit` 分支处理、`ctx.reply` 回 SubmitResp、推送 Report 到队列
+  - 处理 Report：记录日志、`ctx.reply(UnifiedMessage::ReportResp)`
+  - 处理 Deliver（MO 上行）：记录日志、`ctx.reply(UnifiedMessage::DeliverResp)`
 - `build_report()` -- 构建 Report PDU
 - `build_deliver_mo()` -- 构建 Deliver MO 上行 PDU
 - `SgipServerEventHandler` -- 连接/断开/认证事件回调

@@ -172,7 +172,7 @@ let config = Arc::new(EndpointConfig::new("sgip-gateway", "0.0.0.0", 7891, 500, 
     .with_protocol(Protocol::Sgip));
 
 let server = ServerBuilder::new(config)
-    .handler(Arc::new(MyBizHandler))
+    .message_handlers(vec![Arc::new(MyBizHandler)])  // MyBizHandler: impl MessageHandler
     .auth_handler(Arc::new(SgipAuth::new()))
     .serve().await?;
 ```

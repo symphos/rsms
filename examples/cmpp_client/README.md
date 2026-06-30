@@ -37,7 +37,7 @@ cargo run -p cmpp-client-example
 2. 调用 `connect()` 建立 TCP 连接，框架启动读循环、心跳和 outbound fetcher
 3. 通过 `send_request()` 发送 Connect 认证（MD5），等待 ConnectResp 确认
 4. 认证成功后，`MessageSource.fetch()` 被 outbound fetcher 循环调用，自动发出 Submit
-5. `ClientHandler.on_inbound()` 接收并处理所有服务端响应（SubmitResp、Deliver Report/MO）
+5. `MessageHandler.on_message()` 接收并处理所有服务端响应（框架已解码为 `UnifiedMessage`：BindResp、SubmitResp、Report、Deliver）
 
 ## 代码结构
 
@@ -51,15 +51,15 @@ cargo run -p cmpp-client-example
 
 注意：`fetch` 的 `account` 参数就是 `EndpointConfig.id`，必须和 `connect()` 时设置的 endpoint id 一致。
 
-### ClientHandler -- CmppClientHandler
+### MessageHandler -- CmppClientHandler
 
-处理服务端下发的所有帧，在 `on_inbound` 中根据 `command_id` 分发处理：
+处理服务端下发的所有帧（实现 `MessageHandler` trait 的 `on_message`，签名 `on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage)`），按 `UnifiedMessage` 枚举分支分发处理：
 
-- **ConnectResp** -- 判断认证结果，成功后设置 `authenticated` 标志，触发 MessageSource 开始发送
+- **BindResp** -- 判断认证结果，成功后设置 `authenticated` 标志，触发 MessageSource 开始发送
 - **SubmitResp** -- 记录提交结果和 msg_id，累计计数
-- **Deliver（Report）** -- `registered_delivery=1` 时解析 `CmppReport`（包含 MsgId、Stat、DestTerminalId 等），累计报告计数
-- **Deliver（MO 上行）** -- `registered_delivery=0` 时为上行短信，记录内容，并回复 DeliverResp
-- **ActiveTestResp** -- 心跳响应，debug 级别日志
+- **Report** -- 状态报告，解析其 `msg_id`/`raw` 等字段，累计报告计数，并用 `ctx.reply(UnifiedMessage::DeliverResp)` 回包
+- **Deliver（MO 上行）** -- 上行短信，记录内容，并用 `ctx.reply(UnifiedMessage::DeliverResp)` 回包
+- **PingResp** -- 心跳响应（ActiveTestResp）日志
 
 ## 关键代码说明
 
@@ -153,6 +153,6 @@ if deliver.tpudhi == 1 {
 | crate | 用途 |
 |-------|------|
 | rsms-core | 核心类型（EndpointConfig、Frame、RawPdu） |
-| rsms-connector | 客户端框架（connect、ClientHandler、MessageSource、CmppDecoder） |
+| rsms-connector | 客户端框架（connect、MessageHandler、MessageSource、CmppDecoder） |
 | rsms-codec-cmpp | CMPP 协议编解码（compute_connect_auth、decode_message、Submit、CmppReport） |
 | rsms-longmsg | 长短信拆分/合包（LongMessageSplitter、LongMessageMerger、UdhParser） |

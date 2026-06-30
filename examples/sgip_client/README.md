@@ -32,12 +32,12 @@ cargo run -p sgip-client-example
 1. **加载消息**：从 `messages.conf` 读取待发送短信列表
 2. **建立连接**：调用 `connect()` 建立 TCP 连接，框架启动读循环、keepalive、outbound fetcher
 3. **发送 Bind**：通过 `write_frame()` 发送 Bind 认证请求（明文方式）
-4. **认证成功**：`SgipClientHandler.on_inbound()` 收到 BindResp 后设置认证标志
+4. **认证成功**：`SgipClientHandler.on_message()` 收到 BindResp 后设置认证标志
 5. **自动发送 Submit**：框架的 `run_outbound_fetcher` 循环调用 `MessageSource.fetch()`，认证后自动将 Submit 发出
-6. **处理响应**：`SgipClientHandler.on_inbound()` 处理所有服务端下发的帧：
+6. **处理响应**：`SgipClientHandler.on_message()` 处理所有服务端下发的帧：
    - SubmitResp -- 提交结果
-   - Report -- 独立状态报告（SGIP 特有），回 ReportResp
-   - Deliver -- MO 上行短信，回 DeliverResp
+   - Report -- 独立状态报告（SGIP 特有），`ctx.reply(UnifiedMessage::ReportResp)`
+   - Deliver -- MO 上行短信，`ctx.reply(UnifiedMessage::DeliverResp)`
    - UnbindResp -- 断连响应
 
 ## 配置文件
@@ -93,11 +93,11 @@ sgip_client/
   - 启动时预构建所有 Submit PDU
   - 认证成功后 `fetch()` 返回待发送消息
   - `fetch()` 的 account 参数是 EndpointConfig.id
-- `SgipClientHandler` -- 客户端处理器，实现 `ClientHandler` trait
+- `SgipClientHandler` -- 客户端处理器，实现 `MessageHandler` trait（`on_message`）
   - 处理 BindResp：检查认证结果
   - 处理 SubmitResp：记录提交计数和结果
-  - 处理 Report：独立状态报告，回 ReportResp
-  - 处理 Deliver：MO 上行短信，回 DeliverResp
+  - 处理 Report：独立状态报告，`ctx.reply(UnifiedMessage::ReportResp)`
+  - 处理 Deliver：MO 上行短信，`ctx.reply(UnifiedMessage::DeliverResp)`
 - `extract_sgip_sequence()` -- 从原始 PDU 字节中提取 SgipSequence（bytes 8-19）
 - `sgip_timestamp()` -- 生成 SGIP 格式的时间戳
 

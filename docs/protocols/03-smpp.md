@@ -138,18 +138,7 @@ SMPP 的状态报告通过 `DeliverSm` 承载，通过 `esm_class & 0x04` 区分
 
 ## 服务端版本检测
 
-服务端通过客户端 Bind 时的 `interface_version` 判断版本：
-
-```rust
-// 在 AuthHandler 中
-AuthCredentials::Smpp { interface_version, .. } => {
-    conn.set_protocol_version(interface_version).await;
-}
-
-// 在 BusinessHandler 中解码
-let version = conn.protocol_version().await.unwrap_or(0x34);
-let message = decode_message_with_version(pdu, Some(version))?;
-```
+SMPP 版本差异（V3.4/V5.0）仅是字段长度限制，统一模型由 `SmppAdapter` 内部封装：框架将收到的 PDU 解码为协议无关的 `UnifiedMessage` 交给 `MessageHandler::on_message()`，业务无需显式判断版本或调用裸 codec 解码。如需在客户端限定版本，可在 `EndpointConfig` 侧通过配置层声明。
 
 ## 服务端完整示例
 
@@ -160,8 +149,9 @@ use rsms_core::Protocol;
 let config = Arc::new(EndpointConfig::new("smpp-gateway", "0.0.0.0", 7893, 500, 60)
     .with_protocol(Protocol::Smpp));   // 必须设置！
 
+// MyBizHandler 实现 MessageHandler trait（on_message 按 UnifiedMessage 分支，用 ctx.reply 回执）
 let server = ServerBuilder::new(config)
-    .handler(Arc::new(MyBizHandler))
+    .message_handlers(vec![Arc::new(MyBizHandler)])
     .auth_handler(Arc::new(SmppAuth::new()))
     .serve().await?;
 ```
@@ -174,14 +164,23 @@ let server = ServerBuilder::new(config)
 let endpoint = Arc::new(EndpointConfig::new("smpp-client", "127.0.0.1", port, 500, 60)
     .with_protocol(Protocol::Smpp));   // 必须设置！
 
+// MyClientHandler 实现 MessageHandler trait（ClientBuilder 第二参为 Arc<dyn MessageHandler>，
+// on_message 按 UnifiedMessage 分支，用 ctx.reply 回 DeliverResp）
 let conn = ClientBuilder::new(endpoint, Arc::new(MyClientHandler), SmppDecoder)
-    .client_config(ClientConfig::default())
     .connect().await?;
 
-// 发送 Bind
-let bind_pdu = BindTransmitter::new("SMPP", "pwd12345", "CMT", 0x34);
-let pdu: Pdu = bind_pdu.into();
-conn.write_frame(pdu.to_pdu_bytes(1).as_slice()).await?;
+// 发送 Bind：SMPP DUPLEX 端点须 BindTransceiver，构造统一 Bind 经 SmppAdapter 编码后发送
+let bind = UnifiedMessage::Bind(UnifiedBind {
+    client_id: "SMPP".to_string(),
+    authenticator: "pwd12345".as_bytes().to_vec(), // SMPP 明文口令（非 MD5）
+    timestamp: 0,
+    version: 0x34,
+    system_type: Some("CMT".to_string()),
+    mode: BindMode::Transceiver,
+    login_mode: None,
+});
+let bind_bytes = SmppAdapter.encode(&bind, Sequence::Plain(1))?;
+conn.send_request(bind_bytes).await?;
 ```
 
 ## 参考测试

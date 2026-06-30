@@ -147,7 +147,7 @@ let config = Arc::new(EndpointConfig::new("smgp-gateway", "0.0.0.0", 7892, 500, 
     .with_protocol(Protocol::Smgp));
 
 let server = ServerBuilder::new(config)
-    .handler(Arc::new(MyBizHandler))
+    .message_handlers(vec![Arc::new(MyBizHandler)])
     .auth_handler(Arc::new(SmgpAuth::new()))
     .serve().await?;
 ```

@@ -41,8 +41,8 @@ cargo run -p cmpp-server-example
 
 1. 从 `accounts.conf` 读取账号配置，从 `messages.conf` 读取预定义 MO 消息
 2. 客户端连接后，框架自动完成 CMPP 协议握手（Connect / ConnectResp）
-3. 客户端发送 Submit 时，`BusinessHandler.on_inbound()` 收到并处理
-4. 业务方在 `on_inbound` 中解码 Submit、构造 SubmitResp 并通过 `write_frame` 回复
+3. 客户端发送 Submit 时，`MessageHandler.on_message()` 收到（框架已解码为 `UnifiedMessage::Submit`）并处理
+4. 业务方在 `on_message` 中按 `UnifiedMessage::Submit` 分支处理、用 `ctx.reply(UnifiedMessage::SubmitResp(..))` 回包
 5. 如果 Submit 带状态报告请求（`registered_delivery=1`），通过 `MessageSource` 异步推送 Report
 
 ## 代码结构
@@ -51,14 +51,14 @@ cargo run -p cmpp-server-example
 
 负责 MD5 认证。从 `AuthCredentials::Cmpp` 中提取 `source_addr`、`authenticator_source` 和 `timestamp`，用 `compute_connect_auth()` 计算期望值并比对。认证成功返回 `AuthResult::success(source_addr)`，失败返回具体错误码。
 
-### BusinessHandler -- CmppBusinessHandler
+### MessageHandler -- CmppBusinessHandler
 
-处理客户端上行消息的核心逻辑。收到 Submit 后：
+处理客户端上行消息的核心逻辑（实现 `MessageHandler` trait 的 `on_message`，签名 `on_message(&self, ctx: &MessageContext, msg: &UnifiedMessage)`，按 `UnifiedMessage` 枚举分支处理）。收到 `UnifiedMessage::Submit` 后：
 
-- 解码消息内容，记录日志
-- 构造 `SubmitResp` 并通过 `ctx.conn.write_frame()` 回复客户端
-- 若 `tpudhi == 1`，通过 `UdhParser::extract_udh()` 提取 UDH 头信息，构造 `LongMessageFrame` 并交给 `LongMessageMerger` 进行合包缓存
-- 若 `registered_delivery == 1`，构造 Report 类型的 Deliver PDU 并推送到 `MessageSource` 队列
+- 按统一模型读取消息内容，记录日志
+- 用 `ctx.reply(UnifiedMessage::SubmitResp(..))` 回复客户端（框架按请求帧序列编码并写回）
+- 若 `submit.concat` 非空（长短信分段），据 concat 重建含 UDH 段构造 `LongMessageFrame` 并交给 `LongMessageMerger` 进行合包缓存
+- 若 `submit.want_report` 为真，构造 Report 类型的 Deliver PDU 并推送到 `MessageSource` 队列
 
 框架不自动回 SubmitResp，完全由业务方控制。
 
@@ -67,7 +67,7 @@ cargo run -p cmpp-server-example
 内存消息队列，按账号隔离。实现了 `MessageSource` trait 的 `fetch(account, batch_size)` 方法。框架的 `run_outbound_fetcher` 循环调用 `fetch` 取出消息并通过 `write_frame` 发出。支持两种消息来源：
 
 - 启动时从 `messages.conf` 加载的预定义 MO 消息
-- 运行时 `BusinessHandler` 动态推送的 Report
+- 运行时 `MessageHandler` 动态推送的 Report
 
 ### ServerEventHandler -- CmppServerEventHandler
 
@@ -79,24 +79,24 @@ cargo run -p cmpp-server-example
 
 ## 关键代码说明
 
-### on_inbound 中回复 SubmitResp
+### on_message 中回复 SubmitResp
 
 ```rust
-// 构造 SubmitResp
-let resp = SubmitResp {
-    msg_id: *msg_id,
-    result: 0,
-};
-let resp_pdu: Pdu = resp.into();
-ctx.conn.write_frame(resp_pdu.to_pdu_bytes(sequence_id).as_bytes_ref()).await?;
+// 一步回执（窄腰）：构造统一 SubmitResp 交给 ctx.reply，
+// 框架按请求帧序列编码并写回，业务不再手剥序列/手拼字节。
+ctx.reply(UnifiedMessage::SubmitResp(rsms_model::UnifiedSubmitResp {
+    msg_id: MessageId::Binary(msg_id.to_vec()),
+    status: 0,
+}))
+.await?;
 ```
 
-### on_inbound 中推送 Report
+### on_message 中推送 Report
 
 ```rust
-if registered_delivery == 1 {
+if submit.want_report {
     if let Some(account) = ctx.conn.authenticated_account().await {
-        let report = build_deliver_report(&account, msg_id, phone);
+        let report = build_deliver_report(&account, &msg_id, phone, version);
         self.msg_source.push(&account, report).await;
     }
 }
@@ -163,6 +163,6 @@ if content_bytes.len() > single_max {
 |-------|------|
 | rsms-core | 核心类型（EndpointConfig、Frame、RawPdu） |
 | rsms-connector | 服务端框架（serve、MessageSource、AuthHandler） |
-| rsms-business | BusinessHandler trait |
+| rsms-business | MessageHandler trait |
 | rsms-codec-cmpp | CMPP 协议编解码（compute_connect_auth、decode_message、Pdu） |
 | rsms-longmsg | 长短信拆分/合包（LongMessageSplitter、LongMessageMerger、UdhParser） |

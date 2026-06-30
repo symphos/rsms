@@ -37,11 +37,11 @@ cargo run -p smpp-client-example
 2. `connect()` 建立 TCP 连接，框架启动读循环、keepalive、outbound fetcher
 3. `write_frame()` 发送 BindTransmitter 认证（明文，无 MD5）
 4. 认证成功后 `MessageSource.fetch()` 被 outbound fetcher 循环调用，自动发出 SubmitSm
-5. `ClientHandler.on_inbound()` 处理所有服务端响应：
-   - **SubmitSmResp** — 短信提交结果，包含 String 类型的 message_id
-   - **DeliverSm (esm_class & 0x04)** — 状态报告
-   - **DeliverSm (esm_class == 0)** — 上行短信（MO）
-   - **EnquireLinkResp** — 心跳响应
+5. `MessageHandler.on_message()` 按统一模型枚举分支处理所有服务端响应：
+   - **UnifiedMessage::SubmitResp** — 短信提交结果，包含 String 类型的 message_id
+   - **UnifiedMessage::Report**（DeliverSm esm_class & 0x04）— 状态报告，`ctx.reply(UnifiedMessage::DeliverResp)` 回执
+   - **UnifiedMessage::Deliver**（DeliverSm esm_class == 0）— 上行短信（MO），`ctx.reply(UnifiedMessage::DeliverResp)` 回执
+   - **UnifiedMessage::PingResp** — 心跳响应（EnquireLinkResp）
 
 ## SMPP 关键差异
 
@@ -157,9 +157,9 @@ if esm_class & 0x04 != 0 {
 src/main.rs
 ├── load_messages()            — 从 messages.conf 读取待发送短信
 ├── ClientMessageSource        — 客户端消息队列（实现 MessageSource trait）
-│   └── fetch()                — 认证后返回待发送 SubmitSm PDU
-├── SmppClientHandler          — 客户端处理器（实现 ClientHandler trait）
-│   └── on_inbound()           — 处理 BindResp/SubmitSmResp/DeliverSm/EnquireLinkResp
+│   └── fetch()                — 认证后返回待发送 Submit PDU
+├── SmppClientHandler          — 客户端处理器（实现 MessageHandler trait）
+│   └── on_message()           — 分支处理 BindResp/SubmitResp/Report/Deliver/PingResp
 └── main()                     — 组装各组件并启动
     ├── connect()              — 建立 TCP 连接
     ├── send_request()         — 发送 BindTransmitter 认证

@@ -20,7 +20,7 @@ pub struct Frame { ... }       // 解析后的帧（command_id + sequence_id + d
 ```
 
 - `RawPdu`：协议编码后的原始字节，用于 `write_frame()` 发送
-- `Frame`：解码后的帧结构，用于 `on_inbound()` 接收
+- `Frame`：解码后的帧结构；业务通常不直接接触它，框架会进一步解码为 `UnifiedMessage` 交给 `MessageHandler::on_message`（见下文窄腰统一模型）。裸 `Frame` 仅在需要绕过统一模型时经 `RawFrameHandler` 逃生舱口拿到
 
 ### 窄腰统一模型（UnifiedMessage + ProtocolAdapter）—— 推荐主路径
 
